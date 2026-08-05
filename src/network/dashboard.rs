@@ -1225,11 +1225,15 @@ async function loadChart(window) {
       '24h': light ? '#0e7490' : '#22d3ee'
     };
     const series = Array.isArray(options.series) ? options.series : [options.series].filter(Boolean);
-    const legendOrder = (options.legend && options.legend.data) || series.map(s => s.name);
-    options.color = legendOrder.map(name => palette[name]).filter(Boolean);
+    // ECharts assigns global colours by series order, not legend order. The
+    // two are deliberately reversed here, so feeding it legend order rotates
+    // every legend icon, hover point, and tooltip swatch away from its line.
+    options.color = series.map(line => palette[line.name]).filter(Boolean);
     series.forEach(line => {
+      const color = palette[line.name];
       line.smooth = false;
-      line.lineStyle = Object.assign(line.lineStyle || {}, { color: palette[line.name] });
+      line.lineStyle = Object.assign(line.lineStyle || {}, { color });
+      line.itemStyle = Object.assign(line.itemStyle || {}, { color });
     });
     if (options.legend) {
       options.legend.textStyle = { color: muted, fontSize: 11 };
@@ -1253,7 +1257,7 @@ async function loadChart(window) {
         const rows = params
           .filter(p => Array.isArray(p.value) && p.value[1] !== null && p.value[1] !== undefined)
           .sort((a, b) => order.indexOf(a.seriesName) - order.indexOf(b.seriesName))
-          .map(p => '<span style="color:' + p.color + '">&#9632;</span> ' + p.seriesName + ': ' + fmtHr(p.value[1], false));
+          .map(p => '<span style="color:' + (palette[p.seriesName] || p.color) + '">&#9632;</span> ' + p.seriesName + ': ' + fmtHr(p.value[1], false));
         return date + '<br/>' + rows.join('<br/>');
       };
     }
@@ -1719,11 +1723,23 @@ mod tests {
             assert!(legend.contains(name), "series {name} missing from legend");
         }
 
-        // The client keys colours by series name; a positional palette would
-        // silently invert now that the two orders differ.
+        // ECharts consumes its global palette in draw order, while each visual
+        // component is also pinned by name. Building the global palette in
+        // legend order rotates all six legend/tooltip colours because the two
+        // orders are opposite.
         assert!(
-            DASHBOARD_HTML.contains("palette[line.name]"),
-            "chart colours must be keyed by series name, not array index"
+            DASHBOARD_HTML
+                .contains("options.color = series.map(line => palette[line.name]).filter(Boolean)"),
+            "global chart colours must follow series draw order"
+        );
+        assert!(
+            DASHBOARD_HTML
+                .contains("line.itemStyle = Object.assign(line.itemStyle || {}, { color })"),
+            "legend and hover markers must use the line's name-based colour"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("palette[p.seriesName] || p.color"),
+            "tooltip swatches must use the series-name palette"
         );
     }
 

@@ -27,6 +27,9 @@ Upstream v0.6.3 compatibility fixes and live BIP110/RDTS visibility.
 - The block-acceptance test now abandons a nonce sweep after two minutes and
   resynchronizes with the latest job. Slow CI runners can no longer spend long
   enough on one sweep for the pool to evict that job before submission.
+- Hashrate chart lines, legend markers, hover points, and tooltip swatches now
+  use the same name-based color mapping. Building ECharts' global palette in
+  legend order had rotated all six marker colors away from their plotted lines.
 
 ## [0.1.2] - 2026-08-05
 
