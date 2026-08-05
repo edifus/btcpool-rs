@@ -1,0 +1,192 @@
+# btcpool-rs configuration
+# Copy this to config.toml and adjust for your environment.
+#
+#   cp config.toml.example config.toml
+#   # edit bitcoin_rpc settings, then:
+#   cargo build --release
+#   ./target/release/btcpool-rs config.toml
+#
+# Every value can be overridden by an environment variable named
+# BTCPOOL_<SECTION>__<KEY> (double underscore between section and key) —
+# useful for container platforms that configure apps through env vars:
+#
+#   BTCPOOL_BITCOIN_RPC__URL=http://10.0.0.5:8332
+#   BTCPOOL_SV2__ENABLED=false
+#
+# Overrides are parsed as the type the key has in this file. For keys absent
+# from the file, true/false and numbers are typed as such — wrap the value in
+# double quotes to force a string (e.g. an all-numeric RPC password).
+
+[pool]
+# Address and port miners connect to
+listen_addr = "0.0.0.0:3333"
+
+# Block rewards pay the Bitcoin address in each miner's username. Configure the
+# miner as BITCOIN_ADDRESS or BITCOIN_ADDRESS.worker. The address must match the
+# connected node's network.
+
+# Tag embedded in the coinbase scriptSig (max ~20 bytes)
+coinbase_tag = "/btcpool-rs/"
+
+# Optional safety assertion. The pool always detects the actual network from
+# the connected node (getblockchaininfo), and miner payout addresses must be
+# valid for that chain before work is issued. Setting this additionally makes
+# boot fail fast if the node reports a different chain — catching a config
+# pointed at the wrong node. "mainnet" | "testnet" | "testnet4" | "signet" | "regtest".
+# network = "mainnet"
+
+# Initial share difficulty assigned to new miners.
+# Vardiff will adjust from here. Set near the expected steady-state value
+# for your hardware to avoid excessive rejects on first connect.
+#
+# Rough guide (targeting 1 share every 15 seconds):
+#   1 TH/s  →  ~4 096
+#   5 TH/s  →  ~20 000
+#   10 TH/s →  ~40 000
+#   100 TH/s → ~400 000
+initial_difficulty = 4096
+
+# Extranonce1 length in bytes (4 is standard; supports up to 255 miners)
+extranonce1_size = 4
+
+# Extranonce2 size advertised to SV1 miners (bytes). The Avalon Nano needs 4.
+#
+# extranonce1_size + extranonce2_size is the TOTAL extranonce region reserved in
+# the coinbase. SV2 devices carve their requested rolling extranonce out of this
+# same total (prefix = total - granted), so the total must be >= any SV2 device's
+# min_extranonce_size (a NerdQAxe++ asks for 8 → 4 + 4 = 8 works). Raise the
+# total (e.g. extranonce1_size = 8) only if an SV2 OpenChannel is still rejected.
+extranonce2_size = 4
+
+# Maximum number of simultaneous miner connections
+max_connections = 256
+
+# Idle connection timeout (seconds) — disconnect miners that stop responding
+idle_timeout_secs = 300
+
+# Directory where the raw hex of every found block is archived before
+# submission, so a failed submitblock can be retried automatically or replayed
+# by hand (`bitcoin-cli submitblock "$(cat <file>)"`). Relative paths resolve
+# against the service working directory, like stats_db_path.
+found_block_dir = "found-blocks"
+
+[sv2]
+# Accept Stratum V2 (Extended Channel, Noise-encrypted) connections on the SAME
+# listen_addr as SV1. The protocol is auto-detected from the first byte of each
+# connection, so no separate port is needed. Point an SV2-capable miner (e.g. a
+# NerdQAxe++ on AxeOS >= v1.0.37, "Stratum V2" selected) at the same host:port
+# as your SV1 miners.
+#
+# Set to false to refuse SV2 and serve SV1 only.
+enabled = true
+
+# Persist the Noise authority key so the pool keeps the same identity across
+# restarts. The base58check public key is logged at startup and shown in the
+# dashboard's Connect modal; set it as the pool/authority public key on the
+# miner to cryptographically verify the pool (identity pinning). Miners that
+# do not pin connect exactly as before. Set to false for a fresh key each
+# start (pinning miners will then refuse to connect after every restart).
+persist_authority_key = true
+
+# Where the authority secret key lives (one base58check line, created with
+# owner-only permissions on first start). Relative paths resolve against the
+# service working directory, like stats_db_path. Supports ~ expansion.
+authority_key_file = "sv2-authority.key"
+
+# Validity window (seconds) of the certificate signed for each connection:
+# valid_from = now, not_valid_after = now + cert_validity_secs. Miners that
+# verify pool identity check this window against their own clock (SRI-based
+# verifiers allow 10 s of drift), so short values expose device clock skew.
+# Default: one year.
+cert_validity_secs = 31536000
+
+[bitcoin_rpc]
+# Bitcoin RPC endpoint (core/knots)
+url = "http://127.0.0.1:8332"
+
+# Cookie-file authentication (leave user/password empty when using cookie)
+# Default location: ~/.bitcoin/.cookie
+# Override with an absolute path if using a custom datadir or rpccookiefile=
+cookie_path = "~/.bitcoin/.cookie"
+
+# Uncomment to use explicit credentials instead of cookie
+# user = "rpcuser"
+# password = "rpcpassword"
+
+# RPC timeout (seconds)
+timeout_secs = 10
+
+[zmq]
+# ZMQ endpoint for Bitcoin Knots block/hashblock notifications
+# Enable in bitcoin.conf:  zmqpubhashblock=tcp://127.0.0.1:28332
+hashblock_endpoint = "tcp://127.0.0.1:28332"
+
+# Fall back to polling if ZMQ is unavailable
+poll_fallback = true
+poll_interval_ms = 1000
+
+[vardiff]
+# Target number of seconds between share submissions per miner
+target_share_time_secs = 15
+
+# How often (seconds) to re-evaluate and adjust difficulty
+retarget_interval_secs = 60
+
+# Hard floor / ceiling on per-miner difficulty
+# Floor should be above 1 but low enough for vardiff to work on small miners.
+# Note: for cgminer/Avalon hardware the floor is sent as minimum-difficulty at
+# session start and cannot be changed without a reconnect.
+min_difficulty = 4096
+max_difficulty = 65536
+
+# Maximum difficulty adjustment ratio per retarget (e.g. 4 = up to 4× change)
+max_retarget_factor = 4.0
+
+[security]
+# Rate-limit: max new TCP connections per IP per minute
+max_connections_per_ip = 5
+
+# Max share submissions per second per connection before banning
+max_shares_per_sec = 500
+
+# Ban duration (seconds) after policy violation
+ban_duration_secs = 600
+
+# Maximum genuinely invalid shares (bad nonce/duplicate) before disconnect (0 = disabled)
+# Low-difficulty and stale shares are NOT counted — they're expected during transitions.
+max_invalid_shares = 5
+
+# JSON message size limit per line (bytes) — protects against oversized payloads
+max_message_bytes = 4096
+
+# Maximum byte length of an accepted worker/user-identity name. Bounds the
+# global per-worker stats maps and Prometheus label cardinality against
+# untrusted names. 128 fits a bech32m payout address plus a `.worker` suffix.
+max_worker_name_len = 128
+
+# Maximum number of DISTINCT worker identities one connection may authorize
+# (SV1 mining.authorize / SV2 OpenExtendedMiningChannel). Each distinct name
+# creates per-worker stats entries and Prometheus label series, so this bounds
+# how much a single connection can grow them. Real miners authorize once.
+# 0 = disabled.
+max_authorizations_per_session = 8
+
+[metrics]
+# Prometheus metrics HTTP endpoint (empty string to disable)
+prometheus_addr = "0.0.0.0:9090"
+
+# Optional SQLite file for persisting all-time best stats across restarts.
+# Leave empty or omit to disable.
+stats_db_path = "pool_stats.sqlite"
+
+[logging]
+# Log level: trace | debug | info | warn | error
+level = "info"
+
+# Emit structured JSON logs (useful for log aggregators like Loki)
+json = false
+
+# Optional: Directory to write log files to (e.g., for systemd service).
+# If set, logs will be written to a rotating file in this directory.
+# Supports ~ expansion. Leave empty or omit to log to stdout/stderr.
+log_dir = ""

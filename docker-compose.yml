@@ -1,0 +1,48 @@
+# btcpool-rs — example Docker deployment.
+#
+#   1. cp config.toml.example config.toml   # edit Bitcoin RPC settings
+#   2. docker compose up -d
+#
+# host networking is the simplest setup: the pool reaches bitcoind's RPC
+# (127.0.0.1:8332) and ZMQ (127.0.0.1:28332) on the host, and the listen/metrics
+# ports in config.toml are exposed directly. On non-Linux hosts (Docker Desktop)
+# host networking is limited — see the note at the bottom.
+services:
+  btcpool:
+    # Use the published image…
+    image: ghcr.io/edifus/btcpool-rs:latest
+    # …or build from this checkout instead:
+    # build: .
+    container_name: btcpool-rs
+    restart: unless-stopped
+    network_mode: host
+    # The image runs as the non-root user btcpool (uid:gid 10001), so the
+    # container also needs READ access to bitcoind's cookie. Add the host group
+    # that owns the cookie as a supplementary group — find its GID with
+    # `stat -c %g "$HOME/.bitcoin/.cookie"` — and set `rpccookieperms=group` in
+    # bitcoin.conf so the cookie is group-readable. Replace the GID below:
+    group_add:
+      - "1000"   # <-- your node group's GID (e.g. `bitstack`); REQUIRED for cookie auth
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      # Read the Bitcoin cookie. Left side is the host path (default Bitcoin Core
+      # datadir — change it if you use a custom datadir); right side matches the
+      # default cookie_path = "~/.bitcoin/.cookie" inside the container, which now
+      # expands under the non-root home /home/btcpool.
+      - ${HOME}/.bitcoin/.cookie:/home/btcpool/.bitcoin/.cookie:ro
+      # Persist all-time stats and found-block archives. The image runs as uid
+      # 10001, so this host dir must be writable by that uid:
+      #   mkdir -p data && sudo chown -R 10001:10001 data
+      # Then in config.toml set stats_db_path = "data/pool_stats.sqlite" and
+      # found_block_dir = "data/found-blocks" so both land in this volume.
+      # The SV2 authority key defaults to /app/sv2-authority.key, which does not
+      # survive a container re-create. If miners pin the pool identity, also set
+      # authority_key_file = "data/sv2-authority.key" so the key lives here too.
+      - ./data:/app/data
+
+# Without host networking, drop `network_mode: host`, add:
+#   ports:
+#     - "3333:3333"   # stratum (match listen_addr)
+#     - "9090:9090"   # dashboard + metrics
+# and set bitcoin_rpc.url in config.toml to host.docker.internal:8332
+# (Docker Desktop) or your host's LAN IP.

@@ -1,0 +1,32 @@
+# Ignore every file by default. Directories stay visible so the repository
+# allowlist below can match files at any depth.
+*
+!*/
+
+# Root repository files.
+!/.gitignore
+!/.dockerignore
+!/Cargo.lock
+!/Cargo.toml
+!/CHANGELOG.md
+!/CONTRIBUTING.md
+!/LICENSE-*
+!/README.md
+!/SECURITY.md
+!/TODO.md
+!/config.toml.example
+!/docker-compose.yml
+!/Dockerfile
+!/flake.lock
+!/flake.nix
+
+# Repository-owned trees. Unknown files and files outside these patterns remain
+# ignored by the default rule above.
+!/.github/workflows/*.yml
+!/docs/*.png
+!/examples/**/*.rs
+!/modules/**/*.nix
+!/packaging/systemd/*.service
+!/src/**/*.rs
+!/src/network/favicon.ico
+!/tests/**/*.rs

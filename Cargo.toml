@@ -1,0 +1,91 @@
+[package]
+name = "btcpool-rs"
+version = "0.1.3"
+edition = "2021"
+rust-version = "1.75.0"
+authors = []
+description = "Solo BTC mining pool for ASIC miners — Stratum V1 and Noise-encrypted Stratum V2, auto-detected on a single port"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "btcpool-rs"
+path = "src/main.rs"
+
+[dependencies]
+# ── Async runtime ──────────────────────────────────────────────────────────────
+tokio = { version = "1", features = ["full"] }
+# Socket options tokio doesn't expose (TCP keepalive, TCP_USER_TIMEOUT); already
+# in the dependency tree via tokio.
+socket2 = { version = "0.6", features = ["all"] }
+
+# ── Bitcoin primitives ─────────────────────────────────────────────────────────
+bitcoin = { version = "0.32", features = ["rand-std"] }
+hex = "0.4"
+# `compress` exposes compress256 (hardware SHA-NI) for the e2e miner's hot loop;
+# it only adds a function to sha2's API, so the shipped binary is unaffected.
+sha2 = { version = "0.10", features = ["compress"] }
+
+# ── Bitcoin Core RPC (supports cookie auth) ────────────────────────────────────
+bitcoincore-rpc = "0.19"
+
+# ── ZMQ for block/tx notifications from Bitcoin Knots ─────────────────────────
+tmq = "0.4"          # async ZMQ bindings on top of tokio (uses libzmq)
+tokio-stream = "0.1" # StreamExt for tmq Subscribe socket
+
+# ── Stratum V2 protocol (SRI crates) ──────────────────────────────────────────
+# Plaintext SV2 (Extended Channel) support. We use binary_sv2 for message
+# (de)serialization and framing_sv2 for the 6-byte SV2 frame header; the per-
+# connection frame read/write is done directly over tokio (see protocol/sv2).
+#
+# SV1 is still spoken via the hand-rolled layer in protocol/sv1.rs — both
+# protocols are auto-detected on the same listen port (see network/server.rs).
+#
+# Phase 2 (Noise encryption) will add codec_sv2 (noise_sv2 feature) + noise_sv2.
+const_sv2 = "4.0.1"            # shared SV2 message-type / channel-bit constants
+binary_sv2 = "5.0.1"           # SV2 binary message (de)serialization
+framing_sv2 = "6.0.1"          # SV2 frame header (extension_type, msg_type, length)
+common_messages_sv2 = "7.1.0"  # SetupConnection(Success/Error)
+mining_sv2 = "9.0.0"           # mining protocol messages (extended channel)
+
+# ── Serialization ──────────────────────────────────────────────────────────────
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# ── Logging / tracing ─────────────────────────────────────────────────────────
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
+
+# ── Metrics (Prometheus-compatible) ───────────────────────────────────────────
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+metrics-util = "0.17" # MetricKindMask for the exporter idle-timeout (same minor as the exporter's own dep)
+
+# ── Dashboard HTTP server ──────────────────────────────────────────────────────
+axum = "0.7"
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+thiserror = "1"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+dashmap = "5"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+rusqlite = "0.29"
+codec_sv2 = { version = "5.0.0", features = ["noise_sv2"] }
+noise_sv2 = "1.4.2"
+secp256k1 = { version = "0.28", features = ["rand", "std"] }
+key-utils = "1.2.0"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
