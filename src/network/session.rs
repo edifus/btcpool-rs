@@ -17,6 +17,8 @@ use crate::{
     error::PoolError,
     metrics,
     mining::{
+        accounting::{self, RejectReason},
+        credit::ShareCredit,
         engine::{JobBroadcast, TemplateEngine},
         identity::MinerIdentity,
         jobs::IssuedJobs,
@@ -80,6 +82,8 @@ pub struct Session {
     pub difficulty: u64,
     vardiff: Vardiff,
     vardiff_cfg: VardiffConfig,
+    /// What one accepted share is worth to the hashrate estimator.
+    credit: ShareCredit,
 
     // Share dedup
     share_set: ShareSet,
@@ -123,6 +127,7 @@ impl Session {
             difficulty: initial_diff,
             vardiff: Vardiff::new(cfg.vardiff.clone(), initial_diff),
             vardiff_cfg: cfg.vardiff.clone(),
+            credit: ShareCredit::new(cfg.vardiff.min_difficulty, Instant::now()),
             share_set: ShareSet::new(),
             guard: SessionGuard::new(&cfg.security),
             shares_accepted: 0,
@@ -332,6 +337,9 @@ pub async fn run(
         accepted = session.shares_accepted,
         rejected = session.shares_rejected,
         uptime_secs = uptime,
+        // False when the miner kept submitting below the difficulty it was
+        // sent, so its hashrate was credited at the acceptance floor instead.
+        honors_set_difficulty = session.credit.honors_assigned(),
         "Miner session ended"
     );
 }
@@ -701,19 +709,8 @@ async fn handle_submit(
     let worker_owned = session.worker.clone().unwrap_or_else(|| "?".to_string());
     let worker: &str = &worker_owned;
 
-    if !session.authorized {
-        metrics::share_rejected("unauthorized", worker);
-        session.stats.share_rejected();
-        return HandleResult::Messages(vec![ResponseBuilder::err(
-            &req.id,
-            PoolError::NotAuthorized.to_stratum_error(),
-        )]);
-    }
-
-    if params.worker != worker {
-        metrics::share_rejected("unauthorized", worker);
-        session.stats.share_rejected();
-        session.stats.worker_share_rejected(worker, "unauthorized");
+    if !session.authorized || params.worker != worker {
+        reject_share(session, RejectReason::Unauthorized);
         return HandleResult::Messages(vec![ResponseBuilder::err(
             &req.id,
             PoolError::NotAuthorized.to_stratum_error(),
@@ -725,10 +722,7 @@ async fn handle_submit(
     let job_entry = match session.issued_jobs.find(&params.job_id) {
         Some(entry) => entry,
         None => {
-            metrics::share_rejected("job_not_found", worker);
-            session.stats.share_rejected();
-            session.stats.worker_share_rejected(worker, "job_not_found");
-            if session.guard.invalid_shares.record_invalid() {
+            if reject_share(session, RejectReason::JobNotFound) {
                 return HandleResult::Disconnect("too many invalid shares".into());
             }
             return HandleResult::Messages(vec![ResponseBuilder::err(
@@ -782,10 +776,7 @@ async fn handle_submit(
         params.version_bits.unwrap_or(0),
     );
     if session.share_set.contains(&share_key) {
-        metrics::share_rejected("duplicate", worker);
-        session.stats.share_rejected();
-        session.stats.worker_share_rejected(worker, "duplicate");
-        if session.guard.invalid_shares.record_invalid() {
+        if reject_share(session, RejectReason::Duplicate) {
             return HandleResult::Disconnect("too many invalid shares".into());
         }
         return HandleResult::Messages(vec![ResponseBuilder::err(
@@ -837,25 +828,17 @@ async fn handle_submit(
             let validation_duration_ms = validation_start.elapsed().as_millis() as f64;
             metrics::share_validation_time(validation_duration_ms);
 
-            let latency_ms = submit_start.elapsed().as_millis();
+            let credit = accept_share(session, worker, hash_difficulty);
             debug!(
                 worker = worker,
                 job = %params.job_id,
                 hash = %hex::encode(hash),
                 diff = assigned_difficulty,
                 hash_diff = hash_difficulty,
-                latency_ms = latency_ms,
+                credit = credit,
+                latency_ms = submit_start.elapsed().as_millis(),
                 "Share accepted"
             );
-            session.shares_accepted += 1;
-            session.vardiff.record_share();
-            session
-                .stats
-                .add_share_diff(&session.session_id, worker, session.difficulty as f64);
-            metrics::share_accepted(assigned_difficulty, worker);
-            session.stats.share_accepted(hash_difficulty);
-            session.stats.worker_share_accepted(worker, hash_difficulty);
-            session.stats.mark_worker_submit(worker);
             HandleResult::Messages(vec![ResponseBuilder::ok(
                 &req.id,
                 serde_json::Value::Bool(true),
@@ -887,17 +870,8 @@ async fn handle_submit(
                     metrics::block_submission_success();
                     session
                         .stats
-                        .block_found(worker, &job_payout, &hex::encode(hash));
-                    session.shares_accepted += 1;
-                    session.vardiff.record_share();
-                    session.stats.add_share_diff(
-                        &session.session_id,
-                        worker,
-                        session.difficulty as f64,
-                    );
-                    session.stats.share_accepted(hash_difficulty);
-                    session.stats.worker_share_accepted(worker, hash_difficulty);
-                    session.stats.mark_worker_submit(worker);
+                        .block_found(worker, &job_payout, &block_hash_hex);
+                    accept_share(session, worker, hash_difficulty);
                     info!(
                         "🏆 Block submitted! worker={worker} hash={}",
                         hex::encode(hash)
@@ -922,15 +896,10 @@ async fn handle_submit(
             let validation_duration_ms = validation_start.elapsed().as_millis() as f64;
             metrics::share_validation_time(validation_duration_ms);
 
-            let reason = match &e {
-                PoolError::StaleJob(_) => "stale",
-                PoolError::DuplicateShare => "duplicate",
-                PoolError::LowDifficulty => "low_difficulty",
-                _ => "invalid",
-            };
+            let reason = RejectReason::from_error(&e);
             warn!(
                 worker = worker,
-                reason = reason,
+                reason = reason.label(),
                 job_id = %params.job_id,
                 extranonce2 = %hex::encode(&params.extranonce2),
                 ntime = %format!("{:08x}", params.ntime),
@@ -938,21 +907,43 @@ async fn handle_submit(
                 version_bits = ?params.version_bits,
                 "Share rejected: {e}"
             );
-            metrics::share_rejected(reason, worker);
-            session.stats.share_rejected();
-            session.stats.worker_share_rejected(worker, reason);
-            session.shares_rejected += 1;
-
-            // Low-difficulty shares are expected during vardiff transitions — the miner
-            // has in-flight work at the old difficulty. Don't count them as malicious.
-            let is_malicious = !matches!(e, PoolError::LowDifficulty | PoolError::StaleJob(_));
-            if is_malicious && session.guard.invalid_shares.record_invalid() {
+            if reject_share(session, reason) {
                 return HandleResult::Disconnect("too many invalid shares".into());
             }
 
             HandleResult::Messages(vec![ResponseBuilder::err(&req.id, e.to_stratum_error())])
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Share bookkeeping
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Book an accepted share: session counters, vardiff, and the pool-wide stats
+/// and metrics. Returns the difficulty credited to the hashrate estimator.
+fn accept_share(session: &mut Session, worker: &str, hash_difficulty: u64) -> u64 {
+    session.shares_accepted += 1;
+    session.vardiff.record_share();
+    let credit = session
+        .credit
+        .credit(session.difficulty, hash_difficulty, Instant::now());
+    accounting::record_accepted(
+        &session.stats,
+        &session.session_id,
+        worker,
+        credit,
+        hash_difficulty,
+    );
+    credit
+}
+
+/// Book a rejected share. Returns `true` when the session should be dropped for
+/// exceeding its invalid-share budget.
+fn reject_share(session: &mut Session, reason: RejectReason) -> bool {
+    session.shares_rejected += 1;
+    let worker = session.worker.clone().unwrap_or_else(|| "?".to_string());
+    accounting::record_rejected(&session.stats, &mut session.guard, &worker, reason)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

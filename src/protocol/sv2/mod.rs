@@ -26,6 +26,8 @@ use crate::{
     config::{Config, VardiffConfig},
     metrics,
     mining::{
+        accounting::{self, RejectReason},
+        credit::ShareCredit,
         engine::{JobBroadcast, TemplateEngine},
         identity::MinerIdentity,
         jobs::IssuedJobs,
@@ -90,6 +92,8 @@ struct Sv2Session {
     difficulty: u64,
     vardiff: Vardiff,
     vardiff_cfg: VardiffConfig,
+    /// What one accepted share is worth to the hashrate estimator.
+    credit: ShareCredit,
 
     share_set: ShareSet,
     guard: SessionGuard,
@@ -132,6 +136,7 @@ impl Sv2Session {
             difficulty: initial_diff,
             vardiff: Vardiff::new(cfg.vardiff.clone(), initial_diff),
             vardiff_cfg: cfg.vardiff.clone(),
+            credit: ShareCredit::new(cfg.vardiff.min_difficulty, Instant::now()),
             share_set: ShareSet::new(),
             guard: SessionGuard::new(&cfg.security),
             job_ids: VecDeque::new(),
@@ -360,6 +365,7 @@ pub async fn run(
         accepted = session.shares_accepted,
         rejected = session.shares_rejected,
         uptime_secs = uptime,
+        honors_set_difficulty = session.credit.honors_assigned(),
         "SV2 miner session ended"
     );
 }
@@ -663,12 +669,7 @@ async fn handle_submit(
             expected = session.extranonce_size,
             "SV2 submit has wrong extranonce length — rejecting"
         );
-        metrics::share_rejected("bad_extranonce", &worker);
-        session.stats.share_rejected();
-        session
-            .stats
-            .worker_share_rejected(&worker, "bad_extranonce");
-        if session.guard.invalid_shares.record_invalid() {
+        if reject_share(session, RejectReason::BadExtranonce) {
             return Flow::Disconnect("too many invalid shares".into());
         }
         return reject(
@@ -690,12 +691,7 @@ async fn handle_submit(
     let job_entry = match job_entry {
         Some(e) => e,
         None => {
-            metrics::share_rejected("job_not_found", &worker);
-            session.stats.share_rejected();
-            session
-                .stats
-                .worker_share_rejected(&worker, "job_not_found");
-            if session.guard.invalid_shares.record_invalid() {
+            if reject_share(session, RejectReason::JobNotFound) {
                 return Flow::Disconnect("too many invalid shares".into());
             }
             return reject(session, writer, submit.sequence_number, "stale-job").await;
@@ -725,10 +721,7 @@ async fn handle_submit(
         submit.version & mask,
     );
     if session.share_set.contains(&share_key) {
-        metrics::share_rejected("duplicate", &worker);
-        session.stats.share_rejected();
-        session.stats.worker_share_rejected(&worker, "duplicate");
-        if session.guard.invalid_shares.record_invalid() {
+        if reject_share(session, RejectReason::Duplicate) {
             return Flow::Disconnect("too many invalid shares".into());
         }
         return reject(session, writer, submit.sequence_number, "duplicate-share").await;
@@ -772,22 +765,13 @@ async fn handle_submit(
             hash,
         }) => {
             metrics::share_validation_time(validation_start.elapsed().as_millis() as f64);
+            let credit = accept_share(session, &worker, hash_difficulty);
             debug!(
                 worker = %worker, hash = %hex::encode(hash), diff = assigned_difficulty,
-                hash_diff = hash_difficulty, latency_ms = submit_start.elapsed().as_millis(),
+                hash_diff = hash_difficulty, credit = credit,
+                latency_ms = submit_start.elapsed().as_millis(),
                 "SV2 share accepted"
             );
-            session.shares_accepted += 1;
-            session.vardiff.record_share();
-            session
-                .stats
-                .add_share_diff(&session.session_id, &worker, session.difficulty as f64);
-            metrics::share_accepted(assigned_difficulty, &worker);
-            session.stats.share_accepted(hash_difficulty);
-            session
-                .stats
-                .worker_share_accepted(&worker, hash_difficulty);
-            session.stats.mark_worker_submit(&worker);
             accept(session, writer, submit.sequence_number).await
         }
 
@@ -814,19 +798,8 @@ async fn handle_submit(
                     metrics::block_submission_success();
                     session
                         .stats
-                        .block_found(&worker, &job_payout, &hex::encode(hash));
-                    session.shares_accepted += 1;
-                    session.vardiff.record_share();
-                    session.stats.add_share_diff(
-                        &session.session_id,
-                        &worker,
-                        session.difficulty as f64,
-                    );
-                    session.stats.share_accepted(hash_difficulty);
-                    session
-                        .stats
-                        .worker_share_accepted(&worker, hash_difficulty);
-                    session.stats.mark_worker_submit(&worker);
+                        .block_found(&worker, &job_payout, &block_hash_hex);
+                    accept_share(session, &worker, hash_difficulty);
                     info!(
                         "🏆 Block submitted (SV2)! worker={worker} hash={}",
                         hex::encode(hash)
@@ -849,28 +822,43 @@ async fn handle_submit(
 
         Err(e) => {
             metrics::share_validation_time(validation_start.elapsed().as_millis() as f64);
-            let reason = match &e {
-                crate::error::PoolError::StaleJob(_) => "stale",
-                crate::error::PoolError::DuplicateShare => "duplicate",
-                crate::error::PoolError::LowDifficulty => "low_difficulty",
-                _ => "invalid",
-            };
-            warn!(worker = %worker, reason, nonce = %format!("{:08x}", submit.nonce), "SV2 share rejected: {e}");
-            metrics::share_rejected(reason, &worker);
-            session.stats.share_rejected();
-            session.stats.worker_share_rejected(&worker, reason);
-            session.shares_rejected += 1;
-
-            let is_malicious = !matches!(
-                e,
-                crate::error::PoolError::LowDifficulty | crate::error::PoolError::StaleJob(_)
-            );
-            if is_malicious && session.guard.invalid_shares.record_invalid() {
+            let reason = RejectReason::from_error(&e);
+            warn!(worker = %worker, reason = reason.label(), nonce = %format!("{:08x}", submit.nonce), "SV2 share rejected: {e}");
+            if reject_share(session, reason) {
                 return Flow::Disconnect("too many invalid shares".into());
             }
-            reject(session, writer, submit.sequence_number, reason).await
+            reject(session, writer, submit.sequence_number, reason.label()).await
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Share bookkeeping (mirrors the SV1 session; both go through `accounting`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Book an accepted share. Returns the difficulty credited to the estimator.
+fn accept_share(session: &mut Sv2Session, worker: &str, hash_difficulty: u64) -> u64 {
+    session.shares_accepted += 1;
+    session.vardiff.record_share();
+    let credit = session
+        .credit
+        .credit(session.difficulty, hash_difficulty, Instant::now());
+    accounting::record_accepted(
+        &session.stats,
+        &session.session_id,
+        worker,
+        credit,
+        hash_difficulty,
+    );
+    credit
+}
+
+/// Book a rejected share. Returns `true` when the session should be dropped for
+/// exceeding its invalid-share budget.
+fn reject_share(session: &mut Sv2Session, reason: RejectReason) -> bool {
+    session.shares_rejected += 1;
+    let worker = session.worker.clone().unwrap_or_else(|| "?".to_string());
+    accounting::record_rejected(&session.stats, &mut session.guard, &worker, reason)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
