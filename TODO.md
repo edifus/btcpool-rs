@@ -33,6 +33,9 @@ underflow panic). Line references are as of that review and may drift.
   stats loop. Rather than wrap each call site, `RpcClient`'s synchronous method
   bodies are now private and the only public surface is `async` wrappers that
   `spawn_blocking` internally, so a future call site cannot reintroduce the bug.
+  `bitcoin_rpc.timeout_secs` is applied at last (it was parsed, documented, and
+  then dropped on the floor) — it is what bounds how long a wedged node can hold
+  a blocking-pool thread, since a `spawn_blocking` task cannot be cancelled.
 
 - [ ] **The template engine can stop refreshing without anyone noticing.** If
   the ZMQ/poll task exits, `TemplateEngine::run` breaks out of its loop

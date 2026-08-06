@@ -45,6 +45,15 @@ everything else bumps the **patch** version.
   recur.
 
 ### Fixed
+- **`bitcoin_rpc.timeout_secs` was parsed, documented, and then never applied.**
+  The client was built with the JSON-RPC transport's hardcoded 15-second
+  default, so setting the option did nothing — including on the client rebuilt
+  after a cookie rotation. It is now honoured on both construction paths. This
+  matters more than it used to: RPC calls run on the blocking pool, where a task
+  cannot be cancelled, so the transport timeout is the only bound on how long an
+  unresponsive node can hold a thread. Operators whose node needs more than the
+  default 10 seconds to answer `getblocktemplate` should raise the value — it is
+  now enforced where 15 seconds silently applied before.
 - Hashrate averages no longer restart from zero when the service restarts.
   Per-worker decay state is checkpointed with the chart history, restored from
   SQLite at startup, and decayed across the time the service was offline.

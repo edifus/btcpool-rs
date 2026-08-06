@@ -13,9 +13,10 @@
 /// from parking a runtime worker on a node round trip.
 use crate::{config::RpcConfig, error::PoolError};
 use anyhow::{anyhow, Result};
-use bitcoincore_rpc::{Client, RpcApi};
+use bitcoincore_rpc::{jsonrpc, Auth, Client, RpcApi};
 use serde_json::{json, Value};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
@@ -59,8 +60,11 @@ impl RpcClient {
     pub fn new(cfg: &RpcConfig) -> Result<Self> {
         let cookie = cfg.read_cookie().ok();
         let auth = cfg.rpc_auth()?;
-        let client = Client::new(&cfg.url, auth)?;
-        info!("Bitcoin RPC connected to {}", cfg.url);
+        let client = build_client(cfg, auth)?;
+        info!(
+            "Bitcoin RPC connected to {} (timeout {}s)",
+            cfg.url, cfg.timeout_secs
+        );
         Ok(Self {
             cfg: cfg.clone(),
             state: RwLock::new(Inner { client, cookie }),
@@ -97,11 +101,11 @@ impl RpcClient {
         }
 
         warn!("Bitcoin RPC cookie changed on disk; rebuilding client and retrying");
-        let new_client = Client::new(
-            &self.cfg.url,
-            bitcoincore_rpc::Auth::UserPass(fresh_cookie.0.clone(), fresh_cookie.1.clone()),
+        let new_client = build_client(
+            &self.cfg,
+            Auth::UserPass(fresh_cookie.0.clone(), fresh_cookie.1.clone()),
         )
-        .map_err(PoolError::Rpc)?;
+        .map_err(PoolError::Other)?;
 
         {
             let mut guard = self.state.write().expect("rpc state lock poisoned");
@@ -330,6 +334,29 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| PoolError::Other(anyhow!("{what} RPC task panicked: {e}")))?
+}
+
+/// Build a client that honours `timeout_secs`.
+///
+/// `Client::new` builds the transport with jsonrpc's hardcoded 15 s default and
+/// offers no way to override it, so the configured value went unused. It matters
+/// now: a `spawn_blocking` task cannot be cancelled, so the transport timeout is
+/// the only bound on how long a wedged node can hold a blocking-pool thread.
+/// This mirrors what `Client::new` does — URL, then basic auth when a user is
+/// present — with the timeout applied.
+fn build_client(cfg: &RpcConfig, auth: Auth) -> Result<Client> {
+    let (user, pass) = auth.get_user_pass()?;
+
+    let mut builder = jsonrpc::simple_http::Builder::new()
+        .url(&cfg.url)?
+        .timeout(Duration::from_secs(cfg.timeout_secs));
+    if let Some(user) = user {
+        builder = builder.auth(user, pass);
+    }
+
+    Ok(Client::from_jsonrpc(jsonrpc::Client::with_transport(
+        builder.build(),
+    )))
 }
 
 fn parse_gbt_transaction(tx: &Value) -> Result<GbtTransaction, PoolError> {

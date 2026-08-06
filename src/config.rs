@@ -123,7 +123,9 @@ pub struct RpcConfig {
     /// Explicit credentials (used only when cookie_path is absent / unreadable)
     pub user: Option<String>,
     pub password: Option<String>,
-    #[allow(dead_code)]
+    /// Transport timeout for every RPC round trip. Because the calls run on the
+    /// blocking pool, where a task cannot be cancelled, this is what bounds how
+    /// long an unresponsive node holds a thread.
     pub timeout_secs: u64,
 }
 
