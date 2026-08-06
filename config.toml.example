@@ -25,7 +25,14 @@ listen_addr = "0.0.0.0:3333"
 # miner as BITCOIN_ADDRESS or BITCOIN_ADDRESS.worker. The address must match the
 # connected node's network.
 
-# Tag embedded in the coinbase scriptSig (max ~20 bytes)
+# Tag embedded in the coinbase scriptSig.
+#
+# Consensus limits the whole coinbase scriptSig to 100 bytes, and it also holds
+# the BIP34 block height (up to 5 bytes) and the extranonce
+# (extranonce1_size + extranonce2_size). The pool refuses to start if the total
+# would exceed 100 — with the default 4 + 4 extranonce that leaves ~91 bytes for
+# this tag, but there is no reason to use them: it only appears in the coinbase
+# of a block you find.
 coinbase_tag = "/btcpool-rs/"
 
 # Optional safety assertion. The pool always detects the actual network from

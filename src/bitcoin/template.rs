@@ -283,40 +283,20 @@ fn build_coinbase(
     let height_script = encode_bip34_height(height);
     let tag_bytes = tag.as_bytes();
 
-    // We need to know the offset before building the script, so we compute
-    // where the extranonce will land inside the serialized transaction.
-    //
-    // CoinbaseTx layout (simplified):
-    //   4  version
-    //   1  marker (segwit) or ...
-    //   varint  vin count = 1
-    //   36 outpoint (32 hash + 4 index)
-    //   varint  scriptSig len
-    //   N  scriptSig content   ← extranonce is inside here
-    //   4  sequence
-    //   ...outputs...
-    //
-    // We build a "dummy" scriptSig, serialize the tx, then locate the
-    // extranonce bytes by searching for a known sentinel.
-
     let en_total = extranonce1_len + extranonce2_len;
     if en_total == 0 {
         return Err(PoolError::Other(anyhow::anyhow!(
             "Total extranonce width must be at least one byte"
         )));
     }
-    const SENTINEL_PATTERN: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
-    let sentinel: Vec<u8> = SENTINEL_PATTERN
-        .iter()
-        .copied()
-        .cycle()
-        .take(en_total)
-        .collect();
 
-    let mut script_sig_content = Vec::new();
+    let script_sig_len = height_script.len() + tag_bytes.len() + en_total;
+    check_coinbase_script_sig_len(script_sig_len)?;
+
+    let mut script_sig_content = Vec::with_capacity(script_sig_len);
     script_sig_content.extend_from_slice(&height_script);
     script_sig_content.extend_from_slice(tag_bytes);
-    script_sig_content.extend_from_slice(&sentinel);
+    script_sig_content.resize(script_sig_len, 0x00); // extranonce placeholder
 
     let script_sig = ScriptBuf::from_bytes(script_sig_content.clone());
 
@@ -356,21 +336,48 @@ fn build_coinbase(
 
     let serialized = serialize(&tx);
 
-    // ── Locate extranonce offset inside the serialized bytes ──────────────────
-    let script_offset = find_bytes(&serialized, &script_sig_content).ok_or_else(|| {
-        PoolError::Other(anyhow::anyhow!(
-            "Coinbase scriptSig not found after serialization"
-        ))
-    })?;
-    let offset = script_offset + height_script.len() + tag_bytes.len();
+    // ── Locate the extranonce placeholder inside the serialized bytes ─────────
+    //
+    // Legacy coinbase layout, which is what `serialize` emits for an input with
+    // no witness:
+    //   4       version
+    //   1       vin count (varint, always 1)
+    //   36      outpoint (32-byte null hash + 4-byte index)
+    //   1       scriptSig length (varint; one byte because consensus caps the
+    //           scriptSig at 100 bytes, enforced above)
+    //   N       scriptSig    ← height ‖ tag ‖ extranonce
+    //   4       sequence
+    //   …       outputs, locktime
+    //
+    // so the offset is arithmetic. The debug assertion pins that against a
+    // search for the actual bytes.
+    const SCRIPT_SIG_OFFSET: usize = 4 + 1 + 36 + 1;
+    let offset = SCRIPT_SIG_OFFSET + height_script.len() + tag_bytes.len();
+    debug_assert_eq!(
+        find_bytes(&serialized, &script_sig_content),
+        Some(SCRIPT_SIG_OFFSET),
+        "coinbase scriptSig is not where the layout says it is"
+    );
 
-    // Replace sentinel with zeros
-    let mut final_bytes = serialized;
-    for i in offset..offset + en_total.min(final_bytes.len() - offset) {
-        final_bytes[i] = 0x00;
+    Ok((serialized, offset))
+}
+
+/// Consensus bounds on the coinbase scriptSig (`bad-cb-length`): at least 2
+/// bytes, at most 100. Everything in it is operator-configured — the BIP34
+/// height push, `coinbase_tag`, and the extranonce widths — so an over-long tag
+/// would otherwise only surface as a rejected block, on the day one is found.
+pub const MAX_COINBASE_SCRIPT_SIG: usize = 100;
+pub const MIN_COINBASE_SCRIPT_SIG: usize = 2;
+
+pub fn check_coinbase_script_sig_len(len: usize) -> Result<(), PoolError> {
+    if !(MIN_COINBASE_SCRIPT_SIG..=MAX_COINBASE_SCRIPT_SIG).contains(&len) {
+        return Err(PoolError::Other(anyhow::anyhow!(
+            "coinbase scriptSig would be {len} bytes; consensus requires \
+             {MIN_COINBASE_SCRIPT_SIG}..={MAX_COINBASE_SCRIPT_SIG} \
+             (BIP34 height push + coinbase_tag + extranonce1_size + extranonce2_size)"
+        )));
     }
-
-    Ok((final_bytes, offset))
+    Ok(())
 }
 
 /// Encode the block height for the BIP34 coinbase scriptSig, matching Bitcoin
@@ -710,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn coinbase_uses_exact_extranonce_width_below_sentinel_pattern() {
+    fn coinbase_reserves_exactly_the_requested_extranonce_width() {
         let payout = payout("address", vec![0x51]);
         let job = build_job_for_payout(sample_template(), &payout, "/test/", 1, 1).unwrap();
         let assembled = job.assemble_coinbase(&[0x12], &[0x34]);
@@ -719,6 +726,42 @@ mod tests {
             &[0x12, 0x34]
         );
         assert_eq!(assembled.len(), job.coinbase_template.len());
+    }
+
+    /// The extranonce offset is now computed from the serialization layout
+    /// rather than found by scanning. Check it against a full deserialization
+    /// for both the one-byte and the wide extranonce case.
+    #[test]
+    fn extranonce_offset_lands_inside_the_serialized_script_sig() {
+        for (en1, en2) in [(1usize, 1usize), (4, 4), (8, 8)] {
+            let payout = payout("address", vec![0x51]);
+            let job =
+                build_job_for_payout(sample_template(), &payout, "/btcpool-rs/", en1, en2).unwrap();
+            let filled = job.assemble_coinbase(&vec![0xAB; en1], &vec![0xCD; en2]);
+            let tx: Transaction = deserialize(&filled).unwrap();
+            let script_sig = tx.input[0].script_sig.as_bytes();
+            let tail = &script_sig[script_sig.len() - (en1 + en2)..];
+            assert_eq!(tail, [vec![0xABu8; en1], vec![0xCDu8; en2]].concat());
+        }
+    }
+
+    #[test]
+    fn an_overlong_coinbase_tag_is_rejected_rather_than_mined() {
+        // Consensus caps the coinbase scriptSig at 100 bytes; a tag that pushes
+        // it over would only surface as `bad-cb-length` on the day a block is
+        // found, so the job build must refuse it here.
+        let payout = payout("address", vec![0x51]);
+        let tag = "x".repeat(MAX_COINBASE_SCRIPT_SIG);
+        let err = build_job_for_payout(sample_template(), &payout, &tag, 4, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("coinbase scriptSig"),
+            "unexpected error: {err}"
+        );
+
+        // And the largest tag that still fits is accepted.
+        let height_push = encode_bip34_height(900_000).len();
+        let fits = "x".repeat(MAX_COINBASE_SCRIPT_SIG - height_push - 8);
+        assert!(build_job_for_payout(sample_template(), &payout, &fits, 4, 4).is_ok());
     }
 
     #[test]

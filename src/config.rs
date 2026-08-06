@@ -267,6 +267,24 @@ impl Config {
                  a zero total extranonce width underflows SV2 channel setup"
             );
         }
+        // Consensus caps the coinbase scriptSig at 100 bytes (`bad-cb-length`),
+        // and everything in it is configured here. Check the worst case — the
+        // widest BIP34 height push — so the pool cannot run for months and then
+        // have its one found block rejected.
+        let widest_height_push = 5; // 1 length byte + up to 4 bytes of height
+        let script_sig_len = widest_height_push
+            + self.pool.coinbase_tag.len()
+            + self.pool.extranonce1_size
+            + self.pool.extranonce2_size;
+        crate::bitcoin::template::check_coinbase_script_sig_len(script_sig_len).map_err(|e| {
+            anyhow::anyhow!(
+                "{e}; shorten [pool] coinbase_tag ({} bytes) or the extranonce sizes ({} + {})",
+                self.pool.coinbase_tag.len(),
+                self.pool.extranonce1_size,
+                self.pool.extranonce2_size,
+            )
+        })?;
+
         if self.sv2.enabled
             && self.sv2.persist_authority_key
             && self.sv2.authority_key_file.trim().is_empty()
@@ -391,7 +409,82 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_env_overrides, PoolConfig};
+    use super::{apply_env_overrides, Config, PoolConfig};
+
+    /// A complete, valid config; tests override single values on top of it.
+    fn config_toml(coinbase_tag: &str, extranonce1: usize, extranonce2: usize) -> String {
+        format!(
+            r#"
+[pool]
+listen_addr = "127.0.0.1:3333"
+coinbase_tag = "{coinbase_tag}"
+initial_difficulty = 4096
+extranonce1_size = {extranonce1}
+extranonce2_size = {extranonce2}
+max_connections = 16
+idle_timeout_secs = 300
+
+[bitcoin_rpc]
+url = "http://127.0.0.1:8332"
+timeout_secs = 10
+
+[zmq]
+hashblock_endpoint = "tcp://127.0.0.1:28332"
+poll_fallback = true
+poll_interval_ms = 1000
+
+[vardiff]
+target_share_time_secs = 15
+retarget_interval_secs = 60
+min_difficulty = 4096
+max_difficulty = 65536
+max_retarget_factor = 4.0
+
+[security]
+max_connections_per_ip = 5
+max_shares_per_sec = 500
+ban_duration_secs = 600
+max_invalid_shares = 5
+max_message_bytes = 4096
+
+[metrics]
+prometheus_addr = "127.0.0.1:9090"
+
+[logging]
+level = "info"
+json = false
+"#
+        )
+    }
+
+    fn validate(coinbase_tag: &str, extranonce1: usize, extranonce2: usize) -> anyhow::Result<()> {
+        let config: Config =
+            toml::from_str(&config_toml(coinbase_tag, extranonce1, extranonce2)).unwrap();
+        config.validate()
+    }
+
+    /// Consensus caps the coinbase scriptSig at 100 bytes. Everything in it is
+    /// configured here, so an over-long tag has to fail at boot — the
+    /// alternative is discovering it as `bad-cb-length` on the one block the
+    /// pool ever finds.
+    #[test]
+    fn coinbase_script_sig_length_is_enforced_at_boot() {
+        assert!(validate("/btcpool-rs/", 4, 4).is_ok());
+
+        let err = validate(&"x".repeat(96), 4, 4).unwrap_err().to_string();
+        assert!(
+            err.contains("coinbase scriptSig"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("coinbase_tag"), "unexpected error: {err}");
+
+        // Wide extranonces count against the same budget.
+        let err = validate("/btcpool-rs/", 64, 32).unwrap_err().to_string();
+        assert!(
+            err.contains("coinbase scriptSig"),
+            "unexpected error: {err}"
+        );
+    }
 
     // Fixtures pass vars directly instead of mutating the process environment,
     // so tests stay parallel-safe.
