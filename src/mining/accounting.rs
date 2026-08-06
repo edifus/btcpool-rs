@@ -8,7 +8,10 @@
 /// drift (the Prometheus share-difficulty histogram and the dashboard hashrate
 /// were recording different difficulties). The session keeps its own local
 /// counters and vardiff — only the pool-wide bookkeeping lives here.
-use crate::{error::PoolError, metrics, security::SessionGuard, stats::PoolStats};
+use crate::{
+    bitcoin::rpc::BlockSubmitOutcome, error::PoolError, metrics, security::SessionGuard,
+    stats::PoolStats,
+};
 
 /// Why a share was not accepted. A closed set, so the `reason` Prometheus label
 /// cannot be minted from untrusted input.
@@ -102,6 +105,33 @@ pub fn record_rejected(
     reason.counts_as_invalid() && guard.invalid_shares.record_invalid()
 }
 
+/// Record what the node did with a block we submitted.
+///
+/// Shared by the SV1 and SV2 session loops *and* the engine's background
+/// resubmit task — three hand-written copies of this sequence is exactly how
+/// the stale-tip miscount got in. Only a block that won its height is a find:
+/// an `Inconclusive` block is consensus-valid but sits on a side branch and
+/// earned nothing, so it must not move `pool_blocks_found_total` or the
+/// dashboard's last-block card.
+///
+/// Callers log their own line — they carry protocol and retry-attempt context
+/// this does not.
+pub fn record_block_outcome(
+    stats: &PoolStats,
+    outcome: BlockSubmitOutcome,
+    worker: &str,
+    payout: &str,
+    hash_hex: &str,
+) {
+    metrics::block_submission_outcome(outcome.label());
+    if outcome.is_win() {
+        metrics::block_found();
+        stats.block_found(worker, payout, hash_hex);
+    } else {
+        stats.block_inconclusive();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +164,40 @@ mod tests {
             RejectReason::from_error(&PoolError::NotAuthorized).label(),
             "invalid"
         );
+    }
+
+    #[test]
+    fn a_superseded_block_is_not_counted_as_found() {
+        let stats = PoolStats::new_with_store(None);
+        record_block_outcome(
+            &stats,
+            BlockSubmitOutcome::Inconclusive,
+            "worker1",
+            "bc1qpayout",
+            "00000000000000000000deadbeef",
+        );
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.blocks_found, 0);
+        assert_eq!(snap.blocks_inconclusive, 1);
+        // The last-block card must still be empty — nothing was won.
+        assert_eq!(snap.last_block_hash, "—");
+        assert_eq!(snap.last_block_worker, "—");
+        assert_eq!(snap.last_block_ts, 0);
+    }
+
+    #[test]
+    fn a_winning_block_updates_the_count_and_the_last_block_card() {
+        for outcome in [BlockSubmitOutcome::Accepted, BlockSubmitOutcome::Duplicate] {
+            let stats = PoolStats::new_with_store(None);
+            record_block_outcome(&stats, outcome, "worker1", "bc1qpayout", "0000cafe");
+
+            let snap = stats.snapshot();
+            assert_eq!(snap.blocks_found, 1, "{outcome:?}");
+            assert_eq!(snap.blocks_inconclusive, 0, "{outcome:?}");
+            assert_eq!(snap.last_block_hash, "0000cafe", "{outcome:?}");
+            assert_eq!(snap.last_block_worker, "worker1", "{outcome:?}");
+            assert_eq!(snap.last_block_payout, "bc1qpayout", "{outcome:?}");
+        }
     }
 }

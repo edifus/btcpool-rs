@@ -64,15 +64,26 @@ underflow panic). Line references are as of that review and may drift.
   100% of its shares until the session was dropped. `refresh` now derives
   `clean` by comparing `prev_hash`.
 
-- [ ] **Stale-tip blocks are reported as wins.** `submit_block` maps
-  `"inconclusive"` to `Ok(())` (`rpc.rs:230-234`), and both call sites
-  (`session.rs:860-871`, `sv2/mod.rs:791-801`) treat `Ok` as a find: they fire
-  `metrics::block_found()`, `block_submission_success()`, `stats.block_found()`
-  and log `🏆 Block submitted!`. So a valid-but-superseded block that earned
-  nothing shows up on the dashboard and in `pool_blocks_found_total` as a block
-  found. Thread a three-way outcome out of `submit_block` and count
-  `Inconclusive` separately. Split out of the item above, where it was noted as
-  optional.
+- [x] **Stale-tip blocks are reported as wins** (fixed 2026-08-06):
+  `submit_block` now returns `BlockSubmitOutcome::{Accepted, Duplicate,
+  Inconclusive}`, threaded through `submit_found_block`, and only `is_win()`
+  outcomes reach `metrics::block_found()` / `stats.block_found()`.
+
+  Three corrections to this entry's original framing, found while fixing it.
+  `"duplicate-inconclusive"` was grouped with plain `"duplicate"` and had the
+  identical false-win problem, so it is `Inconclusive` too. There was a third
+  reporting site the entry missed — the background resubmit task in
+  `engine.rs` — and it is the one most likely to see an inconclusive result,
+  because it runs minutes after the block was found. And the reporting sequence
+  existed as three hand-written copies, which is how the miscount spread; it now
+  lives in `accounting::record_block_outcome`, alongside the share-accounting
+  helpers that exist for the same reason.
+- [ ] **Confirm block wins survive a reorg.** `pool_blocks_found_total` is
+  decided by the `submitblock` response, which is only true at that instant. A
+  block that wins its height and is then reorged out is still counted. A
+  deferred confirmation pass — re-check the hash with `getblockheader` after N
+  confirmations and reconcile — would close the gap. Low priority: it needs a
+  reorg *and* a block, and unlike the stale-tip case the pool did win the race.
 - [x] **Harden the duplicate-share set** (shipped in v0.6.0, 2026-07-02):
   shares are recorded for dedup only after validation passes, and the
   per-session set clears on every clean-job broadcast (live-jobs scoping); the

@@ -9,9 +9,14 @@ use crate::metrics;
 /// Sessions materialize payout-specific jobs and retain their own bounded job
 /// history so a submitted job can only pay the identity that received it.
 use crate::{
-    bitcoin::{rpc::RpcClient, template, zmq::NewBlockReceiver},
+    bitcoin::{
+        rpc::{BlockSubmitOutcome, RpcClient},
+        template,
+        zmq::NewBlockReceiver,
+    },
     config::PoolConfig,
     error::PoolError,
+    mining::accounting,
 };
 use std::{
     path::{Path, PathBuf},
@@ -265,6 +270,12 @@ impl TemplateEngine {
     /// RPC failures are retried in-line a few times, and if those fail a
     /// detached background task keeps retrying while the caller reports the
     /// failure.
+    ///
+    /// `Ok` is not the same as a win — check
+    /// [`BlockSubmitOutcome::is_win`](crate::bitcoin::rpc::BlockSubmitOutcome::is_win)
+    /// before reporting one. A block that lost a same-height race comes back as
+    /// `Ok(Inconclusive)`: the node took it and stored it, and it earned
+    /// nothing.
     pub async fn submit_found_block(
         self: &Arc<Self>,
         height: u64,
@@ -273,7 +284,7 @@ impl TemplateEngine {
         worker: &str,
         payout: &str,
         stats: Arc<crate::stats::PoolStats>,
-    ) -> Result<(), PoolError> {
+    ) -> Result<BlockSubmitOutcome, PoolError> {
         let block_hex = Arc::new(block_hex);
 
         // Archive concurrently on a blocking thread — submission is in a race
@@ -290,7 +301,10 @@ impl TemplateEngine {
         let mut last_err = None;
         for attempt in 1..=SUBMIT_INLINE_ATTEMPTS {
             match self.rpc.submit_block(block_hex.clone()).await {
-                Ok(()) => return Ok(()),
+                // Terminal for every outcome, including `Inconclusive`:
+                // resubmitting a block the node already stored on a side branch
+                // cannot promote it to the tip.
+                Ok(outcome) => return Ok(outcome),
                 Err(e) if is_permanent_reject(&e) => return Err(e),
                 Err(e) => {
                     warn!(
@@ -337,16 +351,24 @@ impl TemplateEngine {
                 tokio::time::sleep(SUBMIT_RETRY_INTERVAL).await;
                 attempt += 1;
                 match engine.rpc.submit_block(block_hex.clone()).await {
-                    Ok(()) => {
-                        metrics::block_found();
-                        metrics::block_submission_success();
+                    Ok(outcome) => {
                         // Mirror the inline-success path so the dashboard's
                         // block count / last-block panel agree with Prometheus.
-                        stats.block_found(&worker, &payout, &hash_hex);
-                        info!(
-                            "🏆 Block {hash_hex} (height {height}) accepted on \
-                             retry attempt {attempt}"
+                        accounting::record_block_outcome(
+                            &stats, outcome, &worker, &payout, &hash_hex,
                         );
+                        if outcome.is_win() {
+                            info!(
+                                "🏆 Block {hash_hex} (height {height}) accepted on \
+                                 retry attempt {attempt}"
+                            );
+                        } else {
+                            warn!(
+                                "Block {hash_hex} (height {height}) was valid but lost \
+                                 its height race on retry attempt {attempt}; it is stored \
+                                 on a side branch and earned nothing"
+                            );
+                        }
                         return;
                     }
                     Err(e) if is_permanent_reject(&e) => {

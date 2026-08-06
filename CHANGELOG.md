@@ -53,7 +53,21 @@ everything else bumps the **patch** version.
   keep using the stripped serialization, so the txid is unchanged.
 - Share statistics and metrics for SV1 and SV2 now go through one shared
   accounting path, and rejection reasons are a closed enum rather than
-  duplicated string literals at each site.
+  duplicated string literals at each site. Block-submission reporting now goes
+  through that same path.
+- **Breaking (metrics): `pool_block_submissions_success_total` is removed,**
+  replaced by `pool_block_submissions_total{outcome="accepted"|"duplicate"|
+  "inconclusive"}`. The old counter was incremented on the line directly after
+  every `pool_blocks_found_total` increment and nowhere else, so the two always
+  carried identical values under different names; the labelled counter gives the
+  node's actual verdict instead. `pool_blocks_found_total` keeps its name and
+  stays unlabelled — it is the headline number and should not need a label
+  matcher to read — and is now equivalent to
+  `sum(pool_block_submissions_total{outcome=~"accepted|duplicate"})`.
+  `pool_block_submissions_failed_total{reason}` is unchanged.
+- `GET /stats` gains `blocks_inconclusive`, the count of valid blocks that lost
+  their height race. Like `blocks_found` it is in-memory only and resets on
+  restart.
 - SQLite persistence moved off the async runtime: writes are queued to a
   dedicated writer thread, dashboard history queries run on the blocking pool,
   and the database is opened with `journal_mode=WAL`, `synchronous=NORMAL` and a
@@ -73,6 +87,20 @@ everything else bumps the **patch** version.
   recur.
 
 ### Fixed
+- **Blocks that lost a same-height race were reported as wins.** `submitblock`
+  answers `"inconclusive"` when it accepts and stores a consensus-valid block
+  that did not become the chain tip — the block sits on a side branch and earns
+  nothing. That was mapped to a bare `Ok(())`, indistinguishable from a real
+  find, so a superseded block incremented `pool_blocks_found_total`, incremented
+  the `/stats` block count, overwrote the dashboard's "Last block found" card
+  and logged `🏆 Block submitted!`. `submit_block` now returns a three-way
+  `BlockSubmitOutcome`, and only `Accepted`/`Duplicate` count as a find.
+  `"duplicate-inconclusive"` was grouped with plain `"duplicate"` and had the
+  same problem; it is now `Inconclusive` too. The miner is unaffected: its share
+  is still credited and acked, because a valid block-difficulty share losing a
+  race is not its fault. Fixed at all three reporting sites — SV1, SV2, and the
+  background resubmit task, which is the one most likely to see it, since it
+  runs minutes after the block was found.
 - **The template engine could stop refreshing without anyone noticing.** The ZMQ
   listener had no reconnect — a single receive error ended it permanently. With
   `poll_fallback = false` that dropped the only `watch::Sender`, and the

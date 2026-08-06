@@ -788,17 +788,27 @@ async fn handle_submit(
                 )
                 .await
             {
-                Ok(_) => {
-                    metrics::block_found();
-                    metrics::block_submission_success();
-                    session
-                        .stats
-                        .block_found(&worker, &job_payout, &block_hash_hex);
-                    accept_share(session, &worker, hash_difficulty);
-                    info!(
-                        "🏆 Block submitted (SV2)! worker={worker} hash={}",
-                        hex::encode(hash)
+                Ok(outcome) => {
+                    accounting::record_block_outcome(
+                        &session.stats,
+                        outcome,
+                        &worker,
+                        &job_payout,
+                        &block_hash_hex,
                     );
+                    // Credited and acked either way: the miner produced a valid
+                    // block-difficulty share, and losing a same-height race is
+                    // not its fault.
+                    accept_share(session, &worker, hash_difficulty);
+                    if outcome.is_win() {
+                        info!("🏆 Block submitted (SV2)! worker={worker} hash={block_hash_hex}");
+                    } else {
+                        warn!(
+                            "SV2 block from worker={worker} hash={block_hash_hex} was valid but \
+                             lost its height race; it is stored on a side branch and earned \
+                             nothing"
+                        );
+                    }
                     accept(session, writer, submit.sequence_number).await
                 }
                 Err(e) => {

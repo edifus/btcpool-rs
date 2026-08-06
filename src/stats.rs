@@ -654,6 +654,10 @@ pub struct PoolStats {
     shares_accepted: AtomicU64,
     shares_rejected: AtomicU64,
     blocks_found: AtomicU64,
+    /// Blocks we mined that were consensus-valid but lost a same-height race,
+    /// so they sit on a side branch and earned nothing. Tracked apart from
+    /// `blocks_found` so the dashboard cannot report them as wins.
+    blocks_inconclusive: AtomicU64,
     connected_miners: AtomicU64,
     current_height: AtomicU64,
     current_coinbase_value: AtomicU64,
@@ -805,6 +809,7 @@ impl PoolStats {
             shares_accepted: AtomicU64::new(0),
             shares_rejected: AtomicU64::new(0),
             blocks_found: AtomicU64::new(0),
+            blocks_inconclusive: AtomicU64::new(0),
             connected_miners: AtomicU64::new(0),
             current_height: AtomicU64::new(0),
             current_coinbase_value: AtomicU64::new(0),
@@ -881,6 +886,14 @@ impl PoolStats {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         self.last_block_ts.store(now, Ordering::Relaxed);
+    }
+
+    /// A block that was valid but did not become the chain tip.
+    ///
+    /// Deliberately does not touch `last_block_*`: the dashboard's "Last block
+    /// found" card must only ever show a block that actually won.
+    pub fn block_inconclusive(&self) {
+        self.blocks_inconclusive.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn update_height(&self, height: u64, coinbase_value: u64, transaction_count: u64) {
@@ -1346,6 +1359,7 @@ impl PoolStats {
             shares_accepted: self.shares_accepted.load(Ordering::Relaxed),
             shares_rejected: self.shares_rejected.load(Ordering::Relaxed),
             blocks_found: self.blocks_found.load(Ordering::Relaxed),
+            blocks_inconclusive: self.blocks_inconclusive.load(Ordering::Relaxed),
             connected_miners: self.connected_miners.load(Ordering::Relaxed),
             current_height: self.current_height.load(Ordering::Relaxed),
             current_coinbase_value: self.current_coinbase_value.load(Ordering::Relaxed),
@@ -1405,6 +1419,8 @@ pub struct StatsSnapshot {
     pub shares_accepted: u64,
     pub shares_rejected: u64,
     pub blocks_found: u64,
+    /// Valid blocks that lost a same-height race and earned nothing.
+    pub blocks_inconclusive: u64,
     pub connected_miners: u64,
     pub current_height: u64,
     pub current_coinbase_value: u64,

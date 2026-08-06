@@ -404,7 +404,8 @@ Key Prometheus metrics:
 | `pool_connected_miners` | Current live connections |
 | `pool_shares_accepted_total` | Lifetime valid shares |
 | `pool_shares_rejected_total{reason}` | Rejected shares by reason |
-| `pool_blocks_found_total` | 🏆 Blocks found and submitted |
+| `pool_blocks_found_total` | 🏆 Blocks that won their height |
+| `pool_block_submissions_total{outcome}` | The node's verdict per submitted block: `accepted`, `duplicate`, `inconclusive` |
 | `pool_hashrate_hps{window}` | Pool H/s, one series per averaging window (`1m`, `5m`, `10m`, `1h`, `3h`, `6h`, `24h`) |
 | `pool_worker_hashrate_hps{worker,window}` | Per-worker H/s, same windows |
 | `pool_job_height` | Current template block height |
@@ -417,6 +418,14 @@ constant, refreshed every 2s. A freshly connected worker reads well below its
 true rate on the longer windows until they have filled — the `24h` series is
 still climbing a day in. Alert on `pool_hashrate_hps{window="10m"}`; it carries
 no worker label, so it does not fan out with the fleet.
+
+`pool_blocks_found_total` counts only blocks that became the chain tip. A block
+that is consensus-valid but lost a same-height race earns nothing, and lands in
+`pool_block_submissions_total{outcome="inconclusive"}` instead — a non-zero rate
+there means hashrate is being spent on a stale tip, usually because template
+refreshes are lagging. `pool_blocks_found_total` is equivalent to
+`sum(pool_block_submissions_total{outcome=~"accepted|duplicate"})`; it exists
+unlabelled because it is the headline number.
 
 For template freshness, alert on
 `time() - pool_template_last_refresh_timestamp_seconds`. The raw timestamp is

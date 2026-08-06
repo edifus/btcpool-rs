@@ -44,6 +44,45 @@ pub struct GbtTransaction {
     pub weight: u64,
 }
 
+/// What the node did with a block we submitted.
+///
+/// A closed set, so the `outcome` Prometheus label cannot be minted from the
+/// node's response text — same contract as `PoolError::submit_failure_label`.
+///
+/// The distinction that matters is [`is_win`](Self::is_win): only a block that
+/// became the chain tip earned anything. `submitblock` reports a valid block
+/// that lost a same-height race as `"inconclusive"`, and the node stores it on
+/// a side branch — consensus-valid, worth nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockSubmitOutcome {
+    /// `null` — accepted and connected as the new chain tip.
+    Accepted,
+    /// `duplicate` — the node already had this block, from an earlier attempt
+    /// of ours that landed despite the RPC round trip appearing to fail.
+    Duplicate,
+    /// `inconclusive` / `duplicate-inconclusive` — valid and stored, but not on
+    /// the best chain. Resubmitting cannot promote it.
+    Inconclusive,
+}
+
+impl BlockSubmitOutcome {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Duplicate => "duplicate",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+
+    /// Whether this block won its height, and so counts as a block found.
+    ///
+    /// `Duplicate` counts: it is our own earlier submission, seen again by the
+    /// retry ladder, and that first attempt is never counted anywhere else.
+    pub const fn is_win(self) -> bool {
+        !matches!(self, Self::Inconclusive)
+    }
+}
+
 struct Inner {
     client: Client,
     /// Cookie contents (user, password) we built `client` with, if cookie auth is in use.
@@ -198,7 +237,10 @@ impl RpcClient {
     /// Submit a found block. Takes an `Arc<String>` so the retry ladder in
     /// `TemplateEngine` can hand the same bytes to successive attempts without
     /// re-allocating them for each blocking task.
-    pub async fn submit_block(self: &Arc<Self>, block_hex: Arc<String>) -> Result<(), PoolError> {
+    pub async fn submit_block(
+        self: &Arc<Self>,
+        block_hex: Arc<String>,
+    ) -> Result<BlockSubmitOutcome, PoolError> {
         let this = self.clone();
         spawn_rpc("submitblock", move || {
             this.submit_block_blocking(&block_hex)
@@ -206,38 +248,24 @@ impl RpcClient {
         .await
     }
 
-    fn submit_block_blocking(&self, block_hex: &str) -> Result<(), PoolError> {
+    fn submit_block_blocking(&self, block_hex: &str) -> Result<BlockSubmitOutcome, PoolError> {
         let result: Value = self.call_with_refresh(|c| {
             c.call("submitblock", &[json!(block_hex)])
                 .map_err(PoolError::Rpc)
         })?;
 
-        if result.is_null() {
-            info!("🎉 Block accepted by network!");
-            return Ok(());
+        let outcome = classify_submit_response(&result);
+        match &outcome {
+            Ok(BlockSubmitOutcome::Accepted) => info!("🎉 Block accepted by network!"),
+            Ok(BlockSubmitOutcome::Duplicate) => {
+                info!("submitblock: node already has this block (duplicate)")
+            }
+            Ok(BlockSubmitOutcome::Inconclusive) => {
+                warn!("submitblock: block valid but not on the best chain (inconclusive)")
+            }
+            Err(e) => warn!("submitblock did not accept the block: {e}"),
         }
-
-        match result.as_str() {
-            // The node already has this block — an earlier (possibly retried)
-            // submission went through. Success, not an error.
-            Some("duplicate") | Some("duplicate-inconclusive") => {
-                info!("submitblock: node already has this block (duplicate)");
-                Ok(())
-            }
-            // Valid block that did not become the chain tip (lost a same-height
-            // race). It was accepted and stored — resubmitting cannot help.
-            Some("inconclusive") => {
-                warn!("submitblock: block valid but not on the best chain (inconclusive)");
-                Ok(())
-            }
-            Some(reason) => {
-                warn!("submitblock rejected: {reason}");
-                Err(PoolError::SubmitBlockRejected(reason.to_owned()))
-            }
-            None => Err(PoolError::Other(anyhow!(
-                "unexpected submitblock response: {result}"
-            ))),
-        }
+        outcome
     }
 
     pub async fn best_block_hash(self: &Arc<Self>) -> Result<String, PoolError> {
@@ -324,6 +352,33 @@ impl RpcClient {
     }
 }
 
+/// Map a `submitblock` response to what the node actually did with the block.
+///
+/// Pure and side-effect free so the mapping is unit-testable: getting it wrong
+/// is invisible in production until the block counts are already wrong.
+///
+/// Per BIP22, a `null` response means the block was accepted onto the tip.
+/// Everything else is a status string; only `duplicate` is a success we can
+/// claim, because it is our own earlier submission coming back. `inconclusive`
+/// and `duplicate-inconclusive` both mean "valid, stored, not on the best
+/// chain" — the block lost a same-height race and earned nothing.
+fn classify_submit_response(result: &Value) -> Result<BlockSubmitOutcome, PoolError> {
+    if result.is_null() {
+        return Ok(BlockSubmitOutcome::Accepted);
+    }
+
+    match result.as_str() {
+        Some("duplicate") => Ok(BlockSubmitOutcome::Duplicate),
+        Some("inconclusive") | Some("duplicate-inconclusive") => {
+            Ok(BlockSubmitOutcome::Inconclusive)
+        }
+        Some(reason) => Err(PoolError::SubmitBlockRejected(reason.to_owned())),
+        None => Err(PoolError::Other(anyhow!(
+            "unexpected submitblock response: {result}"
+        ))),
+    }
+}
+
 /// Run one blocking RPC on the blocking pool. `what` names the call so a
 /// panicking task is attributable in the log.
 async fn spawn_rpc<T, F>(what: &'static str, f: F) -> Result<T, PoolError>
@@ -404,4 +459,68 @@ fn value_as_u32(v: &Value, key: &str) -> Result<u32, PoolError> {
             "getblocktemplate field out of range for u32: {key}"
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submit_responses_map_to_their_outcomes() {
+        for (response, expected) in [
+            (Value::Null, BlockSubmitOutcome::Accepted),
+            (json!("duplicate"), BlockSubmitOutcome::Duplicate),
+            (json!("inconclusive"), BlockSubmitOutcome::Inconclusive),
+            (
+                json!("duplicate-inconclusive"),
+                BlockSubmitOutcome::Inconclusive,
+            ),
+        ] {
+            assert_eq!(
+                classify_submit_response(&response).unwrap(),
+                expected,
+                "submitblock response {response:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejection_reason_is_an_error_carrying_that_reason() {
+        let err = classify_submit_response(&json!("bad-txns-inputs-missingorspent")).unwrap_err();
+        assert!(matches!(
+            err,
+            PoolError::SubmitBlockRejected(ref r) if r == "bad-txns-inputs-missingorspent"
+        ));
+        // `duplicate-invalid` is a rejection, not a duplicate: the node has the
+        // block and has decided it is bad.
+        assert!(matches!(
+            classify_submit_response(&json!("duplicate-invalid")).unwrap_err(),
+            PoolError::SubmitBlockRejected(_)
+        ));
+    }
+
+    #[test]
+    fn a_non_string_response_is_not_silently_treated_as_success() {
+        assert!(matches!(
+            classify_submit_response(&json!(42)).unwrap_err(),
+            PoolError::Other(_)
+        ));
+    }
+
+    /// The regression guard for stale-tip blocks being reported as wins: a
+    /// block that lost a same-height race is consensus-valid but earned
+    /// nothing, so it must not move `pool_blocks_found_total`.
+    #[test]
+    fn only_a_block_on_the_best_chain_counts_as_a_find() {
+        assert!(BlockSubmitOutcome::Accepted.is_win());
+        assert!(BlockSubmitOutcome::Duplicate.is_win());
+        assert!(!BlockSubmitOutcome::Inconclusive.is_win());
+    }
+
+    #[test]
+    fn outcome_labels_are_stable() {
+        assert_eq!(BlockSubmitOutcome::Accepted.label(), "accepted");
+        assert_eq!(BlockSubmitOutcome::Duplicate.label(), "duplicate");
+        assert_eq!(BlockSubmitOutcome::Inconclusive.label(), "inconclusive");
+    }
 }

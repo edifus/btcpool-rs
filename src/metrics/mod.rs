@@ -86,8 +86,19 @@ pub fn miner_disconnect(reason: &str, worker: &str) {
     .increment(1);
 }
 
-pub fn block_submission_success() {
-    counter!("pool_block_submissions_success_total").increment(1);
+/// The node's verdict on a block we submitted, one series per outcome.
+///
+/// `outcome` is a closed set (`BlockSubmitOutcome::label`) — same contract as
+/// the `reason` label below, and for the same reason.
+///
+/// This is the breakdown; `block_found` below is the headline. Only outcomes
+/// that won their height increment both.
+pub fn block_submission_outcome(outcome: &'static str) {
+    counter!(
+        "pool_block_submissions_total",
+        "outcome" => outcome
+    )
+    .increment(1);
 }
 
 pub fn block_submission_failure(reason: &'static str) {
@@ -116,6 +127,11 @@ pub fn vardiff_retarget(worker: &str, old_diff: u64, new_diff: u64) {
     histogram!("pool_vardiff_change_ratio").record(new_diff as f64 / old_diff as f64);
 }
 
+/// A block that won its height. Deliberately unlabelled: this is the number an
+/// operator puts on a wall, and reading it should not need a label matcher.
+///
+/// Call this only when `BlockSubmitOutcome::is_win` — a valid block that lost a
+/// same-height race is not a find.
 pub fn block_found() {
     counter!("pool_blocks_found_total").increment(1);
 }
