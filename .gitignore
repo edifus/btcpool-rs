@@ -15,6 +15,7 @@
 !/SECURITY.md
 !/TODO.md
 !/config.toml.example
+!/default.nix
 !/docker-compose.yml
 !/Dockerfile
 !/flake.lock
