@@ -235,9 +235,8 @@ async fn history_json(
     Query(params): Query<HistoryParams>,
 ) -> Json<Vec<HistoryPoint>> {
     let since = params.since.unwrap_or(0);
-    let points = state
-        .stats
-        .get_hashrate_history(since, 60)
+    let points = hashrate_history(&state, since, 60)
+        .await
         .into_iter()
         .filter_map(|point| {
             point
@@ -300,6 +299,23 @@ fn chart_window(value: Option<&str>) -> ChartWindow {
     }
 }
 
+/// Run a history query on the blocking pool.
+///
+/// It is a grouped scan over a table that holds months of samples, against a
+/// SQLite connection shared with the rest of the process. Doing that inline
+/// would park a runtime worker thread on disk I/O for as long as it takes —
+/// with enough dashboard tabs open, long enough to stall the share path.
+async fn hashrate_history(
+    state: &DashState,
+    since: u64,
+    bucket_secs: u64,
+) -> Vec<HashrateHistoryPoint> {
+    let stats = state.stats.clone();
+    tokio::task::spawn_blocking(move || stats.get_hashrate_history(since, bucket_secs))
+        .await
+        .unwrap_or_default()
+}
+
 fn chart_series_data(
     history: &[HashrateHistoryPoint],
     value: fn(&HashrateHistoryPoint) -> Option<f64>,
@@ -324,7 +340,7 @@ async fn chart_json(
         .map(|duration| now.saturating_sub(duration))
         .unwrap_or(0);
 
-    let mut history = state.stats.get_hashrate_history(since, window.bucket_secs);
+    let mut history = hashrate_history(&state, since, window.bucket_secs).await;
 
     // Append the current live value as the trailing edge of the chart, snapped
     // to the bucket grid. Every other point is a bucket mean, so plotting a raw
