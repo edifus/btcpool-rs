@@ -19,12 +19,29 @@ underflow panic). Line references are as of that review and may drift.
 
 ## Medium
 
-- [ ] **Move remaining blocking I/O off the async runtime.** `submit_block` is
-  done (PR #6). SQLite is now done too: writes go to a dedicated `stats-writer`
-  thread over a bounded channel, the store opens with WAL +
-  `synchronous=NORMAL` + a busy timeout, and the dashboard `/history` +
-  `/chart` scans run under `spawn_blocking` against a separate read connection.
-  Still direct: `getblocktemplate` in `TemplateEngine::refresh`.
+- [x] **Move remaining blocking I/O off the async runtime.** `submit_block` was
+  done in PR #6. SQLite followed: writes go to a dedicated `stats-writer` thread
+  over a bounded channel, the store opens with WAL + `synchronous=NORMAL` + a
+  busy timeout, and the dashboard `/history` + `/chart` scans run under
+  `spawn_blocking` against a separate read connection.
+
+  Closed out 2026-08-05 with the Bitcoin RPC. Auditing the surface turned up
+  four sync-in-async call sites, not just the `getblocktemplate` in
+  `TemplateEngine::refresh` this item originally named — also `best_block_hash`
+  in the ZMQ poll fallback (1 Hz), and `network_hashrate` +
+  `estimate_difficulty_change_pct` (five sequential round trips) in the 30 s
+  stats loop. Rather than wrap each call site, `RpcClient`'s synchronous method
+  bodies are now private and the only public surface is `async` wrappers that
+  `spawn_blocking` internally, so a future call site cannot reintroduce the bug.
+
+- [ ] **The template engine can stop refreshing without anyone noticing.** If
+  the ZMQ/poll task exits, `TemplateEngine::run` breaks out of its loop
+  (`engine.rs:119-122`) and the pool serves a frozen template forever — miners
+  keep hashing on a dead tip and any block they find is orphaned. The
+  `JoinHandle` from `tokio::spawn(engine.run(new_block_rx))` (`main.rs:139`) is
+  dropped, so nothing observes or restarts it. At minimum the exit should be
+  loud; better would be keeping the ntime loop alive on channel close, or
+  supervising the ZMQ task so it restarts.
 - [x] **Harden the duplicate-share set** (shipped in v0.6.0, 2026-07-02):
   shares are recorded for dedup only after validation passes, and the
   per-session set clears on every clean-job broadcast (live-jobs scoping); the

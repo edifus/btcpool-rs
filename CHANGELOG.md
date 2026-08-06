@@ -31,6 +31,18 @@ everything else bumps the **patch** version.
   and the database is opened with `journal_mode=WAL`, `synchronous=NORMAL` and a
   5-second busy timeout. Share submissions and dashboard chart queries no longer
   contend on one connection mutex.
+- Bitcoin RPC moved off the async runtime as well, finishing that work.
+  `getblocktemplate` ran synchronously inside the template loop, parking a tokio
+  worker for the whole round trip on every new block and every 30-second ntime
+  refresh — and it is the heaviest RPC the node serves, since it re-runs block
+  assembly over the mempool. On a 2–4 core home node that stalled a quarter to a
+  half of the runtime's capacity while connected miners' share submissions
+  queued behind it. Three further synchronous calls were doing the same thing:
+  the ZMQ poll fallback's `getbestblockhash` at 1 Hz, and `getnetworkhashps`
+  plus the five-round-trip difficulty estimate in the 30-second stats loop.
+  `RpcClient` now exposes only `async` methods, which run the call on the
+  blocking pool; the synchronous bodies are private, so the mistake cannot
+  recur.
 
 ### Fixed
 - Hashrate averages no longer restart from zero when the service restarts.

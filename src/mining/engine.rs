@@ -111,6 +111,7 @@ impl TemplateEngine {
         self.refresh(true).await;
 
         let mut ntime_tick = tokio::time::interval(Duration::from_secs(NTIME_REFRESH_SECS));
+        ntime_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ntime_tick.tick().await; // discard the immediate first tick
 
         loop {
@@ -137,7 +138,7 @@ impl TemplateEngine {
 
     /// Fetch a fresh GBT and push it out to all connected sessions.
     async fn refresh(&self, clean_jobs: bool) {
-        match self.rpc.get_block_template() {
+        match self.rpc.get_block_template().await {
             Ok(gbt) => {
                 match template::build_job_template(&gbt) {
                     Ok(template) => {
@@ -205,7 +206,7 @@ impl TemplateEngine {
 
         let mut last_err = None;
         for attempt in 1..=SUBMIT_INLINE_ATTEMPTS {
-            match self.try_submit(block_hex.clone()).await {
+            match self.rpc.submit_block(block_hex.clone()).await {
                 Ok(()) => return Ok(()),
                 Err(e) if is_permanent_reject(&e) => return Err(e),
                 Err(e) => {
@@ -233,14 +234,6 @@ impl TemplateEngine {
             .unwrap_or_else(|| PoolError::Other(anyhow::anyhow!("submitblock never attempted"))))
     }
 
-    /// One submitblock attempt, off the async runtime (the RPC client blocks).
-    async fn try_submit(&self, block_hex: Arc<String>) -> Result<(), PoolError> {
-        let rpc = self.rpc.clone();
-        task::spawn_blocking(move || rpc.submit_block(&block_hex))
-            .await
-            .map_err(|e| PoolError::Other(anyhow::anyhow!("submitblock task panicked: {e}")))?
-    }
-
     /// Keep resubmitting a found block in the background after the in-line
     /// attempts failed — e.g. while bitcoind restarts. `submit_block` treats
     /// "duplicate" as success, so racing an earlier attempt is harmless.
@@ -260,7 +253,7 @@ impl TemplateEngine {
             while Instant::now() < deadline {
                 tokio::time::sleep(SUBMIT_RETRY_INTERVAL).await;
                 attempt += 1;
-                match engine.try_submit(block_hex.clone()).await {
+                match engine.rpc.submit_block(block_hex.clone()).await {
                     Ok(()) => {
                         metrics::block_found();
                         metrics::block_submission_success();

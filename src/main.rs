@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
     // Miner payout addresses are validated against this chain at authorization.
     let node_chain = rpc
         .chain()
+        .await
         .context("Querying node chain (getblockchaininfo)")?;
     info!(chain = %node_chain, "Connected node chain detected");
     let runtime_settings = settings::RuntimeSettings::new(&config.pool, &node_chain)?;
@@ -114,11 +115,11 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let interval = tokio::time::Duration::from_secs(30);
             loop {
-                match rpc.network_hashrate(None, None) {
+                match rpc.network_hashrate(None, None).await {
                     Ok(network_hps) => stats.set_network_hashrate(network_hps),
                     Err(e) => tracing::warn!("Failed to poll network hash rate: {e}"),
                 }
-                match rpc.estimate_difficulty_change_pct() {
+                match rpc.estimate_difficulty_change_pct().await {
                     Ok(pct) => stats.set_est_difficulty_change_pct(pct),
                     Err(e) => tracing::warn!("Failed to estimate difficulty change: {e}"),
                 }

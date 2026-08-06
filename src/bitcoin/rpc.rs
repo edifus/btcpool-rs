@@ -6,11 +6,16 @@
 ///  - `getblocktemplate`
 ///  - `submitblock`
 ///  - Best-block-hash polling (ZMQ fallback)
+///
+/// `bitcoincore-rpc` is synchronous, so every method that talks to the node is
+/// exposed only in `async` form and runs the round trip on the blocking pool.
+/// The sync bodies are private on purpose: that is what keeps a future caller
+/// from parking a runtime worker on a node round trip.
 use crate::{config::RpcConfig, error::PoolError};
 use anyhow::{anyhow, Result};
 use bitcoincore_rpc::{Client, RpcApi};
 use serde_json::{json, Value};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
@@ -111,7 +116,12 @@ impl RpcClient {
     /// The chain the connected node is on, per `getblockchaininfo`:
     /// "main" | "test" | "signet" | "regtest". Queried once at boot — it is
     /// the source of truth for payout-address network validation.
-    pub fn chain(&self) -> Result<String, PoolError> {
+    pub async fn chain(self: &Arc<Self>) -> Result<String, PoolError> {
+        let this = self.clone();
+        spawn_rpc("getblockchaininfo", move || this.chain_blocking()).await
+    }
+
+    fn chain_blocking(&self) -> Result<String, PoolError> {
         let info: Value =
             self.call_with_refresh(|c| c.call("getblockchaininfo", &[]).map_err(PoolError::Rpc))?;
         info.get("chain")
@@ -124,7 +134,18 @@ impl RpcClient {
             })
     }
 
-    pub fn get_block_template(&self) -> Result<GbtResult, PoolError> {
+    /// Fetch a fresh block template. The heaviest RPC the node serves — it
+    /// re-runs block assembly over the mempool — so it never touches the
+    /// runtime.
+    pub async fn get_block_template(self: &Arc<Self>) -> Result<GbtResult, PoolError> {
+        let this = self.clone();
+        spawn_rpc("getblocktemplate", move || {
+            this.get_block_template_blocking()
+        })
+        .await
+    }
+
+    fn get_block_template_blocking(&self) -> Result<GbtResult, PoolError> {
         let result: Value = self.call_with_refresh(|c| {
             let request = json!({
                 "rules": ["segwit"],
@@ -170,7 +191,18 @@ impl RpcClient {
         })
     }
 
-    pub fn submit_block(&self, block_hex: &str) -> Result<(), PoolError> {
+    /// Submit a found block. Takes an `Arc<String>` so the retry ladder in
+    /// `TemplateEngine` can hand the same bytes to successive attempts without
+    /// re-allocating them for each blocking task.
+    pub async fn submit_block(self: &Arc<Self>, block_hex: Arc<String>) -> Result<(), PoolError> {
+        let this = self.clone();
+        spawn_rpc("submitblock", move || {
+            this.submit_block_blocking(&block_hex)
+        })
+        .await
+    }
+
+    fn submit_block_blocking(&self, block_hex: &str) -> Result<(), PoolError> {
         let result: Value = self.call_with_refresh(|c| {
             c.call("submitblock", &[json!(block_hex)])
                 .map_err(PoolError::Rpc)
@@ -204,7 +236,12 @@ impl RpcClient {
         }
     }
 
-    pub fn best_block_hash(&self) -> Result<String, PoolError> {
+    pub async fn best_block_hash(self: &Arc<Self>) -> Result<String, PoolError> {
+        let this = self.clone();
+        spawn_rpc("getbestblockhash", move || this.best_block_hash_blocking()).await
+    }
+
+    fn best_block_hash_blocking(&self) -> Result<String, PoolError> {
         self.call_with_refresh(|c| {
             c.get_best_block_hash()
                 .map(|h| h.to_string())
@@ -212,7 +249,19 @@ impl RpcClient {
         })
     }
 
-    pub fn network_hashrate(
+    pub async fn network_hashrate(
+        self: &Arc<Self>,
+        blocks: Option<u64>,
+        height: Option<u64>,
+    ) -> Result<f64, PoolError> {
+        let this = self.clone();
+        spawn_rpc("getnetworkhashps", move || {
+            this.network_hashrate_blocking(blocks, height)
+        })
+        .await
+    }
+
+    fn network_hashrate_blocking(
         &self,
         blocks: Option<u64>,
         height: Option<u64>,
@@ -233,7 +282,18 @@ impl RpcClient {
     /// where `elapsed_seconds` is measured between the first block of the epoch
     /// and the chain tip. Clamped to the protocol's [-75%, +300%] limit.
     /// Returns `NaN` right after a retarget (no interval to measure yet).
-    pub fn estimate_difficulty_change_pct(&self) -> Result<f64, PoolError> {
+    ///
+    /// Five sequential round trips, all inside one blocking task so they share
+    /// a single hop on and off the runtime.
+    pub async fn estimate_difficulty_change_pct(self: &Arc<Self>) -> Result<f64, PoolError> {
+        let this = self.clone();
+        spawn_rpc("difficulty estimate", move || {
+            this.estimate_difficulty_change_pct_blocking()
+        })
+        .await
+    }
+
+    fn estimate_difficulty_change_pct_blocking(&self) -> Result<f64, PoolError> {
         self.call_with_refresh(|c| {
             let height = c.get_block_count().map_err(PoolError::Rpc)?;
             let into_epoch = height % 2016;
@@ -258,6 +318,18 @@ impl RpcClient {
             Ok(((expected / elapsed - 1.0) * 100.0).clamp(-75.0, 300.0))
         })
     }
+}
+
+/// Run one blocking RPC on the blocking pool. `what` names the call so a
+/// panicking task is attributable in the log.
+async fn spawn_rpc<T, F>(what: &'static str, f: F) -> Result<T, PoolError>
+where
+    F: FnOnce() -> Result<T, PoolError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| PoolError::Other(anyhow!("{what} RPC task panicked: {e}")))?
 }
 
 fn parse_gbt_transaction(tx: &Value) -> Result<GbtTransaction, PoolError> {

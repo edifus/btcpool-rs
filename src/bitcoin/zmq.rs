@@ -79,7 +79,7 @@ async fn run_poll_fallback(
     let interval = tokio::time::Duration::from_millis(poll_interval_ms);
 
     loop {
-        match rpc.best_block_hash() {
+        match rpc.best_block_hash().await {
             Ok(hash) => {
                 if hash != last_hash {
                     debug!("Poll: new block hash {hash}");
