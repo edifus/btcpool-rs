@@ -713,6 +713,49 @@ pub struct WorkerState {
     pub hashrate_24h_hps: f64,
 }
 
+/// Everything read back from the stats DB at boot. Each failure mode degrades
+/// to "no persistence" with a warning rather than taking the pool down: a
+/// corrupt or unwritable stats file must never stop miners from hashing.
+#[derive(Default)]
+struct Persisted {
+    store: Option<StatsStore>,
+    best_share_difficulty: u64,
+    best_hashrate_hps: f64,
+    worker_best_shares: HashMap<String, u64>,
+    hashrates: Vec<PersistedWorkerHashrate>,
+}
+
+impl Persisted {
+    fn load(path: &str) -> Self {
+        let store = match StatsStore::open(path) {
+            Ok(store) => store,
+            Err(e) => {
+                warn!("Failed to open stats DB {path}: {e}");
+                return Self::default();
+            }
+        };
+        let (best_share_difficulty, best_hashrate_hps, worker_best_shares) =
+            match store.load_values() {
+                Ok(values) => values,
+                Err(e) => {
+                    warn!("Failed to load stats from DB {path}: {e}");
+                    return Self::default();
+                }
+            };
+        let hashrates = store.load_hashrate_state().unwrap_or_else(|e| {
+            warn!("Failed to restore hashrates from DB {path}: {e}");
+            Vec::new()
+        });
+        Self {
+            store: Some(store),
+            best_share_difficulty,
+            best_hashrate_hps,
+            worker_best_shares,
+            hashrates,
+        }
+    }
+}
+
 impl PoolStats {
     pub fn new_with_store(stats_db_path: Option<String>) -> Arc<Self> {
         Self::new_with_store_at(stats_db_path, Self::now_secs(), Instant::now())
@@ -723,43 +766,16 @@ impl PoolStats {
         wall_now: u64,
         instant_now: Instant,
     ) -> Arc<Self> {
-        let (
+        let Persisted {
             store,
             best_share_difficulty,
             best_hashrate_hps,
-            worker_best_shares_map,
-            persisted_hashrates,
-        ) = match stats_db_path.filter(|p| !p.is_empty()) {
-            Some(path) => match StatsStore::open(&path) {
-                Ok(store) => match store.load_values() {
-                    Ok((best_difficulty, best_hps, worker_best_shares_map)) => {
-                        let persisted_hashrates = match store.load_hashrate_state() {
-                            Ok(state) => state,
-                            Err(e) => {
-                                warn!("Failed to restore hashrates from DB {}: {e}", path);
-                                Vec::new()
-                            }
-                        };
-                        (
-                            Some(store),
-                            best_difficulty,
-                            best_hps,
-                            worker_best_shares_map,
-                            persisted_hashrates,
-                        )
-                    }
-                    Err(e) => {
-                        warn!("Failed to load stats from DB {}: {e}", path);
-                        (None, 0, 0.0, HashMap::new(), Vec::new())
-                    }
-                },
-                Err(e) => {
-                    warn!("Failed to open stats DB {}: {e}", path);
-                    (None, 0, 0.0, HashMap::new(), Vec::new())
-                }
-            },
-            None => (None, 0, 0.0, HashMap::new(), Vec::new()),
-        };
+            worker_best_shares: worker_best_shares_map,
+            hashrates: persisted_hashrates,
+        } = stats_db_path
+            .filter(|p| !p.is_empty())
+            .map(|path| Persisted::load(&path))
+            .unwrap_or_default();
 
         let worker_best_shares = DashMap::new();
         for (worker, best_share) in worker_best_shares_map {
@@ -1146,8 +1162,6 @@ impl PoolStats {
             let evicted: std::collections::HashSet<&String> = stale.iter().collect();
             self.session_hashrates
                 .retain(|_, s| !evicted.contains(&s.worker));
-        }
-        if !stale.is_empty() {
             info!("Evicted {} idle offline workers from stats", stale.len());
         }
 
