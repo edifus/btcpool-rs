@@ -78,12 +78,27 @@ underflow panic). Line references are as of that review and may drift.
   existed as three hand-written copies, which is how the miscount spread; it now
   lives in `accounting::record_block_outcome`, alongside the share-accounting
   helpers that exist for the same reason.
-- [ ] **Confirm block wins survive a reorg.** `pool_blocks_found_total` is
-  decided by the `submitblock` response, which is only true at that instant. A
-  block that wins its height and is then reorged out is still counted. A
-  deferred confirmation pass — re-check the hash with `getblockheader` after N
-  confirmations and reconcile — would close the gap. Low priority: it needs a
-  reorg *and* a block, and unlike the stale-tip case the pool did win the race.
+- [x] **Confirm block wins survive a reorg** (fixed 2026-08-06): every block the
+  node stores is enrolled in a `found_blocks` ledger in SQLite and re-checked
+  with `getblockheader` on a 60 s sweep until it is `[pool] confirmation_depth`
+  (default 6) deep on the active chain or that deep on a branch that lost.
+  `pool_blocks_orphaned_total` carries the correction Prometheus cannot make to
+  a counter; the dashboard count drops back and the card is marked.
+
+  Four things this entry's framing missed, found while fixing it.
+  The reconciliation is bidirectional — an `inconclusive` block that a later
+  reorg puts on the active chain is a win the submit-time verdict can never
+  count, and it costs two extra match arms. "After N confirmations" is not
+  sufficient on its own: the orphan side needs the *losing* branch buried by the
+  same depth, or a routine one-block reorg resolves the block as orphaned during
+  the very reorg that was about to restore it. There was no durable record of a
+  found block to re-check at all — only the archived hex, which is written for
+  every attempt including rejects — hence the ledger, which also makes the
+  dashboard's "found blocks survive restarts" label true for the first time.
+  And the hash the pool recorded was the raw little-endian double-SHA256, so it
+  would have been rejected by `getblockheader` outright; it was reversed at the
+  source, which incidentally fixes the dashboard card, the log lines and the
+  archive filenames, none of which resolved in a block explorer.
 - [x] **Harden the duplicate-share set** (shipped in v0.6.0, 2026-07-02):
   shares are recorded for dedup only after validation passes, and the
   per-session set clears on every clean-job broadcast (live-jobs scoping); the

@@ -846,7 +846,7 @@ async fn handle_submit(
             let validation_duration_ms = validation_start.elapsed().as_millis() as f64;
             metrics::share_validation_time(validation_duration_ms);
 
-            let block_hash_hex = hex::encode(hash);
+            let block_hash_hex = validator::block_hash_display(&hash);
             let submit_result = engine
                 .submit_found_block(
                     job_height,
@@ -862,6 +862,7 @@ async fn handle_submit(
                     accounting::record_block_outcome(
                         &session.stats,
                         outcome,
+                        job_height,
                         worker,
                         &job_payout,
                         &block_hash_hex,

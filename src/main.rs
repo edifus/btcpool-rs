@@ -128,6 +128,19 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ── Block confirmation pass ──────────────────────────────────────────────
+    // `submitblock`'s verdict is true at the instant it is read and no longer:
+    // a block that won its height can be reorged out, and one that lost a
+    // same-height race can be promoted by the reorg that follows. This sweeps
+    // the found-block ledger until each is settled. Idle — and silent on the
+    // RPC — whenever nothing is pending, which is nearly always.
+    {
+        let rpc = rpc.clone();
+        let stats = stats.clone();
+        let depth = config.pool.confirmation_depth;
+        tokio::spawn(mining::confirm::run(rpc, stats, depth));
+    }
+
     // ── ZMQ / poll ────────────────────────────────────────────────────────────
     let new_block_rx = zmq::start(&config.zmq, rpc.clone()).await;
 

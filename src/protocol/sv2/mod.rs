@@ -776,7 +776,7 @@ async fn handle_submit(
             hash,
         }) => {
             metrics::share_validation_time(validation_start.elapsed().as_millis() as f64);
-            let block_hash_hex = hex::encode(hash);
+            let block_hash_hex = validator::block_hash_display(&hash);
             match engine
                 .submit_found_block(
                     job_entry.job.height,
@@ -792,6 +792,7 @@ async fn handle_submit(
                     accounting::record_block_outcome(
                         &session.stats,
                         outcome,
+                        job_entry.job.height,
                         &worker,
                         &job_payout,
                         &block_hash_hex,

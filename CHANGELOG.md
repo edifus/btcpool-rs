@@ -32,6 +32,21 @@ everything else bumps the **patch** version.
   push the coinbase scriptSig past the 100-byte consensus limit. All of it is
   operator-configured, so an over-long tag would otherwise only surface as a
   `bad-cb-length` rejection on the one block the pool ever finds.
+- **Deferred confirmation pass for found blocks.** Every block the node stores
+  is enrolled in a `found_blocks` ledger in the stats database and re-checked
+  with `getblockheader` on a 60-second sweep until it is `confirmation_depth`
+  deep on the active chain or that deep on a branch that lost. New config key
+  `[pool] confirmation_depth` (default 6, range 1–100); new metrics
+  `pool_blocks_orphaned_total`, `pool_block_confirmations_total{result}` and the
+  `pool_blocks_pending_confirmation` gauge; new `/stats` fields
+  `blocks_orphaned`, `blocks_pending_confirmation` and `last_block_status`.
+  The sweep makes no RPC call when nothing is pending, which is nearly always.
+- Block counts now survive a restart. `blocks_found`, `blocks_inconclusive` and
+  `blocks_orphaned` are recomputed from the `found_blocks` ledger at boot, which
+  is what the dashboard's "found blocks survive restarts" label has claimed
+  since v0.1.3 without it being true. Requires `[metrics] stats_db_path`; with
+  no stats database the ledger lives in memory only and still drives the
+  confirmation pass for the life of the process.
 
 ### Changed
 - **`[zmq] poll_fallback = true` now polls alongside ZMQ instead of only after
@@ -87,6 +102,26 @@ everything else bumps the **patch** version.
   recur.
 
 ### Fixed
+- **A block that won its height and was then reorged out kept counting as a
+  win.** `pool_blocks_found_total`, the `/stats` block count and the dashboard's
+  "Last block found" card were all decided by the `submitblock` response, which
+  is only true at the instant it is read. A deferred pass now re-checks each
+  found block and reconciles: the dashboard count drops back and the card is
+  marked `reorged out`, while Prometheus — where a counter cannot go down —
+  gains `pool_blocks_orphaned_total`, so the blocks the pool kept are
+  `pool_blocks_found_total - pool_blocks_orphaned_total`. The correction runs in
+  both directions: a block reported `inconclusive` that a later reorg puts on
+  the active chain is counted then, which the submit-time verdict could never
+  do. Orphaning requires the losing branch to be buried by the full
+  `confirmation_depth`, so the routine one-block reorg that resolves in our
+  favour does not flap the count.
+- **The block hash the pool reported was byte-reversed.** The raw double-SHA256
+  is internal (little-endian) order, and it was hex-encoded as-is into the
+  dashboard's last-block card, every log line, and the
+  `found-blocks/block_<height>_<hash>.hex` filename — putting proof-of-work's
+  leading zeros at the wrong end. The string resolved in no block explorer and
+  was accepted by no RPC. All of them now carry the conventional big-endian
+  display form; already-archived filenames keep their old spelling.
 - **Blocks that lost a same-height race were reported as wins.** `submitblock`
   answers `"inconclusive"` when it accepts and stores a consensus-valid block
   that did not become the chain tip — the block sits on a side branch and earns

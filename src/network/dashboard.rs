@@ -835,6 +835,7 @@ tr:last-child td { border-bottom: none; }
       <div class="val" id="v-last-block-worker">&mdash;</div>
       <div class="sub trunc" id="v-last-block-payout" title="Payout address encoded in the found block">&mdash;</div>
       <div class="sub" id="v-last-block-time">&mdash;</div>
+      <div class="sub" id="v-last-block-status" title="A block is only final once it is buried under the configured number of confirmations; until then a reorg can still take it away">&mdash;</div>
       <div class="sub trunc" id="v-last-block-hash" title="Hash of the last block this pool found">&mdash;</div>
     </div>
   </div>
@@ -1352,6 +1353,19 @@ async function refresh() {
     document.getElementById('v-last-block-payout').textContent = d.last_block_payout || '—';
     document.getElementById('v-last-block-hash').textContent = d.last_block_hash || '—';
     document.getElementById('v-last-block-time').textContent = fmtTimestamp(d.last_block_ts);
+    // The submitblock verdict is provisional until the confirmation pass
+    // settles it, so say which it is rather than letting the card imply the
+    // block is safe.
+    const lastBlockStatus = document.getElementById('v-last-block-status');
+    const statusText = {
+      pending: 'awaiting confirmation',
+      confirmed: 'confirmed',
+      orphaned: 'reorged out — earned nothing',
+      abandoned: 'unconfirmed: node no longer has it',
+    };
+    lastBlockStatus.textContent = d.last_block_ts ? (statusText[d.last_block_status] || d.last_block_status) : '—';
+    lastBlockStatus.classList.toggle('ok', d.last_block_status === 'confirmed');
+    lastBlockStatus.classList.toggle('bad', d.last_block_status === 'orphaned' || d.last_block_status === 'abandoned');
     document.getElementById('v-best-share').textContent = fmtDiff(d.best_share_difficulty);
     document.getElementById('v-session-best-share').textContent = fmtDiff(d.session_best_share_difficulty);
     document.getElementById('v-best-over-network').textContent = d.best_share_difficulty >= Math.ceil(d.network_difficulty) ? 'YES' : 'no';

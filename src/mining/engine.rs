@@ -355,7 +355,7 @@ impl TemplateEngine {
                         // Mirror the inline-success path so the dashboard's
                         // block count / last-block panel agree with Prometheus.
                         accounting::record_block_outcome(
-                            &stats, outcome, &worker, &payout, &hash_hex,
+                            &stats, outcome, height, &worker, &payout, &hash_hex,
                         );
                         if outcome.is_win() {
                             info!(

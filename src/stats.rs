@@ -40,6 +40,61 @@ pub const SNAPSHOT_INTERVAL_SECS: u64 = 10;
 /// being thinned to one a minute.
 const FINE_HISTORY_RETENTION_SECS: u64 = 48 * 3600;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Found-block ledger
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A block this pool found, still waiting on the deferred confirmation pass.
+///
+/// `submitblock`'s verdict is only true at the instant it is read, so every
+/// block the node stored is enrolled here and re-checked until the answer is
+/// final. See `mining::confirm`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBlock {
+    /// Big-endian display hex, as `mining::validator::block_hash_display`
+    /// produces it — the only form `getblockheader` accepts.
+    pub hash: String,
+    pub height: u64,
+    pub worker: String,
+    pub payout: String,
+    pub found_ts: u64,
+    /// What `submitblock` said at the time (`BlockSubmitOutcome::is_win`), and
+    /// so what was already counted. The confirmation pass only has work to do
+    /// where this disagrees with the chain.
+    pub won_at_submit: bool,
+}
+
+/// How a found block's confirmation ended.
+///
+/// Terminal: a block leaves the pending set exactly once. A closed set because
+/// it is both a SQL column value and a Prometheus label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockResolution {
+    /// Buried `confirmation_depth` deep on the active chain. Final.
+    Confirmed,
+    /// Buried that deep on a branch that lost. If this block was counted as a
+    /// win at submit time, that count was wrong.
+    Orphaned,
+    /// The node stopped knowing about the hash and never came back — reindexed,
+    /// replaced, or restored from a snapshot. Neither claim can be made, so the
+    /// submit-time verdict is left standing.
+    Abandoned,
+}
+
+impl BlockResolution {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Orphaned => "orphaned",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// Status shown on the dashboard's last-block card while confirmation is still
+/// outstanding. `BlockResolution::label` supplies the terminal values.
+pub const BLOCK_STATUS_PENDING: &str = "pending";
+
 // Generates `HashrateWindows` and everything that has to walk its fields in
 // window order, from the single table below the macro.
 //
@@ -148,6 +203,15 @@ enum StoreWrite {
         worker_rates: HashMap<String, HashrateWindows>,
     },
     PruneWorkerBestShares(usize),
+    /// Enrol a found block in the confirmation ledger. Unlike everything else
+    /// here this is not a watermark that can be recomputed — losing it means
+    /// losing the only record that a reorg has to be checked for.
+    BlockFound(PendingBlock),
+    BlockResolved {
+        hash: String,
+        resolution: BlockResolution,
+        resolved_ts: u64,
+    },
     /// Barrier: acknowledged once every write queued before it has been
     /// applied. Production flushes by dropping the store instead.
     #[cfg(test)]
@@ -247,6 +311,25 @@ impl StatsStore {
              )",
             [],
         )?;
+        // The one table here that is a ledger rather than a watermark: each row
+        // is a block this pool found, and `status` is what the deferred
+        // confirmation pass reconciles against the chain. Rows are never
+        // deleted — a solo pool's block count is the whole point of the
+        // exercise, and the table grows by one row per block found.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS found_blocks (
+             hash TEXT PRIMARY KEY,
+             height INTEGER NOT NULL,
+             worker TEXT NOT NULL,
+             payout TEXT NOT NULL,
+             found_ts INTEGER NOT NULL,
+             won_at_submit INTEGER NOT NULL,
+             status TEXT NOT NULL,
+             resolved_ts INTEGER
+             )",
+            [],
+        )?;
+
         Self::migrate_hashrate_history(&conn)?;
         Self::migrate_hashrate_algo(&conn)?;
 
@@ -359,6 +442,56 @@ impl StatsStore {
         rows.collect()
     }
 
+    /// Blocks still awaiting confirmation, so a restart mid-window does not
+    /// silently abandon one. Confirmation takes an hour at the default depth;
+    /// without this a well-timed restart is all it takes for a reorg to go
+    /// unnoticed, which is the bug this ledger exists to close.
+    fn load_pending_blocks(&self) -> Result<Vec<PendingBlock>, rusqlite::Error> {
+        let conn = self.read.lock();
+        let mut stmt = conn.prepare(
+            "SELECT hash, height, worker, payout, found_ts, won_at_submit
+             FROM found_blocks WHERE status = ?1",
+        )?;
+        let rows = stmt.query_map(params![BLOCK_STATUS_PENDING], |row| {
+            Ok(PendingBlock {
+                hash: row.get(0)?,
+                height: row.get(1)?,
+                worker: row.get(2)?,
+                payout: row.get(3)?,
+                found_ts: row.get(4)?,
+                won_at_submit: row.get::<_, i64>(5)? != 0,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// All-time `(found, orphaned, inconclusive)` from the ledger.
+    ///
+    /// A row counts as a win if `submitblock` said so and nothing has since
+    /// orphaned it, or if it lost its height race at submit time and a later
+    /// reorg promoted it onto the active chain — the two directions the
+    /// confirmation pass reconciles. `abandoned` leaves the submit-time verdict
+    /// standing, since nothing was ever proved against it.
+    fn load_block_counts(&self) -> Result<(u64, u64, u64), rusqlite::Error> {
+        let conn = self.read.lock();
+        // `SUM(CASE ...)` rather than `COUNT(*) FILTER (...)`: rusqlite links
+        // the system SQLite, and `FILTER` needs 3.30. `COALESCE` because `SUM`
+        // over no rows is NULL, not 0.
+        conn.query_row(
+            "SELECT
+               COALESCE(SUM(CASE WHEN (won_at_submit = 1 AND status != 'orphaned')
+                                    OR (won_at_submit = 0 AND status = 'confirmed')
+                                 THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN won_at_submit = 1 AND status = 'orphaned'
+                                 THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN won_at_submit = 0 AND status != 'confirmed'
+                                 THEN 1 ELSE 0 END), 0)
+             FROM found_blocks",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+    }
+
     fn set_best_share_difficulty(&self, difficulty: u64) {
         self.enqueue(StoreWrite::BestShare(difficulty));
     }
@@ -376,6 +509,18 @@ impl StatsStore {
 
     fn prune_worker_best_shares(&self, keep: usize) {
         self.enqueue(StoreWrite::PruneWorkerBestShares(keep));
+    }
+
+    fn record_found_block(&self, block: PendingBlock) {
+        self.enqueue(StoreWrite::BlockFound(block));
+    }
+
+    fn record_block_resolution(&self, hash: &str, resolution: BlockResolution, resolved_ts: u64) {
+        self.enqueue(StoreWrite::BlockResolved {
+            hash: hash.to_string(),
+            resolution,
+            resolved_ts,
+        });
     }
 
     fn record_hashrate_snapshot(
@@ -546,6 +691,39 @@ fn apply_write(conn: &Connection, write: StoreWrite) -> Result<(), rusqlite::Err
         StoreWrite::PruneWorkerBestShares(keep) => {
             prune_worker_best_shares(conn, keep);
         }
+        // `OR IGNORE`: the inline retry ladder and the background resubmitter
+        // can both report the same block, and the first enrolment is the one
+        // with the right `found_ts`.
+        StoreWrite::BlockFound(block) => {
+            conn.execute(
+                "INSERT OR IGNORE INTO found_blocks
+                 (hash, height, worker, payout, found_ts, won_at_submit, status, resolved_ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+                params![
+                    block.hash,
+                    block.height,
+                    block.worker,
+                    block.payout,
+                    block.found_ts,
+                    block.won_at_submit as i64,
+                    BLOCK_STATUS_PENDING,
+                ],
+            )?;
+        }
+        // Guarded on the current status so a resolution can only ever be
+        // written once: the pending set is the authority on what still needs
+        // deciding, and a restart replays it.
+        StoreWrite::BlockResolved {
+            hash,
+            resolution,
+            resolved_ts,
+        } => {
+            conn.execute(
+                "UPDATE found_blocks SET status = ?2, resolved_ts = ?3
+                 WHERE hash = ?1 AND status = ?4",
+                params![hash, resolution.label(), resolved_ts, BLOCK_STATUS_PENDING],
+            )?;
+        }
         StoreWrite::Snapshot {
             history_ts,
             state_ts,
@@ -658,6 +836,10 @@ pub struct PoolStats {
     /// so they sit on a side branch and earned nothing. Tracked apart from
     /// `blocks_found` so the dashboard cannot report them as wins.
     blocks_inconclusive: AtomicU64,
+    /// Blocks that won their height and were later reorged out. `blocks_found`
+    /// is decremented to match, so the dashboard shows the count that survived;
+    /// Prometheus keeps both, since a counter cannot go down.
+    blocks_orphaned: AtomicU64,
     connected_miners: AtomicU64,
     current_height: AtomicU64,
     current_coinbase_value: AtomicU64,
@@ -675,6 +857,15 @@ pub struct PoolStats {
     last_block_payout: Mutex<Option<String>>,
     last_block_hash: Mutex<Option<String>>,
     last_block_ts: AtomicU64,
+    /// Where the last winning block stands with the confirmation pass:
+    /// `BLOCK_STATUS_PENDING` until it resolves, then a `BlockResolution`
+    /// label. Without it the card would keep advertising a block that has since
+    /// been reorged away.
+    last_block_status: Mutex<&'static str>,
+    /// Found blocks still awaiting confirmation, keyed by display hash. This is
+    /// the working set `mining::confirm` sweeps; it is mirrored to SQLite when
+    /// a stats DB is configured and lives here alone when one is not.
+    pending_blocks: DashMap<String, PendingBlock>,
     /// Per-connection decaying hashrate state, keyed by session id. Shares are
     /// accumulated here as they arrive and folded into the averages by
     /// `tick_hashrates` on a fixed cadence; an entry that stops receiving
@@ -727,6 +918,10 @@ struct Persisted {
     best_hashrate_hps: f64,
     worker_best_shares: HashMap<String, u64>,
     hashrates: Vec<PersistedWorkerHashrate>,
+    pending_blocks: Vec<PendingBlock>,
+    blocks_found: u64,
+    blocks_orphaned: u64,
+    blocks_inconclusive: u64,
 }
 
 impl Persisted {
@@ -750,12 +945,31 @@ impl Persisted {
             warn!("Failed to restore hashrates from DB {path}: {e}");
             Vec::new()
         });
+        let pending_blocks = store.load_pending_blocks().unwrap_or_else(|e| {
+            warn!("Failed to restore pending blocks from DB {path}: {e}");
+            Vec::new()
+        });
+        let (blocks_found, blocks_orphaned, blocks_inconclusive) =
+            store.load_block_counts().unwrap_or_else(|e| {
+                warn!("Failed to restore block counts from DB {path}: {e}");
+                (0, 0, 0)
+            });
+        if !pending_blocks.is_empty() {
+            info!(
+                "Restored {} block(s) awaiting confirmation from {path}",
+                pending_blocks.len()
+            );
+        }
         Self {
             store: Some(store),
             best_share_difficulty,
             best_hashrate_hps,
             worker_best_shares,
             hashrates,
+            pending_blocks,
+            blocks_found,
+            blocks_orphaned,
+            blocks_inconclusive,
         }
     }
 }
@@ -776,10 +990,19 @@ impl PoolStats {
             best_hashrate_hps,
             worker_best_shares: worker_best_shares_map,
             hashrates: persisted_hashrates,
+            pending_blocks: persisted_pending_blocks,
+            blocks_found,
+            blocks_orphaned,
+            blocks_inconclusive,
         } = stats_db_path
             .filter(|p| !p.is_empty())
             .map(|path| Persisted::load(&path))
             .unwrap_or_default();
+
+        let pending_blocks = DashMap::new();
+        for block in persisted_pending_blocks {
+            pending_blocks.insert(block.hash.clone(), block);
+        }
 
         let worker_best_shares = DashMap::new();
         for (worker, best_share) in worker_best_shares_map {
@@ -808,8 +1031,9 @@ impl PoolStats {
         Arc::new(Self {
             shares_accepted: AtomicU64::new(0),
             shares_rejected: AtomicU64::new(0),
-            blocks_found: AtomicU64::new(0),
-            blocks_inconclusive: AtomicU64::new(0),
+            blocks_found: AtomicU64::new(blocks_found),
+            blocks_inconclusive: AtomicU64::new(blocks_inconclusive),
+            blocks_orphaned: AtomicU64::new(blocks_orphaned),
             connected_miners: AtomicU64::new(0),
             current_height: AtomicU64::new(0),
             current_coinbase_value: AtomicU64::new(0),
@@ -830,6 +1054,8 @@ impl PoolStats {
             last_block_payout: Mutex::new(None),
             last_block_hash: Mutex::new(None),
             last_block_ts: AtomicU64::new(0),
+            last_block_status: Mutex::new(BLOCK_STATUS_PENDING),
+            pending_blocks,
             start_time: instant_now,
             store,
         })
@@ -881,6 +1107,9 @@ impl PoolStats {
         *self.last_block_worker.lock() = Some(worker.to_string());
         *self.last_block_payout.lock() = Some(payout.to_string());
         *self.last_block_hash.lock() = Some(hash.to_string());
+        // A block only just claimed has not been confirmed yet, whatever the
+        // previous occupant of this card had reached.
+        *self.last_block_status.lock() = BLOCK_STATUS_PENDING;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -894,6 +1123,95 @@ impl PoolStats {
     /// found" card must only ever show a block that actually won.
     pub fn block_inconclusive(&self) {
         self.blocks_inconclusive.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Enrol a block the node stored in the confirmation ledger, whatever
+    /// `submitblock` said about it.
+    ///
+    /// Both verdicts are enrolled because both can be overturned: a win can be
+    /// reorged out, and a block that lost its height race can be promoted onto
+    /// the active chain by the reorg that follows.
+    pub fn enroll_pending_block(
+        &self,
+        height: u64,
+        hash: &str,
+        worker: &str,
+        payout: &str,
+        won_at_submit: bool,
+    ) {
+        let block = PendingBlock {
+            hash: hash.to_string(),
+            height,
+            worker: worker.to_string(),
+            payout: payout.to_string(),
+            found_ts: Self::now_secs(),
+            won_at_submit,
+        };
+        // The retry ladder can report the same block twice; the first
+        // enrolment wins, matching the `INSERT OR IGNORE` below it.
+        if self.pending_blocks.contains_key(hash) {
+            return;
+        }
+        self.pending_blocks.insert(hash.to_string(), block.clone());
+        if let Some(store) = &self.store {
+            store.record_found_block(block);
+        }
+    }
+
+    /// Blocks still awaiting confirmation, for `mining::confirm` to sweep.
+    pub fn pending_blocks(&self) -> Vec<PendingBlock> {
+        self.pending_blocks
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    /// Retire a pending block and reconcile the counts the submit-time verdict
+    /// got wrong.
+    ///
+    /// Returns `false` if the block was already resolved — the sweep snapshots
+    /// the pending set, so a slow tick can overlap the next one.
+    pub fn resolve_block(&self, block: &PendingBlock, resolution: BlockResolution) -> bool {
+        if self.pending_blocks.remove(&block.hash).is_none() {
+            return false;
+        }
+
+        match (block.won_at_submit, resolution) {
+            // Counted as a win, and the chain disagrees. This is the case the
+            // ledger exists for.
+            (true, BlockResolution::Orphaned) => {
+                self.blocks_orphaned.fetch_add(1, Ordering::Relaxed);
+                // Unlike the Prometheus counter this may go down: the dashboard
+                // shows what the pool actually kept.
+                let _ = self
+                    .blocks_found
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        Some(n.saturating_sub(1))
+                    });
+            }
+            // Lost its height race, then a reorg put it on the active chain
+            // after all. `block_found` also refreshes the last-block card,
+            // which is right: it is now the most recent block the pool won.
+            (false, BlockResolution::Confirmed) => {
+                let _ = self.blocks_inconclusive.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |n| Some(n.saturating_sub(1)),
+                );
+                self.block_found(&block.worker, &block.payout, &block.hash);
+            }
+            _ => {}
+        }
+
+        // Only annotate the card if it is still showing this block.
+        if self.last_block_hash.lock().as_deref() == Some(block.hash.as_str()) {
+            *self.last_block_status.lock() = resolution.label();
+        }
+
+        if let Some(store) = &self.store {
+            store.record_block_resolution(&block.hash, resolution, Self::now_secs());
+        }
+        true
     }
 
     pub fn update_height(&self, height: u64, coinbase_value: u64, transaction_count: u64) {
@@ -1004,7 +1322,7 @@ impl PoolStats {
             .fetch_max(bits, Ordering::Relaxed);
     }
 
-    fn now_secs() -> u64 {
+    pub fn now_secs() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1360,6 +1678,8 @@ impl PoolStats {
             shares_rejected: self.shares_rejected.load(Ordering::Relaxed),
             blocks_found: self.blocks_found.load(Ordering::Relaxed),
             blocks_inconclusive: self.blocks_inconclusive.load(Ordering::Relaxed),
+            blocks_orphaned: self.blocks_orphaned.load(Ordering::Relaxed),
+            blocks_pending_confirmation: self.pending_blocks.len() as u64,
             connected_miners: self.connected_miners.load(Ordering::Relaxed),
             current_height: self.current_height.load(Ordering::Relaxed),
             current_coinbase_value: self.current_coinbase_value.load(Ordering::Relaxed),
@@ -1406,6 +1726,7 @@ impl PoolStats {
                 .clone()
                 .unwrap_or_else(|| "—".to_string()),
             last_block_ts: self.last_block_ts.load(Ordering::Relaxed),
+            last_block_status: (*self.last_block_status.lock()).to_string(),
         }
     }
 }
@@ -1418,9 +1739,16 @@ impl PoolStats {
 pub struct StatsSnapshot {
     pub shares_accepted: u64,
     pub shares_rejected: u64,
+    /// Wins that have survived so far: decremented when the confirmation pass
+    /// finds one was reorged out. The Prometheus counter of the same name
+    /// cannot go down, so the two differ by `blocks_orphaned`.
     pub blocks_found: u64,
     /// Valid blocks that lost a same-height race and earned nothing.
     pub blocks_inconclusive: u64,
+    /// Blocks that won their height and were later reorged off the chain.
+    pub blocks_orphaned: u64,
+    /// Found blocks the confirmation pass has not yet decided.
+    pub blocks_pending_confirmation: u64,
     pub connected_miners: u64,
     pub current_height: u64,
     pub current_coinbase_value: u64,
@@ -1449,6 +1777,9 @@ pub struct StatsSnapshot {
     pub last_block_payout: String,
     pub last_block_hash: String,
     pub last_block_ts: u64,
+    /// Where the last block stands with the confirmation pass: `pending` until
+    /// it is decided, then a `BlockResolution` label.
+    pub last_block_status: String,
 }
 
 #[derive(Serialize)]
@@ -1899,6 +2230,78 @@ mod tests {
         let ss = stats.snapshot();
         let w1 = ss.worker_states.iter().find(|w| w.worker == "w1").unwrap();
         assert_eq!(w1.best_share_difficulty, 4000);
+
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Confirmation takes an hour at the default depth. A restart inside that
+    /// window must not be all it takes for a reorg to go unnoticed.
+    #[test]
+    fn a_block_awaiting_confirmation_survives_a_restart() {
+        let db_path = make_temp_db();
+
+        {
+            let stats = PoolStats::new_with_store(Some(db_path.clone()));
+            stats.block_found("w1", "bc1qpayout", "0000cafe");
+            stats.enroll_pending_block(800_000, "0000cafe", "w1", "bc1qpayout", true);
+            assert_eq!(stats.snapshot().blocks_pending_confirmation, 1);
+        }
+
+        let stats = PoolStats::new_with_store(Some(db_path.clone()));
+        let pending = stats.pending_blocks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].hash, "0000cafe");
+        assert_eq!(pending[0].height, 800_000);
+        assert_eq!(pending[0].worker, "w1");
+        assert_eq!(pending[0].payout, "bc1qpayout");
+        assert!(pending[0].won_at_submit);
+        // The count it was claimed under comes back with it.
+        assert_eq!(stats.snapshot().blocks_found, 1);
+
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// The ledger, not the process lifetime, is the authority on how many
+    /// blocks the pool has kept — which is what the dashboard's "found blocks
+    /// survive restarts" has always claimed.
+    #[test]
+    fn resolved_block_counts_are_restored_from_the_ledger() {
+        let db_path = make_temp_db();
+
+        {
+            let stats = PoolStats::new_with_store(Some(db_path.clone()));
+            // One win that stands, one win that is reorged out, one block that
+            // lost its race and is then promoted by a later reorg.
+            for (hash, won) in [("aa", true), ("bb", true), ("cc", false)] {
+                stats.enroll_pending_block(800_000, hash, "w1", "bc1qpayout", won);
+                if won {
+                    stats.block_found("w1", "bc1qpayout", hash);
+                } else {
+                    stats.block_inconclusive();
+                }
+            }
+            let by_hash = |h: &str| {
+                stats
+                    .pending_blocks()
+                    .into_iter()
+                    .find(|b| b.hash == h)
+                    .unwrap()
+            };
+            stats.resolve_block(&by_hash("aa"), BlockResolution::Confirmed);
+            stats.resolve_block(&by_hash("bb"), BlockResolution::Orphaned);
+            stats.resolve_block(&by_hash("cc"), BlockResolution::Confirmed);
+
+            let snap = stats.snapshot();
+            assert_eq!(snap.blocks_found, 2);
+            assert_eq!(snap.blocks_orphaned, 1);
+            assert_eq!(snap.blocks_inconclusive, 0);
+        }
+
+        let snap = PoolStats::new_with_store(Some(db_path.clone())).snapshot();
+        assert_eq!(snap.blocks_found, 2);
+        assert_eq!(snap.blocks_orphaned, 1);
+        assert_eq!(snap.blocks_inconclusive, 0);
+        assert_eq!(snap.blocks_pending_confirmation, 0);
 
         std::fs::remove_file(db_path).ok();
     }

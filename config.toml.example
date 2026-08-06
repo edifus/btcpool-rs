@@ -77,6 +77,22 @@ idle_timeout_secs = 300
 # against the service working directory, like stats_db_path.
 found_block_dir = "found-blocks"
 
+# Confirmations before a found block is treated as final.
+#
+# The submitblock response is only true at the instant it is read: a block that
+# wins its height can still be reorged out, and one that loses a same-height
+# race can be promoted by the reorg that follows. Every found block is
+# re-checked with getblockheader until it is this deep on the active chain
+# (confirmed) or this deep on a branch that lost (reorged out), then reconciled
+# against the counts. See pool_blocks_orphaned_total.
+#
+# 6 is the conventional finality threshold and takes about an hour. 100 is
+# coinbase maturity — the depth at which the reward is actually spendable — at
+# the cost of holding each block pending for ~17 hours. Do not set this to 1:
+# a block one deep on a side branch is a routine reorg that usually resolves in
+# our favour. Range 1–100.
+confirmation_depth = 6
+
 [sv2]
 # Accept Stratum V2 (Extended Channel, Noise-encrypted) connections on the SAME
 # listen_addr as SV1. The protocol is auto-detected from the first byte of each

@@ -136,6 +136,30 @@ pub fn block_found() {
     counter!("pool_blocks_found_total").increment(1);
 }
 
+/// A block that won its height and was later reorged off the chain — the
+/// correction to `pool_blocks_found_total`, which cannot itself go down.
+///
+/// Unlabelled for the same reason as `block_found`: subtracting one from the
+/// other should not need a label matcher.
+pub fn block_orphaned() {
+    counter!("pool_blocks_orphaned_total").increment(1);
+}
+
+/// How the deferred confirmation pass decided a block, one series per outcome.
+///
+/// `result` is a closed set (`stats::BlockResolution::label`); this is the
+/// breakdown that makes `found = confirmed + orphaned + abandoned + pending`
+/// checkable against the gauge below.
+pub fn block_confirmation(result: &'static str) {
+    counter!("pool_block_confirmations_total", "result" => result).increment(1);
+}
+
+/// Found blocks the confirmation pass has not yet decided. Normally zero; a
+/// value stuck above zero for hours means the pass is not making progress.
+pub fn update_blocks_pending_confirmation(pending: u64) {
+    gauge!("pool_blocks_pending_confirmation").set(pending as f64);
+}
+
 /// `window` label values for the hashrate gauges, in the order
 /// `stats::HashrateWindows::to_windows` produces (the `mining::hashrate` `W_*`
 /// indices). Keep the two in step or every series is mislabelled.

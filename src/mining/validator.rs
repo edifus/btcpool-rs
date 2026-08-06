@@ -239,7 +239,7 @@ pub fn validate_share_no_dedup(
         tracing::info!(
             "🎉 BLOCK FOUND! height={} hash={}",
             job.height,
-            hex::encode(hash)
+            block_hash_display(&hash)
         );
         return Ok(ShareResult::Block {
             hash_difficulty,
@@ -401,6 +401,19 @@ pub fn meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
     hash_be <= *target
 }
 
+/// The conventional display form of a block hash: big-endian hex, the string a
+/// block explorer, `getblockheader` and `bitcoin-cli` all speak.
+///
+/// `hash` here is the raw double-SHA256, which is internal (little-endian)
+/// order — the reverse. `hex::encode` on it directly produces a string with the
+/// leading zeros at the *end*, which resolves nowhere and no RPC will accept.
+/// Every hash that leaves this process for a human or a node goes through here.
+pub fn block_hash_display(hash: &[u8; 32]) -> String {
+    let mut be = *hash;
+    be.reverse();
+    hex::encode(be)
+}
+
 fn encode_varint(n: u64) -> Vec<u8> {
     if n < 0xfd {
         vec![n as u8]
@@ -426,6 +439,25 @@ fn encode_varint(n: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mainnet genesis block, against the two forms in the same assertion:
+    /// hex-encoding the raw hash directly is what the pool used to report, and
+    /// it is the reverse of the string every explorer and RPC speaks.
+    #[test]
+    fn a_block_hash_is_displayed_the_way_the_rest_of_bitcoin_writes_it() {
+        let mut genesis = [0u8; 32];
+        genesis.copy_from_slice(
+            &hex::decode("6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000")
+                .unwrap(),
+        );
+
+        assert_eq!(
+            block_hash_display(&genesis),
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+        );
+        // The leading zeros of proof-of-work land at the wrong end without it.
+        assert_ne!(block_hash_display(&genesis), hex::encode(genesis));
+    }
 
     #[test]
     fn test_meets_target_lower() {

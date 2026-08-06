@@ -67,6 +67,7 @@ mod tests {
             max_connections: 8,
             idle_timeout_secs: 300,
             found_block_dir: "found-blocks".into(),
+            confirmation_depth: 6,
             network: network_assert.map(str::to_string),
         }
     }

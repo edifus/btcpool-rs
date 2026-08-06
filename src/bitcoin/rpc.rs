@@ -13,8 +13,10 @@
 /// from parking a runtime worker on a node round trip.
 use crate::{config::RpcConfig, error::PoolError};
 use anyhow::{anyhow, Result};
+use bitcoin::BlockHash;
 use bitcoincore_rpc::{jsonrpc, Auth, Client, RpcApi};
 use serde_json::{json, Value};
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -81,6 +83,27 @@ impl BlockSubmitOutcome {
     pub const fn is_win(self) -> bool {
         !matches!(self, Self::Inconclusive)
     }
+}
+
+/// Where a block we already submitted sits relative to the active chain, as of
+/// one `getblockheader`.
+///
+/// `submitblock`'s verdict is only true at the instant it is read: a block that
+/// won its height can still be reorged out an hour later. This is what the
+/// deferred confirmation pass re-reads, and like [`BlockSubmitOutcome`] it is a
+/// closed set so the decision can live in a pure function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockChainPosition {
+    /// On the active chain, buried under `confirmations` blocks (the block
+    /// itself counts as one).
+    OnChain { confirmations: u32, tip_height: u64 },
+    /// The node has the block but it is not on the active chain
+    /// (`confirmations == -1`). Not yet final in either direction — a reorg can
+    /// still restore it, which is why the caller also weighs `tip_height`.
+    SideBranch { tip_height: u64 },
+    /// The node does not have this block at all: reindexed, pruned onto a
+    /// different chain, or replaced entirely.
+    Unknown,
 }
 
 struct Inner {
@@ -281,6 +304,57 @@ impl RpcClient {
         })
     }
 
+    /// Where `hash_hex` sits relative to the active chain right now.
+    ///
+    /// `hash_hex` is the big-endian display form produced by
+    /// [`crate::mining::validator::block_hash_display`] — the only form
+    /// `getblockheader` accepts.
+    ///
+    /// Two round trips in one blocking task, so they share a single hop on and
+    /// off the runtime: the header carries `confirmations`, and the tip height
+    /// is what tells a side-branch block that has merely lost a race apart from
+    /// one a competing chain has buried for good.
+    pub async fn block_chain_position(
+        self: &Arc<Self>,
+        hash_hex: String,
+    ) -> Result<BlockChainPosition, PoolError> {
+        let this = self.clone();
+        spawn_rpc("getblockheader", move || {
+            this.block_chain_position_blocking(&hash_hex)
+        })
+        .await
+    }
+
+    fn block_chain_position_blocking(
+        &self,
+        hash_hex: &str,
+    ) -> Result<BlockChainPosition, PoolError> {
+        let hash = BlockHash::from_str(hash_hex)
+            .map_err(|e| PoolError::Other(anyhow!("not a block hash: {hash_hex}: {e}")))?;
+
+        self.call_with_refresh(|c| {
+            let header = match c.get_block_header_info(&hash) {
+                Ok(header) => header,
+                // A hash the node has never seen is an answer, not a failure —
+                // and not one a cookie refresh could fix, so it must not go
+                // back as `Err` or `call_with_refresh` would rebuild the client
+                // over it.
+                Err(e) if is_block_not_found(&e) => return Ok(BlockChainPosition::Unknown),
+                Err(e) => return Err(PoolError::Rpc(e)),
+            };
+            let tip_height = c.get_block_count().map_err(PoolError::Rpc)?;
+
+            Ok(if header.confirmations < 0 {
+                BlockChainPosition::SideBranch { tip_height }
+            } else {
+                BlockChainPosition::OnChain {
+                    confirmations: header.confirmations as u32,
+                    tip_height,
+                }
+            })
+        })
+    }
+
     pub async fn network_hashrate(
         self: &Arc<Self>,
         blocks: Option<u64>,
@@ -377,6 +451,16 @@ fn classify_submit_response(result: &Value) -> Result<BlockSubmitOutcome, PoolEr
             "unexpected submitblock response: {result}"
         ))),
     }
+}
+
+/// Whether an RPC failure is Core's `RPC_INVALID_ADDRESS_OR_KEY` (-5), which
+/// `getblockheader` returns as "Block not found" for a hash the node does not
+/// have. Matched on the code rather than the message, which is not stable.
+fn is_block_not_found(e: &bitcoincore_rpc::Error) -> bool {
+    matches!(
+        e,
+        bitcoincore_rpc::Error::JsonRpc(jsonrpc::Error::Rpc(rpc)) if rpc.code == -5
+    )
 }
 
 /// Run one blocking RPC on the blocking pool. `what` names the call so a
