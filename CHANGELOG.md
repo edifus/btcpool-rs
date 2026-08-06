@@ -9,6 +9,11 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+### Fixed
+- Hashrate averages no longer restart from zero when the service restarts.
+  Per-worker decay state is checkpointed with the chart history, restored from
+  SQLite at startup, and decayed across the time the service was offline.
+
 ## [0.1.3] - 2026-08-05
 
 Upstream v0.6.3 compatibility fixes and live BIP110/RDTS visibility.

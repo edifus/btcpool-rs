@@ -13,7 +13,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Offline workers idle longer than this are evicted from the in-memory stats
@@ -119,6 +119,12 @@ pub struct HashrateHistoryPoint {
     pub twenty_four_hours: Option<f64>,
 }
 
+struct PersistedWorkerHashrate {
+    worker: String,
+    updated_ts: u64,
+    rates: HashrateWindows,
+}
+
 /// Decaying hashrate state for one miner connection, keyed by session id
 /// rather than worker name so that several rigs sharing a name each contribute
 /// to the total instead of overwriting one another.
@@ -169,6 +175,20 @@ impl StatsStore {
              hashrate_1h_hps REAL,
              hashrate_6h_hps REAL,
              hashrate_24h_hps REAL
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS worker_hashrate_state (
+             worker TEXT PRIMARY KEY,
+             updated_ts INTEGER NOT NULL,
+             hashrate_1m_hps REAL NOT NULL,
+             hashrate_5m_hps REAL NOT NULL,
+             hashrate_10m_hps REAL NOT NULL,
+             hashrate_1h_hps REAL NOT NULL,
+             hashrate_3h_hps REAL NOT NULL,
+             hashrate_6h_hps REAL NOT NULL,
+             hashrate_24h_hps REAL NOT NULL
              )",
             [],
         )?;
@@ -226,6 +246,33 @@ impl StatsStore {
         }
 
         Ok((best_values.0, best_values.1, worker_best_shares))
+    }
+
+    fn load_hashrate_state(&self) -> Result<Vec<PersistedWorkerHashrate>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT worker, updated_ts,
+                    hashrate_1m_hps, hashrate_5m_hps, hashrate_10m_hps,
+                    hashrate_1h_hps, hashrate_3h_hps, hashrate_6h_hps,
+                    hashrate_24h_hps
+             FROM worker_hashrate_state",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PersistedWorkerHashrate {
+                worker: row.get(0)?,
+                updated_ts: row.get(1)?,
+                rates: HashrateWindows {
+                    one_minute: row.get(2)?,
+                    five_minutes: row.get(3)?,
+                    ten_minutes: row.get(4)?,
+                    one_hour: row.get(5)?,
+                    three_hours: row.get(6)?,
+                    six_hours: row.get(7)?,
+                    twenty_four_hours: row.get(8)?,
+                },
+            })
+        })?;
+        rows.collect()
     }
 
     // The `?1 > ...` guards (matching set_worker_best_share) make the writes
@@ -312,39 +359,78 @@ impl StatsStore {
             return Ok(());
         }
 
-        let dropped = conn.execute("DELETE FROM hashrate_history", [])?;
+        let dropped_history = conn.execute("DELETE FROM hashrate_history", [])?;
+        let dropped_state = conn.execute("DELETE FROM worker_hashrate_state", [])?;
         conn.execute(
             "UPDATE pool_stats
              SET best_hashrate_hps = 0.0, hashrate_algo_version = ?1
              WHERE id = 1",
             params![HASHRATE_ALGO_VERSION],
         )?;
-        if dropped > 0 {
+        if dropped_history > 0 || dropped_state > 0 {
             info!(
                 "Hashrate estimator changed (v{stored} → v{HASHRATE_ALGO_VERSION}): \
-                 dropped {dropped} incomparable history rows and reset the best-hashrate watermark"
+                 dropped {dropped_history} incomparable history rows and {dropped_state} state rows, \
+                 and reset the best-hashrate watermark"
             );
         }
         Ok(())
     }
 
-    fn record_hashrate_snapshot(&self, ts: u64, rates: HashrateWindows) {
-        let conn = self.conn.lock();
-        if let Err(e) = conn.execute(
-            "INSERT OR REPLACE INTO hashrate_history (
-               ts, hashrate_hps, hashrate_1m_hps, hashrate_5m_hps,
-               hashrate_1h_hps, hashrate_6h_hps, hashrate_24h_hps
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                ts,
-                rates.ten_minutes,
-                rates.one_minute,
-                rates.five_minutes,
-                rates.one_hour,
-                rates.six_hours,
-                rates.twenty_four_hours,
-            ],
-        ) {
+    fn record_hashrate_snapshot(
+        &self,
+        history_ts: u64,
+        state_ts: u64,
+        rates: HashrateWindows,
+        worker_rates: &HashMap<String, HashrateWindows>,
+    ) {
+        let mut conn = self.conn.lock();
+        let result = (|| -> Result<(), rusqlite::Error> {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT OR REPLACE INTO hashrate_history (
+                   ts, hashrate_hps, hashrate_1m_hps, hashrate_5m_hps,
+                   hashrate_1h_hps, hashrate_6h_hps, hashrate_24h_hps
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    history_ts,
+                    rates.ten_minutes,
+                    rates.one_minute,
+                    rates.five_minutes,
+                    rates.one_hour,
+                    rates.six_hours,
+                    rates.twenty_four_hours,
+                ],
+            )?;
+
+            // Replace the whole checkpoint atomically so workers whose tails
+            // have fully decayed do not reappear after a later restart.
+            tx.execute("DELETE FROM worker_hashrate_state", [])?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO worker_hashrate_state (
+                       worker, updated_ts, hashrate_1m_hps, hashrate_5m_hps,
+                       hashrate_10m_hps, hashrate_1h_hps, hashrate_3h_hps,
+                       hashrate_6h_hps, hashrate_24h_hps
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )?;
+                for (worker, worker_rate) in worker_rates {
+                    stmt.execute(params![
+                        worker,
+                        state_ts,
+                        worker_rate.one_minute,
+                        worker_rate.five_minutes,
+                        worker_rate.ten_minutes,
+                        worker_rate.one_hour,
+                        worker_rate.three_hours,
+                        worker_rate.six_hours,
+                        worker_rate.twenty_four_hours,
+                    ])?;
+                }
+            }
+            tx.commit()
+        })();
+        if let Err(e) = result {
             warn!("Failed to record hashrate snapshot: {e}");
             return;
         }
@@ -352,13 +438,13 @@ impl StatsStore {
         // Charts covering more than a couple of days bucket at 5 minutes or
         // coarser anyway, so the extra resolution buys nothing while the row
         // count grows by SNAPSHOT_INTERVAL_SECS⁻¹ every second.
-        let fine_cutoff = ts.saturating_sub(FINE_HISTORY_RETENTION_SECS);
+        let fine_cutoff = history_ts.saturating_sub(FINE_HISTORY_RETENTION_SECS);
         let _ = conn.execute(
             "DELETE FROM hashrate_history WHERE ts < ?1 AND ts % 60 != 0",
             params![fine_cutoff],
         );
         // Prune entries older than 6 months
-        let cutoff = ts.saturating_sub(6 * 30 * 24 * 3600);
+        let cutoff = history_ts.saturating_sub(6 * 30 * 24 * 3600);
         let _ = conn.execute(
             "DELETE FROM hashrate_history WHERE ts < ?1",
             params![cutoff],
@@ -475,32 +561,74 @@ pub struct WorkerState {
 
 impl PoolStats {
     pub fn new_with_store(stats_db_path: Option<String>) -> Arc<Self> {
-        let (store, best_share_difficulty, best_hashrate_hps, worker_best_shares_map) =
-            match stats_db_path.filter(|p| !p.is_empty()) {
-                Some(path) => match StatsStore::open(&path) {
-                    Ok(store) => match store.load_values() {
-                        Ok((best_difficulty, best_hps, worker_best_shares_map)) => (
+        Self::new_with_store_at(stats_db_path, Self::now_secs(), Instant::now())
+    }
+
+    fn new_with_store_at(
+        stats_db_path: Option<String>,
+        wall_now: u64,
+        instant_now: Instant,
+    ) -> Arc<Self> {
+        let (
+            store,
+            best_share_difficulty,
+            best_hashrate_hps,
+            worker_best_shares_map,
+            persisted_hashrates,
+        ) = match stats_db_path.filter(|p| !p.is_empty()) {
+            Some(path) => match StatsStore::open(&path) {
+                Ok(store) => match store.load_values() {
+                    Ok((best_difficulty, best_hps, worker_best_shares_map)) => {
+                        let persisted_hashrates = match store.load_hashrate_state() {
+                            Ok(state) => state,
+                            Err(e) => {
+                                warn!("Failed to restore hashrates from DB {}: {e}", path);
+                                Vec::new()
+                            }
+                        };
+                        (
                             Some(store),
                             best_difficulty,
                             best_hps,
                             worker_best_shares_map,
-                        ),
-                        Err(e) => {
-                            warn!("Failed to load stats from DB {}: {e}", path);
-                            (None, 0, 0.0, std::collections::HashMap::new())
-                        }
-                    },
+                            persisted_hashrates,
+                        )
+                    }
                     Err(e) => {
-                        warn!("Failed to open stats DB {}: {e}", path);
-                        (None, 0, 0.0, std::collections::HashMap::new())
+                        warn!("Failed to load stats from DB {}: {e}", path);
+                        (None, 0, 0.0, HashMap::new(), Vec::new())
                     }
                 },
-                None => (None, 0, 0.0, std::collections::HashMap::new()),
-            };
+                Err(e) => {
+                    warn!("Failed to open stats DB {}: {e}", path);
+                    (None, 0, 0.0, HashMap::new(), Vec::new())
+                }
+            },
+            None => (None, 0, 0.0, HashMap::new(), Vec::new()),
+        };
 
         let worker_best_shares = DashMap::new();
         for (worker, best_share) in worker_best_shares_map {
             worker_best_shares.insert(worker, best_share);
+        }
+
+        let session_hashrates = DashMap::new();
+        for persisted in persisted_hashrates {
+            let offline_for = Duration::from_secs(wall_now.saturating_sub(persisted.updated_ts));
+            let decay = hashrate::HashrateDecay::restored(
+                instant_now,
+                persisted.rates.to_windows(),
+                offline_for,
+            );
+            if !decay.is_idle() {
+                session_hashrates.insert(
+                    format!("restored:{}", persisted.worker),
+                    SessionHashrate {
+                        worker: persisted.worker,
+                        decay,
+                    },
+                );
+            }
         }
 
         Arc::new(Self {
@@ -518,7 +646,7 @@ impl PoolStats {
             network_hashrate_hps: AtomicU64::new(0),
             network_difficulty: AtomicU64::new(f64::to_bits(0.0)),
             est_difficulty_change_pct: AtomicU64::new(f64::to_bits(f64::NAN)),
-            session_hashrates: DashMap::new(),
+            session_hashrates,
             worker_protocol: DashMap::new(),
             worker_last_submit_ts: DashMap::new(),
             worker_best_shares,
@@ -527,7 +655,7 @@ impl PoolStats {
             last_block_payout: Mutex::new(None),
             last_block_hash: Mutex::new(None),
             last_block_ts: AtomicU64::new(0),
-            start_time: Instant::now(),
+            start_time: instant_now,
             store,
         })
     }
@@ -745,14 +873,6 @@ impl PoolStats {
         by_worker
     }
 
-    fn total_hashrates(&self) -> HashrateWindows {
-        let mut total = HashrateWindows::default();
-        for entry in self.session_hashrates.iter() {
-            total.add(HashrateWindows::from_windows(entry.decay.hashrates()));
-        }
-        total
-    }
-
     /// Record the connection protocol ("sv1" / "sv2") for a worker.
     pub fn set_worker_protocol(&self, worker: &str, protocol: &str) {
         self.worker_protocol
@@ -925,6 +1045,10 @@ impl PoolStats {
     }
 
     pub fn record_hashrate_snapshot(&self) {
+        self.record_hashrate_snapshot_at(Self::now_secs());
+    }
+
+    fn record_hashrate_snapshot_at(&self, state_ts: u64) {
         if let Some(store) = &self.store {
             // Snap to the sampling grid. The recorder's wall-clock timestamps
             // drift by however long a tick took, and two things downstream need
@@ -932,8 +1056,13 @@ impl PoolStats {
             // view, and the retention step keeps rows where `ts % 60 == 0` —
             // which unsnapped timestamps would hit only by luck, thinning the
             // long-range history away to nothing.
-            let ts = Self::now_secs() / SNAPSHOT_INTERVAL_SECS * SNAPSHOT_INTERVAL_SECS;
-            store.record_hashrate_snapshot(ts, self.total_hashrates());
+            let history_ts = state_ts / SNAPSHOT_INTERVAL_SECS * SNAPSHOT_INTERVAL_SECS;
+            let by_worker = self.hashrates_by_worker();
+            let mut total = HashrateWindows::default();
+            for rates in by_worker.values() {
+                total.add(*rates);
+            }
+            store.record_hashrate_snapshot(history_ts, state_ts, total, &by_worker);
         }
     }
 
@@ -1221,6 +1350,100 @@ mod tests {
     }
 
     #[test]
+    fn worker_hashrates_resume_after_restart_and_decay_while_offline() {
+        let db_path = make_temp_db();
+        let saved_at = 1_000_007;
+        let restart_at = saved_at + 30;
+        let rates = HashrateWindows::uniform(10.0 * TH);
+
+        {
+            let now = Instant::now();
+            let stats = PoolStats::new_with_store_at(Some(db_path.clone()), saved_at, now);
+            stats.session_hashrates.insert(
+                "s1".to_string(),
+                SessionHashrate {
+                    worker: "axe".to_string(),
+                    decay: hashrate::HashrateDecay::restored(
+                        now,
+                        rates.to_windows(),
+                        Duration::ZERO,
+                    ),
+                },
+            );
+            stats.record_hashrate_snapshot_at(saved_at);
+        }
+
+        let now = Instant::now();
+        let stats = PoolStats::new_with_store_at(Some(db_path.clone()), restart_at, now);
+        let expected = HashrateWindows::from_windows(
+            hashrate::HashrateDecay::restored(now, rates.to_windows(), Duration::from_secs(30))
+                .hashrates(),
+        );
+        let snapshot = stats.snapshot();
+        assert!((snapshot.total_hashrate_60s - expected.one_minute).abs() < 1.0);
+        assert!((snapshot.total_hashrate_24h - expected.twenty_four_hours).abs() < 1.0);
+        assert!(snapshot.total_hashrate_60s > 0.0);
+        assert!(snapshot.total_hashrate_60s < 10.0 * TH);
+        assert!(snapshot.total_hashrate_24h > 9.9 * TH);
+        assert_eq!(snapshot.worker_hashrates.len(), 1);
+        assert_eq!(snapshot.worker_hashrates[0].worker, "axe");
+
+        // A reconnected session contributes alongside the restored tail. It
+        // must not overwrite the checkpoint merely because the worker name is
+        // the same.
+        stats.session_hashrates.insert(
+            "s2".to_string(),
+            SessionHashrate {
+                worker: "axe".to_string(),
+                decay: hashrate::HashrateDecay::restored(
+                    now,
+                    HashrateWindows::uniform(2.0 * TH).to_windows(),
+                    Duration::ZERO,
+                ),
+            },
+        );
+        let snapshot = stats.snapshot();
+        assert!((snapshot.total_hashrate_60s - expected.one_minute - 2.0 * TH).abs() < 1.0);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    #[test]
+    fn restored_hashrate_reaches_zero_after_long_downtime() {
+        let db_path = make_temp_db();
+        let saved_at = 2_000_000;
+
+        {
+            let now = Instant::now();
+            let stats = PoolStats::new_with_store_at(Some(db_path.clone()), saved_at, now);
+            stats.session_hashrates.insert(
+                "s1".to_string(),
+                SessionHashrate {
+                    worker: "axe".to_string(),
+                    decay: hashrate::HashrateDecay::restored(
+                        now,
+                        HashrateWindows::uniform(TH).to_windows(),
+                        Duration::ZERO,
+                    ),
+                },
+            );
+            stats.record_hashrate_snapshot_at(saved_at);
+        }
+
+        let stats = PoolStats::new_with_store_at(
+            Some(db_path.clone()),
+            saved_at + 60 * 86_400,
+            Instant::now(),
+        );
+        assert!(stats.session_hashrates.is_empty());
+        assert_eq!(stats.snapshot().total_hashrate_24h, 0.0);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    #[test]
     fn legacy_hashrate_history_migrates_without_inventing_windows() {
         let db_path = make_temp_db();
         {
@@ -1283,7 +1506,14 @@ mod tests {
         {
             let store = StatsStore::open(&db_path).unwrap();
             store.set_best_hashrate_hps(60.0 * TH);
-            store.record_hashrate_snapshot(120, HashrateWindows::uniform(949.0e15));
+            let worker_rates =
+                HashMap::from([("axe".to_string(), HashrateWindows::uniform(949.0e15))]);
+            store.record_hashrate_snapshot(
+                120,
+                120,
+                HashrateWindows::uniform(949.0e15),
+                &worker_rates,
+            );
             // Pretend it was written before the estimator changed.
             store
                 .conn
@@ -1298,6 +1528,7 @@ mod tests {
 
         let stats = PoolStats::new_with_store(Some(db_path.clone()));
         assert!(stats.get_hashrate_history(0, 60).is_empty());
+        assert!(stats.session_hashrates.is_empty());
         assert_eq!(stats.snapshot().best_hashrate_hps, 0.0);
 
         // Second open is a no-op: the version now matches.
@@ -1316,8 +1547,8 @@ mod tests {
     fn hashrate_history_averages_samples_into_time_buckets() {
         let db_path = make_temp_db();
         let store = StatsStore::open(&db_path).unwrap();
-        store.record_hashrate_snapshot(120, HashrateWindows::uniform(10.0));
-        store.record_hashrate_snapshot(150, HashrateWindows::uniform(20.0));
+        store.record_hashrate_snapshot(120, 120, HashrateWindows::uniform(10.0), &HashMap::new());
+        store.record_hashrate_snapshot(150, 150, HashrateWindows::uniform(20.0), &HashMap::new());
 
         let history = store.get_hashrate_history(0, 60);
         assert_eq!(history.len(), 1);
@@ -1345,7 +1576,7 @@ mod tests {
         assert_eq!(base % 60, 0);
         for i in 0..12 {
             let ts = base + i * SNAPSHOT_INTERVAL_SECS;
-            store.record_hashrate_snapshot(ts, HashrateWindows::uniform(10.0));
+            store.record_hashrate_snapshot(ts, ts, HashrateWindows::uniform(10.0), &HashMap::new());
         }
         assert_eq!(
             store.get_hashrate_history(0, SNAPSHOT_INTERVAL_SECS).len(),
@@ -1354,7 +1585,7 @@ mod tests {
 
         // A sample far enough ahead pushes them past the horizon.
         let now = base + FINE_HISTORY_RETENTION_SECS + 600;
-        store.record_hashrate_snapshot(now, HashrateWindows::uniform(20.0));
+        store.record_hashrate_snapshot(now, now, HashrateWindows::uniform(20.0), &HashMap::new());
 
         let kept: Vec<u64> = store
             .get_hashrate_history(0, SNAPSHOT_INTERVAL_SECS)
