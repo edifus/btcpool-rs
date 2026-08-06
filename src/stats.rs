@@ -1162,16 +1162,24 @@ impl PoolStats {
             })
             .collect();
 
-        for entry in self.worker_best_shares.iter() {
-            let worker = entry.key();
-            if seen.contains(worker) {
-                continue;
-            }
+        // Workers with no live `WorkerState`: those known only by an all-time
+        // best share, and those restored from the hashrate checkpoint that have
+        // not reconnected yet. The latter still contribute a decaying tail to
+        // the pool total, so the table has to show it rather than a zero row.
+        let extra_workers = self
+            .worker_best_shares
+            .iter()
+            .map(|e| e.key().clone())
+            .chain(by_worker.keys().cloned())
+            .filter(|w| !seen.contains(w))
+            .collect::<std::collections::BTreeSet<String>>();
+
+        for worker in extra_workers {
+            let rates = by_worker.get(&worker).copied().unwrap_or_default();
             worker_states.push(WorkerState {
-                worker: worker.clone(),
                 protocol: self
                     .worker_protocol
-                    .get(worker)
+                    .get(&worker)
                     .map(|p| p.value().clone())
                     .unwrap_or_else(|| "sv1".to_string()),
                 online: false,
@@ -1180,17 +1188,26 @@ impl PoolStats {
                 shares_rejected: 0,
                 shares_stale: 0,
                 reject_reasons: BTreeMap::new(),
-                best_share_difficulty: *entry.value(),
+                best_share_difficulty: self
+                    .worker_best_shares
+                    .get(&worker)
+                    .map(|v| *v.value())
+                    .unwrap_or(0),
                 active_sessions: 0,
                 connected_ts: 0,
-                last_submit_ts: 0,
-                hashrate_60s_hps: 0.0,
-                hashrate_5m_hps: 0.0,
-                hashrate_10m_hps: 0.0,
-                hashrate_1h_hps: 0.0,
-                hashrate_3h_hps: 0.0,
-                hashrate_6h_hps: 0.0,
-                hashrate_24h_hps: 0.0,
+                last_submit_ts: self
+                    .worker_last_submit_ts
+                    .get(&worker)
+                    .map(|v| *v.value())
+                    .unwrap_or(0),
+                hashrate_60s_hps: rates.one_minute,
+                hashrate_5m_hps: rates.five_minutes,
+                hashrate_10m_hps: rates.ten_minutes,
+                hashrate_1h_hps: rates.one_hour,
+                hashrate_3h_hps: rates.three_hours,
+                hashrate_6h_hps: rates.six_hours,
+                hashrate_24h_hps: rates.twenty_four_hours,
+                worker,
             });
         }
 
@@ -1412,6 +1429,22 @@ mod tests {
         );
         let snapshot = stats.snapshot();
         assert!((snapshot.total_hashrate_60s - expected.one_minute - 2.0 * TH).abs() < 1.0);
+
+        // The restored worker has no `WorkerState` yet (nothing has authorized
+        // this boot), but it is carrying real hashrate, so the worker table has
+        // to show it rather than a zero row next to a non-zero pool total.
+        let row = snapshot
+            .worker_states
+            .iter()
+            .find(|s| s.worker == "axe")
+            .expect("restored worker missing from the worker table");
+        assert!(!row.online);
+        assert!(
+            (row.hashrate_60s_hps - snapshot.total_hashrate_60s).abs() < 1.0,
+            "restored worker row reads {} against a pool total of {}",
+            row.hashrate_60s_hps,
+            snapshot.total_hashrate_60s
+        );
 
         drop(stats);
         std::fs::remove_file(db_path).ok();
