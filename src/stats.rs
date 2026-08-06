@@ -13,7 +13,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Offline workers idle longer than this are evicted from the in-memory stats
@@ -40,72 +40,117 @@ pub const SNAPSHOT_INTERVAL_SECS: u64 = 10;
 /// being thinned to one a minute.
 const FINE_HISTORY_RETENTION_SECS: u64 = 48 * 3600;
 
-/// Hashrate averages over the windows in `mining::hashrate::WINDOW_SECS`,
-/// in H/s. These are decaying averages with the named window as their time
-/// constant, not trailing sliding windows: a freshly started source reads far
-/// below its true rate on the longer windows until they have had time to fill.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct HashrateWindows {
-    pub one_minute: f64,
-    pub five_minutes: f64,
-    pub ten_minutes: f64,
-    pub one_hour: f64,
-    pub three_hours: f64,
-    pub six_hours: f64,
-    pub twenty_four_hours: f64,
+// ─────────────────────────────────────────────────────────────────────────────
+// Found-block ledger
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A block this pool found, still waiting on the deferred confirmation pass.
+///
+/// `submitblock`'s verdict is only true at the instant it is read, so every
+/// block the node stored is enrolled here and re-checked until the answer is
+/// final. See `mining::confirm`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBlock {
+    /// Big-endian display hex, as `mining::validator::block_hash_display`
+    /// produces it — the only form `getblockheader` accepts.
+    pub hash: String,
+    pub height: u64,
+    pub worker: String,
+    pub payout: String,
+    pub found_ts: u64,
+    /// What `submitblock` said at the time (`BlockSubmitOutcome::is_win`), and
+    /// so what was already counted. The confirmation pass only has work to do
+    /// where this disagrees with the chain.
+    pub won_at_submit: bool,
 }
 
-impl HashrateWindows {
-    fn add(&mut self, other: Self) {
-        self.one_minute += other.one_minute;
-        self.five_minutes += other.five_minutes;
-        self.ten_minutes += other.ten_minutes;
-        self.one_hour += other.one_hour;
-        self.three_hours += other.three_hours;
-        self.six_hours += other.six_hours;
-        self.twenty_four_hours += other.twenty_four_hours;
-    }
+/// How a found block's confirmation ended.
+///
+/// Terminal: a block leaves the pending set exactly once. A closed set because
+/// it is both a SQL column value and a Prometheus label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockResolution {
+    /// Buried `confirmation_depth` deep on the active chain. Final.
+    Confirmed,
+    /// Buried that deep on a branch that lost. If this block was counted as a
+    /// win at submit time, that count was wrong.
+    Orphaned,
+    /// The node stopped knowing about the hash and never came back — reindexed,
+    /// replaced, or restored from a snapshot. Neither claim can be made, so the
+    /// submit-time verdict is left standing.
+    Abandoned,
+}
 
-    /// Build from a `mining::hashrate` window array, which is indexed by the
-    /// `W_*` constants.
-    fn from_windows(hps: [f64; hashrate::WINDOW_COUNT]) -> Self {
-        Self {
-            one_minute: hps[hashrate::W_1M],
-            five_minutes: hps[hashrate::W_5M],
-            ten_minutes: hps[hashrate::W_10M],
-            one_hour: hps[hashrate::W_1H],
-            three_hours: hps[hashrate::W_3H],
-            six_hours: hps[hashrate::W_6H],
-            twenty_four_hours: hps[hashrate::W_24H],
+impl BlockResolution {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Orphaned => "orphaned",
+            Self::Abandoned => "abandoned",
         }
     }
+}
 
-    /// Back to the `W_*`-indexed array, which is the order the Prometheus
-    /// window labels are in (`metrics::HASHRATE_WINDOW_LABELS`).
-    pub fn to_windows(self) -> [f64; hashrate::WINDOW_COUNT] {
-        let mut out = [0.0; hashrate::WINDOW_COUNT];
-        out[hashrate::W_1M] = self.one_minute;
-        out[hashrate::W_5M] = self.five_minutes;
-        out[hashrate::W_10M] = self.ten_minutes;
-        out[hashrate::W_1H] = self.one_hour;
-        out[hashrate::W_3H] = self.three_hours;
-        out[hashrate::W_6H] = self.six_hours;
-        out[hashrate::W_24H] = self.twenty_four_hours;
-        out
-    }
+/// Status shown on the dashboard's last-block card while confirmation is still
+/// outstanding. `BlockResolution::label` supplies the terminal values.
+pub const BLOCK_STATUS_PENDING: &str = "pending";
 
-    #[cfg(test)]
-    fn uniform(hps: f64) -> Self {
-        Self {
-            one_minute: hps,
-            five_minutes: hps,
-            ten_minutes: hps,
-            one_hour: hps,
-            three_hours: hps,
-            six_hours: hps,
-            twenty_four_hours: hps,
+// Generates `HashrateWindows` and everything that has to walk its fields in
+// window order, from the single table below the macro.
+//
+// The four operations (`add`, `from_windows`, `to_windows`, `uniform`) were
+// four hand-written lists of the same seven fields in the same order, and
+// `to_windows`' order additionally has to match the Prometheus window labels.
+// Any one of them could drift and silently mislabel every exported series, so
+// the field ↔ window-index correspondence is stated exactly once.
+macro_rules! hashrate_windows {
+    ($($field:ident => $index:path),+ $(,)?) => {
+        /// Hashrate averages over the windows in
+        /// `mining::hashrate::WINDOW_SECS`, in H/s. These are decaying averages
+        /// with the named window as their time constant, not trailing sliding
+        /// windows: a freshly started source reads far below its true rate on
+        /// the longer windows until they have had time to fill.
+        #[derive(Debug, Clone, Copy, Default)]
+        pub struct HashrateWindows {
+            $(pub $field: f64,)+
         }
-    }
+
+        impl HashrateWindows {
+            fn add(&mut self, other: Self) {
+                $(self.$field += other.$field;)+
+            }
+
+            /// Build from a `mining::hashrate` window array, which is indexed
+            /// by the `W_*` constants.
+            fn from_windows(hps: [f64; hashrate::WINDOW_COUNT]) -> Self {
+                Self { $($field: hps[$index],)+ }
+            }
+
+            /// Back to the `W_*`-indexed array, which is the order the
+            /// Prometheus window labels are in
+            /// (`metrics::HASHRATE_WINDOW_LABELS`).
+            pub fn to_windows(self) -> [f64; hashrate::WINDOW_COUNT] {
+                let mut out = [0.0; hashrate::WINDOW_COUNT];
+                $(out[$index] = self.$field;)+
+                out
+            }
+
+            #[cfg(test)]
+            fn uniform(hps: f64) -> Self {
+                Self { $($field: hps,)+ }
+            }
+        }
+    };
+}
+
+hashrate_windows! {
+    one_minute => hashrate::W_1M,
+    five_minutes => hashrate::W_5M,
+    ten_minutes => hashrate::W_10M,
+    one_hour => hashrate::W_1H,
+    three_hours => hashrate::W_3H,
+    six_hours => hashrate::W_6H,
+    twenty_four_hours => hashrate::W_24H,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,6 +162,12 @@ pub struct HashrateHistoryPoint {
     pub one_hour: Option<f64>,
     pub six_hours: Option<f64>,
     pub twenty_four_hours: Option<f64>,
+}
+
+struct PersistedWorkerHashrate {
+    worker: String,
+    updated_ts: u64,
+    rates: HashrateWindows,
 }
 
 /// Decaying hashrate state for one miner connection, keyed by session id
@@ -131,13 +182,87 @@ struct SessionHashrate {
 // Persistent store for all-time metrics
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A persisted update, applied by the writer thread.
+///
+/// Every write originates on an async task — the share hot path, the snapshot
+/// ticker, the pruner — so none of them may touch the disk directly. They hand
+/// the work to one thread that owns the write connection instead, which also
+/// removes the lock contention that used to put dashboard queries and share
+/// submissions on the same mutex.
+enum StoreWrite {
+    BestShare(u64),
+    BestHashrate(f64),
+    WorkerBestShare {
+        worker: String,
+        difficulty: u64,
+    },
+    Snapshot {
+        history_ts: u64,
+        state_ts: u64,
+        rates: HashrateWindows,
+        worker_rates: HashMap<String, HashrateWindows>,
+    },
+    PruneWorkerBestShares(usize),
+    /// Enrol a found block in the confirmation ledger. Unlike everything else
+    /// here this is not a watermark that can be recomputed — losing it means
+    /// losing the only record that a reorg has to be checked for.
+    BlockFound(PendingBlock),
+    BlockResolved {
+        hash: String,
+        resolution: BlockResolution,
+        resolved_ts: u64,
+    },
+    /// Barrier: acknowledged once every write queued before it has been
+    /// applied. Production flushes by dropping the store instead.
+    #[cfg(test)]
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// Pending writes allowed before new ones are dropped. Each is a few hundred
+/// bytes and the writer drains them in microseconds; a backlog this deep means
+/// the disk is gone, and dropping a best-share update is better than stalling
+/// the share path.
+const WRITE_QUEUE_DEPTH: usize = 256;
+
 struct StatsStore {
-    conn: Mutex<Connection>,
+    /// Read connection. Only touched from `spawn_blocking` (dashboard queries)
+    /// and at boot, so it never blocks a runtime worker thread.
+    read: Mutex<Connection>,
+    /// `None` only while dropping, which is what closes the channel and lets
+    /// the writer thread finish.
+    writes: Option<std::sync::mpsc::SyncSender<StoreWrite>>,
+    writer: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for StatsStore {
+    /// Flush before going away: closing the channel ends `writer_loop` once it
+    /// has drained the queue, and the join waits for that. Without this a
+    /// process that shuts down promptly — or a test that reopens the same file
+    /// — could lose the last few queued updates.
+    fn drop(&mut self) {
+        self.writes.take();
+        if let Some(handle) = self.writer.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl StatsStore {
-    fn open(path: &str) -> Result<Self, rusqlite::Error> {
+    /// Open a connection with the pragmas this workload wants: WAL so the
+    /// dashboard's reads never block the writer (and vice versa), `NORMAL`
+    /// syncing so a 10-second snapshot doesn't fsync twice, and a busy timeout
+    /// so a concurrent `sqlite3` session on the same file cannot make writes
+    /// fail outright.
+    fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
         let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(conn)
+    }
+
+    fn open(path: &str) -> Result<Self, rusqlite::Error> {
+        let conn = Self::connect(path)?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS pool_stats (
              id INTEGER PRIMARY KEY CHECK(id = 1),
@@ -172,37 +297,99 @@ impl StatsStore {
              )",
             [],
         )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS worker_hashrate_state (
+             worker TEXT PRIMARY KEY,
+             updated_ts INTEGER NOT NULL,
+             hashrate_1m_hps REAL NOT NULL,
+             hashrate_5m_hps REAL NOT NULL,
+             hashrate_10m_hps REAL NOT NULL,
+             hashrate_1h_hps REAL NOT NULL,
+             hashrate_3h_hps REAL NOT NULL,
+             hashrate_6h_hps REAL NOT NULL,
+             hashrate_24h_hps REAL NOT NULL
+             )",
+            [],
+        )?;
+        // The one table here that is a ledger rather than a watermark: each row
+        // is a block this pool found, and `status` is what the deferred
+        // confirmation pass reconciles against the chain. Rows are never
+        // deleted — a solo pool's block count is the whole point of the
+        // exercise, and the table grows by one row per block found.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS found_blocks (
+             hash TEXT PRIMARY KEY,
+             height INTEGER NOT NULL,
+             worker TEXT NOT NULL,
+             payout TEXT NOT NULL,
+             found_ts INTEGER NOT NULL,
+             won_at_submit INTEGER NOT NULL,
+             status TEXT NOT NULL,
+             resolved_ts INTEGER
+             )",
+            [],
+        )?;
+
         Self::migrate_hashrate_history(&conn)?;
         Self::migrate_hashrate_algo(&conn)?;
 
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
-        // Enforce the row cap at boot so an attacker-inflated table from a
-        // previous run is trimmed before load_values pulls it into RAM.
-        store.prune_worker_best_shares(MAX_WORKER_BEST_SHARES);
-        Ok(store)
+        // Enforce the row cap at boot, synchronously and before the writer
+        // thread exists, so an attacker-inflated table from a previous run is
+        // trimmed before `load_values` pulls it into RAM.
+        prune_worker_best_shares(&conn, MAX_WORKER_BEST_SHARES);
+
+        let writer_conn = Self::connect(path)?;
+        let (writes, rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_DEPTH);
+        let writer = std::thread::Builder::new()
+            .name("stats-writer".into())
+            .spawn(move || writer_loop(writer_conn, rx))
+            .map_err(|e| {
+                rusqlite::Error::InvalidParameterName(format!("spawn stats writer thread: {e}"))
+            })?;
+
+        Ok(Self {
+            read: Mutex::new(conn),
+            writes: Some(writes),
+            writer: Some(writer),
+        })
     }
 
-    /// Keep only the `keep` highest-difficulty rows in `worker_best_shares`.
-    fn prune_worker_best_shares(&self, keep: usize) {
-        match self.conn.lock().execute(
-            "DELETE FROM worker_best_shares WHERE worker NOT IN (
-               SELECT worker FROM worker_best_shares
-               ORDER BY best_share_difficulty DESC LIMIT ?1
-             )",
-            params![keep as i64],
-        ) {
-            Ok(0) => {}
-            Ok(n) => info!("Pruned {n} stale worker_best_shares rows (cap {keep})"),
-            Err(e) => warn!("Failed to prune worker_best_shares: {e}"),
+    /// Queue a write. Never blocks: persistence is best-effort next to serving
+    /// miners, so a wedged disk costs a stat, not a share.
+    fn enqueue(&self, write: StoreWrite) {
+        use std::sync::mpsc::TrySendError;
+        let Some(writes) = self.writes.as_ref() else {
+            return; // shutting down
+        };
+        match writes.try_send(write) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                warn!("Stats writer queue full — dropping a persisted stats update")
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                static GONE: std::sync::Once = std::sync::Once::new();
+                GONE.call_once(|| {
+                    warn!("Stats writer thread has stopped; stats are no longer persisted")
+                });
+            }
+        }
+    }
+
+    /// Block until every write queued so far has been applied.
+    #[cfg(test)]
+    fn flush(&self) {
+        let (ack, done) = std::sync::mpsc::channel();
+        if let Some(writes) = self.writes.as_ref() {
+            if writes.send(StoreWrite::Flush(ack)).is_ok() {
+                let _ = done.recv();
+            }
         }
     }
 
     fn load_values(
         &self,
     ) -> Result<(u64, f64, std::collections::HashMap<String, u64>), rusqlite::Error> {
-        let conn = self.conn.lock();
+        let conn = self.read.lock();
         let mut stmt = conn.prepare(
             "SELECT best_share_difficulty, best_hashrate_hps FROM pool_stats WHERE id = 1",
         )?;
@@ -228,28 +415,127 @@ impl StatsStore {
         Ok((best_values.0, best_values.1, worker_best_shares))
     }
 
-    // The `?1 > ...` guards (matching set_worker_best_share) make the writes
-    // monotonic at the SQL level: two racing writers can call these out of
-    // order, and a stale lower value must not overwrite a higher one already
-    // persisted.
+    fn load_hashrate_state(&self) -> Result<Vec<PersistedWorkerHashrate>, rusqlite::Error> {
+        let conn = self.read.lock();
+        let mut stmt = conn.prepare(
+            "SELECT worker, updated_ts,
+                    hashrate_1m_hps, hashrate_5m_hps, hashrate_10m_hps,
+                    hashrate_1h_hps, hashrate_3h_hps, hashrate_6h_hps,
+                    hashrate_24h_hps
+             FROM worker_hashrate_state",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PersistedWorkerHashrate {
+                worker: row.get(0)?,
+                updated_ts: row.get(1)?,
+                rates: HashrateWindows {
+                    one_minute: row.get(2)?,
+                    five_minutes: row.get(3)?,
+                    ten_minutes: row.get(4)?,
+                    one_hour: row.get(5)?,
+                    three_hours: row.get(6)?,
+                    six_hours: row.get(7)?,
+                    twenty_four_hours: row.get(8)?,
+                },
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Blocks still awaiting confirmation, so a restart mid-window does not
+    /// silently abandon one. Confirmation takes an hour at the default depth;
+    /// without this a well-timed restart is all it takes for a reorg to go
+    /// unnoticed, which is the bug this ledger exists to close.
+    fn load_pending_blocks(&self) -> Result<Vec<PendingBlock>, rusqlite::Error> {
+        let conn = self.read.lock();
+        let mut stmt = conn.prepare(
+            "SELECT hash, height, worker, payout, found_ts, won_at_submit
+             FROM found_blocks WHERE status = ?1",
+        )?;
+        let rows = stmt.query_map(params![BLOCK_STATUS_PENDING], |row| {
+            Ok(PendingBlock {
+                hash: row.get(0)?,
+                height: row.get(1)?,
+                worker: row.get(2)?,
+                payout: row.get(3)?,
+                found_ts: row.get(4)?,
+                won_at_submit: row.get::<_, i64>(5)? != 0,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// All-time `(found, orphaned, inconclusive)` from the ledger.
+    ///
+    /// A row counts as a win if `submitblock` said so and nothing has since
+    /// orphaned it, or if it lost its height race at submit time and a later
+    /// reorg promoted it onto the active chain — the two directions the
+    /// confirmation pass reconciles. `abandoned` leaves the submit-time verdict
+    /// standing, since nothing was ever proved against it.
+    fn load_block_counts(&self) -> Result<(u64, u64, u64), rusqlite::Error> {
+        let conn = self.read.lock();
+        // `SUM(CASE ...)` rather than `COUNT(*) FILTER (...)`: rusqlite links
+        // the system SQLite, and `FILTER` needs 3.30. `COALESCE` because `SUM`
+        // over no rows is NULL, not 0.
+        conn.query_row(
+            "SELECT
+               COALESCE(SUM(CASE WHEN (won_at_submit = 1 AND status != 'orphaned')
+                                    OR (won_at_submit = 0 AND status = 'confirmed')
+                                 THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN won_at_submit = 1 AND status = 'orphaned'
+                                 THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN won_at_submit = 0 AND status != 'confirmed'
+                                 THEN 1 ELSE 0 END), 0)
+             FROM found_blocks",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+    }
+
     fn set_best_share_difficulty(&self, difficulty: u64) {
-        if let Err(e) = self.conn.lock().execute(
-            "UPDATE pool_stats SET best_share_difficulty = ?1
-             WHERE id = 1 AND ?1 > best_share_difficulty",
-            params![difficulty],
-        ) {
-            warn!("Failed to persist best_share_difficulty: {e}");
-        }
+        self.enqueue(StoreWrite::BestShare(difficulty));
     }
 
     fn set_best_hashrate_hps(&self, hps: f64) {
-        if let Err(e) = self.conn.lock().execute(
-            "UPDATE pool_stats SET best_hashrate_hps = ?1
-             WHERE id = 1 AND ?1 > best_hashrate_hps",
-            params![hps],
-        ) {
-            warn!("Failed to persist best_hashrate_hps: {e}");
-        }
+        self.enqueue(StoreWrite::BestHashrate(hps));
+    }
+
+    fn set_worker_best_share(&self, worker: &str, difficulty: u64) {
+        self.enqueue(StoreWrite::WorkerBestShare {
+            worker: worker.to_string(),
+            difficulty,
+        });
+    }
+
+    fn prune_worker_best_shares(&self, keep: usize) {
+        self.enqueue(StoreWrite::PruneWorkerBestShares(keep));
+    }
+
+    fn record_found_block(&self, block: PendingBlock) {
+        self.enqueue(StoreWrite::BlockFound(block));
+    }
+
+    fn record_block_resolution(&self, hash: &str, resolution: BlockResolution, resolved_ts: u64) {
+        self.enqueue(StoreWrite::BlockResolved {
+            hash: hash.to_string(),
+            resolution,
+            resolved_ts,
+        });
+    }
+
+    fn record_hashrate_snapshot(
+        &self,
+        history_ts: u64,
+        state_ts: u64,
+        rates: HashrateWindows,
+        worker_rates: &HashMap<String, HashrateWindows>,
+    ) {
+        self.enqueue(StoreWrite::Snapshot {
+            history_ts,
+            state_ts,
+            rates,
+            worker_rates: worker_rates.clone(),
+        });
     }
 
     fn migrate_hashrate_history(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -312,61 +598,26 @@ impl StatsStore {
             return Ok(());
         }
 
-        let dropped = conn.execute("DELETE FROM hashrate_history", [])?;
+        let dropped_history = conn.execute("DELETE FROM hashrate_history", [])?;
+        let dropped_state = conn.execute("DELETE FROM worker_hashrate_state", [])?;
         conn.execute(
             "UPDATE pool_stats
              SET best_hashrate_hps = 0.0, hashrate_algo_version = ?1
              WHERE id = 1",
             params![HASHRATE_ALGO_VERSION],
         )?;
-        if dropped > 0 {
+        if dropped_history > 0 || dropped_state > 0 {
             info!(
                 "Hashrate estimator changed (v{stored} → v{HASHRATE_ALGO_VERSION}): \
-                 dropped {dropped} incomparable history rows and reset the best-hashrate watermark"
+                 dropped {dropped_history} incomparable history rows and {dropped_state} state rows, \
+                 and reset the best-hashrate watermark"
             );
         }
         Ok(())
     }
 
-    fn record_hashrate_snapshot(&self, ts: u64, rates: HashrateWindows) {
-        let conn = self.conn.lock();
-        if let Err(e) = conn.execute(
-            "INSERT OR REPLACE INTO hashrate_history (
-               ts, hashrate_hps, hashrate_1m_hps, hashrate_5m_hps,
-               hashrate_1h_hps, hashrate_6h_hps, hashrate_24h_hps
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                ts,
-                rates.ten_minutes,
-                rates.one_minute,
-                rates.five_minutes,
-                rates.one_hour,
-                rates.six_hours,
-                rates.twenty_four_hours,
-            ],
-        ) {
-            warn!("Failed to record hashrate snapshot: {e}");
-            return;
-        }
-        // Thin samples past the fine-grained retention down to one a minute.
-        // Charts covering more than a couple of days bucket at 5 minutes or
-        // coarser anyway, so the extra resolution buys nothing while the row
-        // count grows by SNAPSHOT_INTERVAL_SECS⁻¹ every second.
-        let fine_cutoff = ts.saturating_sub(FINE_HISTORY_RETENTION_SECS);
-        let _ = conn.execute(
-            "DELETE FROM hashrate_history WHERE ts < ?1 AND ts % 60 != 0",
-            params![fine_cutoff],
-        );
-        // Prune entries older than 6 months
-        let cutoff = ts.saturating_sub(6 * 30 * 24 * 3600);
-        let _ = conn.execute(
-            "DELETE FROM hashrate_history WHERE ts < ?1",
-            params![cutoff],
-        );
-    }
-
     fn get_hashrate_history(&self, since_ts: u64, bucket_secs: u64) -> Vec<HashrateHistoryPoint> {
-        let conn = self.conn.lock();
+        let conn = self.read.lock();
         let mut stmt = match conn.prepare(
             "SELECT (ts / ?2) * ?2 AS bucket_ts,
                     AVG(hashrate_1m_hps), AVG(hashrate_5m_hps), AVG(hashrate_hps),
@@ -393,16 +644,183 @@ impl StatsStore {
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
     }
+}
 
-    fn set_worker_best_share(&self, worker: &str, difficulty: u64) {
-        if let Err(e) = self.conn.lock().execute(
-            "INSERT INTO worker_best_shares (worker, best_share_difficulty) VALUES (?1, ?2)
-             ON CONFLICT(worker) DO UPDATE SET best_share_difficulty = excluded.best_share_difficulty
-             WHERE excluded.best_share_difficulty > worker_best_shares.best_share_difficulty",
-            params![worker, difficulty],
-        ) {
-            warn!("Failed to persist worker_best_share for {worker}: {e}");
+// ─────────────────────────────────────────────────────────────────────────────
+// Writer thread
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Drain queued writes until the store is dropped. Owns the only write
+/// connection, so SQLite never sees two writers and every statement below runs
+/// off the async runtime.
+fn writer_loop(conn: Connection, rx: std::sync::mpsc::Receiver<StoreWrite>) {
+    while let Ok(write) = rx.recv() {
+        if let Err(e) = apply_write(&conn, write) {
+            warn!("Failed to persist stats update: {e}");
         }
+    }
+}
+
+fn apply_write(conn: &Connection, write: StoreWrite) -> Result<(), rusqlite::Error> {
+    match write {
+        // The `?1 > ...` guards keep the watermarks monotonic at the SQL level:
+        // updates can be queued out of order, and a stale lower value must not
+        // overwrite a higher one already persisted.
+        StoreWrite::BestShare(difficulty) => {
+            conn.execute(
+                "UPDATE pool_stats SET best_share_difficulty = ?1
+                 WHERE id = 1 AND ?1 > best_share_difficulty",
+                params![difficulty],
+            )?;
+        }
+        StoreWrite::BestHashrate(hps) => {
+            conn.execute(
+                "UPDATE pool_stats SET best_hashrate_hps = ?1
+                 WHERE id = 1 AND ?1 > best_hashrate_hps",
+                params![hps],
+            )?;
+        }
+        StoreWrite::WorkerBestShare { worker, difficulty } => {
+            conn.execute(
+                "INSERT INTO worker_best_shares (worker, best_share_difficulty) VALUES (?1, ?2)
+                 ON CONFLICT(worker) DO UPDATE SET best_share_difficulty = excluded.best_share_difficulty
+                 WHERE excluded.best_share_difficulty > worker_best_shares.best_share_difficulty",
+                params![worker, difficulty],
+            )?;
+        }
+        StoreWrite::PruneWorkerBestShares(keep) => {
+            prune_worker_best_shares(conn, keep);
+        }
+        // `OR IGNORE`: the inline retry ladder and the background resubmitter
+        // can both report the same block, and the first enrolment is the one
+        // with the right `found_ts`.
+        StoreWrite::BlockFound(block) => {
+            conn.execute(
+                "INSERT OR IGNORE INTO found_blocks
+                 (hash, height, worker, payout, found_ts, won_at_submit, status, resolved_ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+                params![
+                    block.hash,
+                    block.height,
+                    block.worker,
+                    block.payout,
+                    block.found_ts,
+                    block.won_at_submit as i64,
+                    BLOCK_STATUS_PENDING,
+                ],
+            )?;
+        }
+        // Guarded on the current status so a resolution can only ever be
+        // written once: the pending set is the authority on what still needs
+        // deciding, and a restart replays it.
+        StoreWrite::BlockResolved {
+            hash,
+            resolution,
+            resolved_ts,
+        } => {
+            conn.execute(
+                "UPDATE found_blocks SET status = ?2, resolved_ts = ?3
+                 WHERE hash = ?1 AND status = ?4",
+                params![hash, resolution.label(), resolved_ts, BLOCK_STATUS_PENDING],
+            )?;
+        }
+        StoreWrite::Snapshot {
+            history_ts,
+            state_ts,
+            rates,
+            worker_rates,
+        } => write_snapshot(conn, history_ts, state_ts, rates, &worker_rates)?,
+        #[cfg(test)]
+        StoreWrite::Flush(ack) => {
+            let _ = ack.send(());
+        }
+    }
+    Ok(())
+}
+
+fn write_snapshot(
+    conn: &Connection,
+    history_ts: u64,
+    state_ts: u64,
+    rates: HashrateWindows,
+    worker_rates: &HashMap<String, HashrateWindows>,
+) -> Result<(), rusqlite::Error> {
+    {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO hashrate_history (
+               ts, hashrate_hps, hashrate_1m_hps, hashrate_5m_hps,
+               hashrate_1h_hps, hashrate_6h_hps, hashrate_24h_hps
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                history_ts,
+                rates.ten_minutes,
+                rates.one_minute,
+                rates.five_minutes,
+                rates.one_hour,
+                rates.six_hours,
+                rates.twenty_four_hours,
+            ],
+        )?;
+
+        // Replace the whole checkpoint atomically so workers whose tails
+        // have fully decayed do not reappear after a later restart.
+        tx.execute("DELETE FROM worker_hashrate_state", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO worker_hashrate_state (
+                   worker, updated_ts, hashrate_1m_hps, hashrate_5m_hps,
+                   hashrate_10m_hps, hashrate_1h_hps, hashrate_3h_hps,
+                   hashrate_6h_hps, hashrate_24h_hps
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for (worker, worker_rate) in worker_rates {
+                stmt.execute(params![
+                    worker,
+                    state_ts,
+                    worker_rate.one_minute,
+                    worker_rate.five_minutes,
+                    worker_rate.ten_minutes,
+                    worker_rate.one_hour,
+                    worker_rate.three_hours,
+                    worker_rate.six_hours,
+                    worker_rate.twenty_four_hours,
+                ])?;
+            }
+        }
+        tx.commit()?;
+    }
+
+    // Thin samples past the fine-grained retention down to one a minute.
+    // Charts covering more than a couple of days bucket at 5 minutes or
+    // coarser anyway, so the extra resolution buys nothing while the row
+    // count grows by SNAPSHOT_INTERVAL_SECS⁻¹ every second.
+    let fine_cutoff = history_ts.saturating_sub(FINE_HISTORY_RETENTION_SECS);
+    conn.execute(
+        "DELETE FROM hashrate_history WHERE ts < ?1 AND ts % 60 != 0",
+        params![fine_cutoff],
+    )?;
+    // Prune entries older than 6 months
+    let cutoff = history_ts.saturating_sub(6 * 30 * 24 * 3600);
+    conn.execute(
+        "DELETE FROM hashrate_history WHERE ts < ?1",
+        params![cutoff],
+    )?;
+    Ok(())
+}
+
+/// Keep only the `keep` highest-difficulty rows in `worker_best_shares`.
+fn prune_worker_best_shares(conn: &Connection, keep: usize) {
+    match conn.execute(
+        "DELETE FROM worker_best_shares WHERE worker NOT IN (
+           SELECT worker FROM worker_best_shares
+           ORDER BY best_share_difficulty DESC LIMIT ?1
+         )",
+        params![keep as i64],
+    ) {
+        Ok(0) => {}
+        Ok(n) => info!("Pruned {n} stale worker_best_shares rows (cap {keep})"),
+        Err(e) => warn!("Failed to prune worker_best_shares: {e}"),
     }
 }
 
@@ -411,26 +829,43 @@ impl StatsStore {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct PoolStats {
-    pub shares_accepted: AtomicU64,
-    pub shares_rejected: AtomicU64,
-    pub blocks_found: AtomicU64,
-    pub connected_miners: AtomicU64,
-    pub current_height: AtomicU64,
-    pub current_coinbase_value: AtomicU64,
-    pub current_block_transaction_count: AtomicU64,
-    pub best_share_difficulty: AtomicU64,
-    pub session_best_share_difficulty: AtomicU64,
-    pub best_hashrate_hps: AtomicU64,
-    pub session_best_hashrate_hps: AtomicU64,
-    pub network_hashrate_hps: AtomicU64,
-    pub network_difficulty: AtomicU64,
+    shares_accepted: AtomicU64,
+    shares_rejected: AtomicU64,
+    blocks_found: AtomicU64,
+    /// Blocks we mined that were consensus-valid but lost a same-height race,
+    /// so they sit on a side branch and earned nothing. Tracked apart from
+    /// `blocks_found` so the dashboard cannot report them as wins.
+    blocks_inconclusive: AtomicU64,
+    /// Blocks that won their height and were later reorged out. `blocks_found`
+    /// is decremented to match, so the dashboard shows the count that survived;
+    /// Prometheus keeps both, since a counter cannot go down.
+    blocks_orphaned: AtomicU64,
+    connected_miners: AtomicU64,
+    current_height: AtomicU64,
+    current_coinbase_value: AtomicU64,
+    current_block_transaction_count: AtomicU64,
+    best_share_difficulty: AtomicU64,
+    session_best_share_difficulty: AtomicU64,
+    best_hashrate_hps: AtomicU64,
+    session_best_hashrate_hps: AtomicU64,
+    network_hashrate_hps: AtomicU64,
+    network_difficulty: AtomicU64,
     /// Estimated difficulty change (%) at the next retarget, from epoch timestamps.
     /// Stored as f64::to_bits; NaN until first polled / right after a retarget.
-    pub est_difficulty_change_pct: AtomicU64,
-    pub last_block_worker: Mutex<Option<String>>,
-    pub last_block_payout: Mutex<Option<String>>,
-    pub last_block_hash: Mutex<Option<String>>,
-    pub last_block_ts: AtomicU64,
+    est_difficulty_change_pct: AtomicU64,
+    last_block_worker: Mutex<Option<String>>,
+    last_block_payout: Mutex<Option<String>>,
+    last_block_hash: Mutex<Option<String>>,
+    last_block_ts: AtomicU64,
+    /// Where the last winning block stands with the confirmation pass:
+    /// `BLOCK_STATUS_PENDING` until it resolves, then a `BlockResolution`
+    /// label. Without it the card would keep advertising a block that has since
+    /// been reorged away.
+    last_block_status: Mutex<&'static str>,
+    /// Found blocks still awaiting confirmation, keyed by display hash. This is
+    /// the working set `mining::confirm` sweeps; it is mirrored to SQLite when
+    /// a stats DB is configured and lives here alone when one is not.
+    pending_blocks: DashMap<String, PendingBlock>,
     /// Per-connection decaying hashrate state, keyed by session id. Shares are
     /// accumulated here as they arrive and folded into the averages by
     /// `tick_hashrates` on a fixed cadence; an entry that stops receiving
@@ -473,40 +908,132 @@ pub struct WorkerState {
     pub hashrate_24h_hps: f64,
 }
 
+/// Everything read back from the stats DB at boot. Each failure mode degrades
+/// to "no persistence" with a warning rather than taking the pool down: a
+/// corrupt or unwritable stats file must never stop miners from hashing.
+#[derive(Default)]
+struct Persisted {
+    store: Option<StatsStore>,
+    best_share_difficulty: u64,
+    best_hashrate_hps: f64,
+    worker_best_shares: HashMap<String, u64>,
+    hashrates: Vec<PersistedWorkerHashrate>,
+    pending_blocks: Vec<PendingBlock>,
+    blocks_found: u64,
+    blocks_orphaned: u64,
+    blocks_inconclusive: u64,
+}
+
+impl Persisted {
+    fn load(path: &str) -> Self {
+        let store = match StatsStore::open(path) {
+            Ok(store) => store,
+            Err(e) => {
+                warn!("Failed to open stats DB {path}: {e}");
+                return Self::default();
+            }
+        };
+        let (best_share_difficulty, best_hashrate_hps, worker_best_shares) =
+            match store.load_values() {
+                Ok(values) => values,
+                Err(e) => {
+                    warn!("Failed to load stats from DB {path}: {e}");
+                    return Self::default();
+                }
+            };
+        let hashrates = store.load_hashrate_state().unwrap_or_else(|e| {
+            warn!("Failed to restore hashrates from DB {path}: {e}");
+            Vec::new()
+        });
+        let pending_blocks = store.load_pending_blocks().unwrap_or_else(|e| {
+            warn!("Failed to restore pending blocks from DB {path}: {e}");
+            Vec::new()
+        });
+        let (blocks_found, blocks_orphaned, blocks_inconclusive) =
+            store.load_block_counts().unwrap_or_else(|e| {
+                warn!("Failed to restore block counts from DB {path}: {e}");
+                (0, 0, 0)
+            });
+        if !pending_blocks.is_empty() {
+            info!(
+                "Restored {} block(s) awaiting confirmation from {path}",
+                pending_blocks.len()
+            );
+        }
+        Self {
+            store: Some(store),
+            best_share_difficulty,
+            best_hashrate_hps,
+            worker_best_shares,
+            hashrates,
+            pending_blocks,
+            blocks_found,
+            blocks_orphaned,
+            blocks_inconclusive,
+        }
+    }
+}
+
 impl PoolStats {
     pub fn new_with_store(stats_db_path: Option<String>) -> Arc<Self> {
-        let (store, best_share_difficulty, best_hashrate_hps, worker_best_shares_map) =
-            match stats_db_path.filter(|p| !p.is_empty()) {
-                Some(path) => match StatsStore::open(&path) {
-                    Ok(store) => match store.load_values() {
-                        Ok((best_difficulty, best_hps, worker_best_shares_map)) => (
-                            Some(store),
-                            best_difficulty,
-                            best_hps,
-                            worker_best_shares_map,
-                        ),
-                        Err(e) => {
-                            warn!("Failed to load stats from DB {}: {e}", path);
-                            (None, 0, 0.0, std::collections::HashMap::new())
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Failed to open stats DB {}: {e}", path);
-                        (None, 0, 0.0, std::collections::HashMap::new())
-                    }
-                },
-                None => (None, 0, 0.0, std::collections::HashMap::new()),
-            };
+        Self::new_with_store_at(stats_db_path, Self::now_secs(), Instant::now())
+    }
+
+    fn new_with_store_at(
+        stats_db_path: Option<String>,
+        wall_now: u64,
+        instant_now: Instant,
+    ) -> Arc<Self> {
+        let Persisted {
+            store,
+            best_share_difficulty,
+            best_hashrate_hps,
+            worker_best_shares: worker_best_shares_map,
+            hashrates: persisted_hashrates,
+            pending_blocks: persisted_pending_blocks,
+            blocks_found,
+            blocks_orphaned,
+            blocks_inconclusive,
+        } = stats_db_path
+            .filter(|p| !p.is_empty())
+            .map(|path| Persisted::load(&path))
+            .unwrap_or_default();
+
+        let pending_blocks = DashMap::new();
+        for block in persisted_pending_blocks {
+            pending_blocks.insert(block.hash.clone(), block);
+        }
 
         let worker_best_shares = DashMap::new();
         for (worker, best_share) in worker_best_shares_map {
             worker_best_shares.insert(worker, best_share);
         }
 
+        let session_hashrates = DashMap::new();
+        for persisted in persisted_hashrates {
+            let offline_for = Duration::from_secs(wall_now.saturating_sub(persisted.updated_ts));
+            let decay = hashrate::HashrateDecay::restored(
+                instant_now,
+                persisted.rates.to_windows(),
+                offline_for,
+            );
+            if !decay.is_idle() {
+                session_hashrates.insert(
+                    format!("restored:{}", persisted.worker),
+                    SessionHashrate {
+                        worker: persisted.worker,
+                        decay,
+                    },
+                );
+            }
+        }
+
         Arc::new(Self {
             shares_accepted: AtomicU64::new(0),
             shares_rejected: AtomicU64::new(0),
-            blocks_found: AtomicU64::new(0),
+            blocks_found: AtomicU64::new(blocks_found),
+            blocks_inconclusive: AtomicU64::new(blocks_inconclusive),
+            blocks_orphaned: AtomicU64::new(blocks_orphaned),
             connected_miners: AtomicU64::new(0),
             current_height: AtomicU64::new(0),
             current_coinbase_value: AtomicU64::new(0),
@@ -518,7 +1045,7 @@ impl PoolStats {
             network_hashrate_hps: AtomicU64::new(0),
             network_difficulty: AtomicU64::new(f64::to_bits(0.0)),
             est_difficulty_change_pct: AtomicU64::new(f64::to_bits(f64::NAN)),
-            session_hashrates: DashMap::new(),
+            session_hashrates,
             worker_protocol: DashMap::new(),
             worker_last_submit_ts: DashMap::new(),
             worker_best_shares,
@@ -527,7 +1054,9 @@ impl PoolStats {
             last_block_payout: Mutex::new(None),
             last_block_hash: Mutex::new(None),
             last_block_ts: AtomicU64::new(0),
-            start_time: Instant::now(),
+            last_block_status: Mutex::new(BLOCK_STATUS_PENDING),
+            pending_blocks,
+            start_time: instant_now,
             store,
         })
     }
@@ -555,36 +1084,18 @@ impl PoolStats {
     pub fn share_accepted(&self, difficulty: u64) {
         self.shares_accepted.fetch_add(1, Ordering::Relaxed);
 
-        // CAS loop to track all-time best share
-        let mut prev = self.best_share_difficulty.load(Ordering::Relaxed);
-        while difficulty > prev {
-            match self.best_share_difficulty.compare_exchange_weak(
-                prev,
-                difficulty,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.persist_best_share_difficulty(difficulty);
-                    break;
-                }
-                Err(x) => prev = x,
-            }
+        // All-time best share. `fetch_max` is the whole CAS loop: it only ever
+        // raises the watermark, so two racing writers cannot lose the higher
+        // value. Persist only when this call is the one that raised it.
+        if self
+            .best_share_difficulty
+            .fetch_max(difficulty, Ordering::Relaxed)
+            < difficulty
+        {
+            self.persist_best_share_difficulty(difficulty);
         }
-
-        // Session best share
-        let mut prev_session_best = self.session_best_share_difficulty.load(Ordering::Relaxed);
-        while difficulty > prev_session_best {
-            match self.session_best_share_difficulty.compare_exchange_weak(
-                prev_session_best,
-                difficulty,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(x) => prev_session_best = x,
-            }
-        }
+        self.session_best_share_difficulty
+            .fetch_max(difficulty, Ordering::Relaxed);
     }
 
     pub fn share_rejected(&self) {
@@ -596,11 +1107,111 @@ impl PoolStats {
         *self.last_block_worker.lock() = Some(worker.to_string());
         *self.last_block_payout.lock() = Some(payout.to_string());
         *self.last_block_hash.lock() = Some(hash.to_string());
+        // A block only just claimed has not been confirmed yet, whatever the
+        // previous occupant of this card had reached.
+        *self.last_block_status.lock() = BLOCK_STATUS_PENDING;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         self.last_block_ts.store(now, Ordering::Relaxed);
+    }
+
+    /// A block that was valid but did not become the chain tip.
+    ///
+    /// Deliberately does not touch `last_block_*`: the dashboard's "Last block
+    /// found" card must only ever show a block that actually won.
+    pub fn block_inconclusive(&self) {
+        self.blocks_inconclusive.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Enrol a block the node stored in the confirmation ledger, whatever
+    /// `submitblock` said about it.
+    ///
+    /// Both verdicts are enrolled because both can be overturned: a win can be
+    /// reorged out, and a block that lost its height race can be promoted onto
+    /// the active chain by the reorg that follows.
+    pub fn enroll_pending_block(
+        &self,
+        height: u64,
+        hash: &str,
+        worker: &str,
+        payout: &str,
+        won_at_submit: bool,
+    ) {
+        let block = PendingBlock {
+            hash: hash.to_string(),
+            height,
+            worker: worker.to_string(),
+            payout: payout.to_string(),
+            found_ts: Self::now_secs(),
+            won_at_submit,
+        };
+        // The retry ladder can report the same block twice; the first
+        // enrolment wins, matching the `INSERT OR IGNORE` below it.
+        if self.pending_blocks.contains_key(hash) {
+            return;
+        }
+        self.pending_blocks.insert(hash.to_string(), block.clone());
+        if let Some(store) = &self.store {
+            store.record_found_block(block);
+        }
+    }
+
+    /// Blocks still awaiting confirmation, for `mining::confirm` to sweep.
+    pub fn pending_blocks(&self) -> Vec<PendingBlock> {
+        self.pending_blocks
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    /// Retire a pending block and reconcile the counts the submit-time verdict
+    /// got wrong.
+    ///
+    /// Returns `false` if the block was already resolved — the sweep snapshots
+    /// the pending set, so a slow tick can overlap the next one.
+    pub fn resolve_block(&self, block: &PendingBlock, resolution: BlockResolution) -> bool {
+        if self.pending_blocks.remove(&block.hash).is_none() {
+            return false;
+        }
+
+        match (block.won_at_submit, resolution) {
+            // Counted as a win, and the chain disagrees. This is the case the
+            // ledger exists for.
+            (true, BlockResolution::Orphaned) => {
+                self.blocks_orphaned.fetch_add(1, Ordering::Relaxed);
+                // Unlike the Prometheus counter this may go down: the dashboard
+                // shows what the pool actually kept.
+                let _ = self
+                    .blocks_found
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        Some(n.saturating_sub(1))
+                    });
+            }
+            // Lost its height race, then a reorg put it on the active chain
+            // after all. `block_found` also refreshes the last-block card,
+            // which is right: it is now the most recent block the pool won.
+            (false, BlockResolution::Confirmed) => {
+                let _ = self.blocks_inconclusive.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |n| Some(n.saturating_sub(1)),
+                );
+                self.block_found(&block.worker, &block.payout, &block.hash);
+            }
+            _ => {}
+        }
+
+        // Only annotate the card if it is still showing this block.
+        if self.last_block_hash.lock().as_deref() == Some(block.hash.as_str()) {
+            *self.last_block_status.lock() = resolution.label();
+        }
+
+        if let Some(store) = &self.store {
+            store.record_block_resolution(&block.hash, resolution, Self::now_secs());
+        }
+        true
     }
 
     pub fn update_height(&self, height: u64, coinbase_value: u64, transaction_count: u64) {
@@ -620,6 +1231,14 @@ impl PoolStats {
 
     fn add_share_diff_at(&self, session_id: &str, worker: &str, difficulty: f64, now: Instant) {
         if let Some(mut entry) = self.session_hashrates.get_mut(session_id) {
+            // One connection may re-authorize under a different identity
+            // (`max_authorizations_per_session`) while keeping its session id.
+            // Follow the rename, or every later share keeps landing on the
+            // previous worker name. The decaying tail moves with it: it is the
+            // same physical rig either way.
+            if entry.worker != worker {
+                entry.worker = worker.to_string();
+            }
             entry.decay.add_share(difficulty);
             return;
         }
@@ -684,45 +1303,26 @@ impl PoolStats {
     }
 
     /// Track all-time best (persistent) and session-best (since boot).
-    /// CAS loops (like share_accepted's best-share tracking) so two racing
-    /// updaters cannot let a lower value overwrite a higher one that landed
-    /// between the load and the store.
+    ///
+    /// `fetch_max` works directly on the bit patterns: for non-negative finite
+    /// f64 the IEEE-754 encoding is monotonic, so comparing the bits as `u64`
+    /// orders the values identically. The `is_finite` guard keeps NaN (whose
+    /// bits exceed every real value) out of the watermark; a hashrate is never
+    /// negative.
     fn record_best_hashrate(&self, total_10m: f64) {
-        if !total_10m.is_finite() {
+        if !total_10m.is_finite() || total_10m < 0.0 {
             return;
         }
+        let bits = total_10m.to_bits();
 
-        let mut prev = self.best_hashrate_hps.load(Ordering::Relaxed);
-        while total_10m > f64::from_bits(prev) {
-            match self.best_hashrate_hps.compare_exchange_weak(
-                prev,
-                total_10m.to_bits(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.persist_best_hashrate_hps(total_10m);
-                    break;
-                }
-                Err(x) => prev = x,
-            }
+        if self.best_hashrate_hps.fetch_max(bits, Ordering::Relaxed) < bits {
+            self.persist_best_hashrate_hps(total_10m);
         }
-
-        let mut prev_session = self.session_best_hashrate_hps.load(Ordering::Relaxed);
-        while total_10m > f64::from_bits(prev_session) {
-            match self.session_best_hashrate_hps.compare_exchange_weak(
-                prev_session,
-                total_10m.to_bits(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(x) => prev_session = x,
-            }
-        }
+        self.session_best_hashrate_hps
+            .fetch_max(bits, Ordering::Relaxed);
     }
 
-    fn now_secs() -> u64 {
+    pub fn now_secs() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -743,14 +1343,6 @@ impl PoolStats {
                 .add(rates);
         }
         by_worker
-    }
-
-    fn total_hashrates(&self) -> HashrateWindows {
-        let mut total = HashrateWindows::default();
-        for entry in self.session_hashrates.iter() {
-            total.add(HashrateWindows::from_windows(entry.decay.hashrates()));
-        }
-        total
     }
 
     /// Record the connection protocol ("sv1" / "sv2") for a worker.
@@ -901,8 +1493,6 @@ impl PoolStats {
             let evicted: std::collections::HashSet<&String> = stale.iter().collect();
             self.session_hashrates
                 .retain(|_, s| !evicted.contains(&s.worker));
-        }
-        if !stale.is_empty() {
             info!("Evicted {} idle offline workers from stats", stale.len());
         }
 
@@ -925,6 +1515,10 @@ impl PoolStats {
     }
 
     pub fn record_hashrate_snapshot(&self) {
+        self.record_hashrate_snapshot_at(Self::now_secs());
+    }
+
+    fn record_hashrate_snapshot_at(&self, state_ts: u64) {
         if let Some(store) = &self.store {
             // Snap to the sampling grid. The recorder's wall-clock timestamps
             // drift by however long a tick took, and two things downstream need
@@ -932,8 +1526,13 @@ impl PoolStats {
             // view, and the retention step keeps rows where `ts % 60 == 0` —
             // which unsnapped timestamps would hit only by luck, thinning the
             // long-range history away to nothing.
-            let ts = Self::now_secs() / SNAPSHOT_INTERVAL_SECS * SNAPSHOT_INTERVAL_SECS;
-            store.record_hashrate_snapshot(ts, self.total_hashrates());
+            let history_ts = state_ts / SNAPSHOT_INTERVAL_SECS * SNAPSHOT_INTERVAL_SECS;
+            let by_worker = self.hashrates_by_worker();
+            let mut total = HashrateWindows::default();
+            for rates in by_worker.values() {
+                total.add(*rates);
+            }
+            store.record_hashrate_snapshot(history_ts, state_ts, total, &by_worker);
         }
     }
 
@@ -1025,16 +1624,24 @@ impl PoolStats {
             })
             .collect();
 
-        for entry in self.worker_best_shares.iter() {
-            let worker = entry.key();
-            if seen.contains(worker) {
-                continue;
-            }
+        // Workers with no live `WorkerState`: those known only by an all-time
+        // best share, and those restored from the hashrate checkpoint that have
+        // not reconnected yet. The latter still contribute a decaying tail to
+        // the pool total, so the table has to show it rather than a zero row.
+        let extra_workers = self
+            .worker_best_shares
+            .iter()
+            .map(|e| e.key().clone())
+            .chain(by_worker.keys().cloned())
+            .filter(|w| !seen.contains(w))
+            .collect::<std::collections::BTreeSet<String>>();
+
+        for worker in extra_workers {
+            let rates = by_worker.get(&worker).copied().unwrap_or_default();
             worker_states.push(WorkerState {
-                worker: worker.clone(),
                 protocol: self
                     .worker_protocol
-                    .get(worker)
+                    .get(&worker)
                     .map(|p| p.value().clone())
                     .unwrap_or_else(|| "sv1".to_string()),
                 online: false,
@@ -1043,17 +1650,26 @@ impl PoolStats {
                 shares_rejected: 0,
                 shares_stale: 0,
                 reject_reasons: BTreeMap::new(),
-                best_share_difficulty: *entry.value(),
+                best_share_difficulty: self
+                    .worker_best_shares
+                    .get(&worker)
+                    .map(|v| *v.value())
+                    .unwrap_or(0),
                 active_sessions: 0,
                 connected_ts: 0,
-                last_submit_ts: 0,
-                hashrate_60s_hps: 0.0,
-                hashrate_5m_hps: 0.0,
-                hashrate_10m_hps: 0.0,
-                hashrate_1h_hps: 0.0,
-                hashrate_3h_hps: 0.0,
-                hashrate_6h_hps: 0.0,
-                hashrate_24h_hps: 0.0,
+                last_submit_ts: self
+                    .worker_last_submit_ts
+                    .get(&worker)
+                    .map(|v| *v.value())
+                    .unwrap_or(0),
+                hashrate_60s_hps: rates.one_minute,
+                hashrate_5m_hps: rates.five_minutes,
+                hashrate_10m_hps: rates.ten_minutes,
+                hashrate_1h_hps: rates.one_hour,
+                hashrate_3h_hps: rates.three_hours,
+                hashrate_6h_hps: rates.six_hours,
+                hashrate_24h_hps: rates.twenty_four_hours,
+                worker,
             });
         }
 
@@ -1061,6 +1677,9 @@ impl PoolStats {
             shares_accepted: self.shares_accepted.load(Ordering::Relaxed),
             shares_rejected: self.shares_rejected.load(Ordering::Relaxed),
             blocks_found: self.blocks_found.load(Ordering::Relaxed),
+            blocks_inconclusive: self.blocks_inconclusive.load(Ordering::Relaxed),
+            blocks_orphaned: self.blocks_orphaned.load(Ordering::Relaxed),
+            blocks_pending_confirmation: self.pending_blocks.len() as u64,
             connected_miners: self.connected_miners.load(Ordering::Relaxed),
             current_height: self.current_height.load(Ordering::Relaxed),
             current_coinbase_value: self.current_coinbase_value.load(Ordering::Relaxed),
@@ -1107,6 +1726,7 @@ impl PoolStats {
                 .clone()
                 .unwrap_or_else(|| "—".to_string()),
             last_block_ts: self.last_block_ts.load(Ordering::Relaxed),
+            last_block_status: (*self.last_block_status.lock()).to_string(),
         }
     }
 }
@@ -1119,7 +1739,16 @@ impl PoolStats {
 pub struct StatsSnapshot {
     pub shares_accepted: u64,
     pub shares_rejected: u64,
+    /// Wins that have survived so far: decremented when the confirmation pass
+    /// finds one was reorged out. The Prometheus counter of the same name
+    /// cannot go down, so the two differ by `blocks_orphaned`.
     pub blocks_found: u64,
+    /// Valid blocks that lost a same-height race and earned nothing.
+    pub blocks_inconclusive: u64,
+    /// Blocks that won their height and were later reorged off the chain.
+    pub blocks_orphaned: u64,
+    /// Found blocks the confirmation pass has not yet decided.
+    pub blocks_pending_confirmation: u64,
     pub connected_miners: u64,
     pub current_height: u64,
     pub current_coinbase_value: u64,
@@ -1148,6 +1777,9 @@ pub struct StatsSnapshot {
     pub last_block_payout: String,
     pub last_block_hash: String,
     pub last_block_ts: u64,
+    /// Where the last block stands with the confirmation pass: `pending` until
+    /// it is decided, then a `BlockResolution` label.
+    pub last_block_status: String,
 }
 
 #[derive(Serialize)]
@@ -1221,6 +1853,143 @@ mod tests {
     }
 
     #[test]
+    fn worker_hashrates_resume_after_restart_and_decay_while_offline() {
+        let db_path = make_temp_db();
+        let saved_at = 1_000_007;
+        let restart_at = saved_at + 30;
+        let rates = HashrateWindows::uniform(10.0 * TH);
+
+        {
+            let now = Instant::now();
+            let stats = PoolStats::new_with_store_at(Some(db_path.clone()), saved_at, now);
+            stats.session_hashrates.insert(
+                "s1".to_string(),
+                SessionHashrate {
+                    worker: "axe".to_string(),
+                    decay: hashrate::HashrateDecay::restored(
+                        now,
+                        rates.to_windows(),
+                        Duration::ZERO,
+                    ),
+                },
+            );
+            stats.record_hashrate_snapshot_at(saved_at);
+        }
+
+        let now = Instant::now();
+        let stats = PoolStats::new_with_store_at(Some(db_path.clone()), restart_at, now);
+        let expected = HashrateWindows::from_windows(
+            hashrate::HashrateDecay::restored(now, rates.to_windows(), Duration::from_secs(30))
+                .hashrates(),
+        );
+        let snapshot = stats.snapshot();
+        assert!((snapshot.total_hashrate_60s - expected.one_minute).abs() < 1.0);
+        assert!((snapshot.total_hashrate_24h - expected.twenty_four_hours).abs() < 1.0);
+        assert!(snapshot.total_hashrate_60s > 0.0);
+        assert!(snapshot.total_hashrate_60s < 10.0 * TH);
+        assert!(snapshot.total_hashrate_24h > 9.9 * TH);
+        assert_eq!(snapshot.worker_hashrates.len(), 1);
+        assert_eq!(snapshot.worker_hashrates[0].worker, "axe");
+
+        // A reconnected session contributes alongside the restored tail. It
+        // must not overwrite the checkpoint merely because the worker name is
+        // the same.
+        stats.session_hashrates.insert(
+            "s2".to_string(),
+            SessionHashrate {
+                worker: "axe".to_string(),
+                decay: hashrate::HashrateDecay::restored(
+                    now,
+                    HashrateWindows::uniform(2.0 * TH).to_windows(),
+                    Duration::ZERO,
+                ),
+            },
+        );
+        let snapshot = stats.snapshot();
+        assert!((snapshot.total_hashrate_60s - expected.one_minute - 2.0 * TH).abs() < 1.0);
+
+        // The restored worker has no `WorkerState` yet (nothing has authorized
+        // this boot), but it is carrying real hashrate, so the worker table has
+        // to show it rather than a zero row next to a non-zero pool total.
+        let row = snapshot
+            .worker_states
+            .iter()
+            .find(|s| s.worker == "axe")
+            .expect("restored worker missing from the worker table");
+        assert!(!row.online);
+        assert!(
+            (row.hashrate_60s_hps - snapshot.total_hashrate_60s).abs() < 1.0,
+            "restored worker row reads {} against a pool total of {}",
+            row.hashrate_60s_hps,
+            snapshot.total_hashrate_60s
+        );
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// One connection may re-authorize under a different identity. Shares after
+    /// the switch belong to the new name; before this was fixed they kept
+    /// landing on the old one for the life of the connection.
+    #[test]
+    fn shares_follow_a_session_that_re_authorizes_under_a_new_name() {
+        let stats = PoolStats::new_with_store(None);
+        let start = Instant::now();
+
+        stats.add_share_diff_at("session-1", "old-name", 4_096.0, start);
+        stats.tick_hashrates_at(start + Duration::from_secs(2));
+        assert!(stats.hashrates_by_worker().contains_key("old-name"));
+
+        stats.add_share_diff_at("session-1", "new-name", 4_096.0, start);
+        stats.tick_hashrates_at(start + Duration::from_secs(4));
+
+        let by_worker = stats.hashrates_by_worker();
+        assert!(
+            by_worker.contains_key("new-name"),
+            "shares still credited to the previous identity: {:?}",
+            by_worker.keys().collect::<Vec<_>>()
+        );
+        assert!(!by_worker.contains_key("old-name"));
+        // The decaying tail moved with the session — it is the same rig — so no
+        // hashrate was lost or duplicated by the rename.
+        assert_eq!(stats.session_hashrates.len(), 1);
+    }
+
+    #[test]
+    fn restored_hashrate_reaches_zero_after_long_downtime() {
+        let db_path = make_temp_db();
+        let saved_at = 2_000_000;
+
+        {
+            let now = Instant::now();
+            let stats = PoolStats::new_with_store_at(Some(db_path.clone()), saved_at, now);
+            stats.session_hashrates.insert(
+                "s1".to_string(),
+                SessionHashrate {
+                    worker: "axe".to_string(),
+                    decay: hashrate::HashrateDecay::restored(
+                        now,
+                        HashrateWindows::uniform(TH).to_windows(),
+                        Duration::ZERO,
+                    ),
+                },
+            );
+            stats.record_hashrate_snapshot_at(saved_at);
+        }
+
+        let stats = PoolStats::new_with_store_at(
+            Some(db_path.clone()),
+            saved_at + 60 * 86_400,
+            Instant::now(),
+        );
+        assert!(stats.session_hashrates.is_empty());
+        assert_eq!(stats.snapshot().total_hashrate_24h, 0.0);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    #[test]
     fn legacy_hashrate_history_migrates_without_inventing_windows() {
         let db_path = make_temp_db();
         {
@@ -1283,10 +2052,18 @@ mod tests {
         {
             let store = StatsStore::open(&db_path).unwrap();
             store.set_best_hashrate_hps(60.0 * TH);
-            store.record_hashrate_snapshot(120, HashrateWindows::uniform(949.0e15));
+            let worker_rates =
+                HashMap::from([("axe".to_string(), HashrateWindows::uniform(949.0e15))]);
+            store.record_hashrate_snapshot(
+                120,
+                120,
+                HashrateWindows::uniform(949.0e15),
+                &worker_rates,
+            );
             // Pretend it was written before the estimator changed.
+            store.flush();
             store
-                .conn
+                .read
                 .lock()
                 .execute(
                     "UPDATE pool_stats SET hashrate_algo_version = 0 WHERE id = 1",
@@ -1298,6 +2075,7 @@ mod tests {
 
         let stats = PoolStats::new_with_store(Some(db_path.clone()));
         assert!(stats.get_hashrate_history(0, 60).is_empty());
+        assert!(stats.session_hashrates.is_empty());
         assert_eq!(stats.snapshot().best_hashrate_hps, 0.0);
 
         // Second open is a no-op: the version now matches.
@@ -1316,8 +2094,9 @@ mod tests {
     fn hashrate_history_averages_samples_into_time_buckets() {
         let db_path = make_temp_db();
         let store = StatsStore::open(&db_path).unwrap();
-        store.record_hashrate_snapshot(120, HashrateWindows::uniform(10.0));
-        store.record_hashrate_snapshot(150, HashrateWindows::uniform(20.0));
+        store.record_hashrate_snapshot(120, 120, HashrateWindows::uniform(10.0), &HashMap::new());
+        store.record_hashrate_snapshot(150, 150, HashrateWindows::uniform(20.0), &HashMap::new());
+        store.flush();
 
         let history = store.get_hashrate_history(0, 60);
         assert_eq!(history.len(), 1);
@@ -1345,8 +2124,9 @@ mod tests {
         assert_eq!(base % 60, 0);
         for i in 0..12 {
             let ts = base + i * SNAPSHOT_INTERVAL_SECS;
-            store.record_hashrate_snapshot(ts, HashrateWindows::uniform(10.0));
+            store.record_hashrate_snapshot(ts, ts, HashrateWindows::uniform(10.0), &HashMap::new());
         }
+        store.flush();
         assert_eq!(
             store.get_hashrate_history(0, SNAPSHOT_INTERVAL_SECS).len(),
             12
@@ -1354,7 +2134,8 @@ mod tests {
 
         // A sample far enough ahead pushes them past the horizon.
         let now = base + FINE_HISTORY_RETENTION_SECS + 600;
-        store.record_hashrate_snapshot(now, HashrateWindows::uniform(20.0));
+        store.record_hashrate_snapshot(now, now, HashrateWindows::uniform(20.0), &HashMap::new());
+        store.flush();
 
         let kept: Vec<u64> = store
             .get_hashrate_history(0, SNAPSHOT_INTERVAL_SECS)
@@ -1449,6 +2230,78 @@ mod tests {
         let ss = stats.snapshot();
         let w1 = ss.worker_states.iter().find(|w| w.worker == "w1").unwrap();
         assert_eq!(w1.best_share_difficulty, 4000);
+
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Confirmation takes an hour at the default depth. A restart inside that
+    /// window must not be all it takes for a reorg to go unnoticed.
+    #[test]
+    fn a_block_awaiting_confirmation_survives_a_restart() {
+        let db_path = make_temp_db();
+
+        {
+            let stats = PoolStats::new_with_store(Some(db_path.clone()));
+            stats.block_found("w1", "bc1qpayout", "0000cafe");
+            stats.enroll_pending_block(800_000, "0000cafe", "w1", "bc1qpayout", true);
+            assert_eq!(stats.snapshot().blocks_pending_confirmation, 1);
+        }
+
+        let stats = PoolStats::new_with_store(Some(db_path.clone()));
+        let pending = stats.pending_blocks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].hash, "0000cafe");
+        assert_eq!(pending[0].height, 800_000);
+        assert_eq!(pending[0].worker, "w1");
+        assert_eq!(pending[0].payout, "bc1qpayout");
+        assert!(pending[0].won_at_submit);
+        // The count it was claimed under comes back with it.
+        assert_eq!(stats.snapshot().blocks_found, 1);
+
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// The ledger, not the process lifetime, is the authority on how many
+    /// blocks the pool has kept — which is what the dashboard's "found blocks
+    /// survive restarts" has always claimed.
+    #[test]
+    fn resolved_block_counts_are_restored_from_the_ledger() {
+        let db_path = make_temp_db();
+
+        {
+            let stats = PoolStats::new_with_store(Some(db_path.clone()));
+            // One win that stands, one win that is reorged out, one block that
+            // lost its race and is then promoted by a later reorg.
+            for (hash, won) in [("aa", true), ("bb", true), ("cc", false)] {
+                stats.enroll_pending_block(800_000, hash, "w1", "bc1qpayout", won);
+                if won {
+                    stats.block_found("w1", "bc1qpayout", hash);
+                } else {
+                    stats.block_inconclusive();
+                }
+            }
+            let by_hash = |h: &str| {
+                stats
+                    .pending_blocks()
+                    .into_iter()
+                    .find(|b| b.hash == h)
+                    .unwrap()
+            };
+            stats.resolve_block(&by_hash("aa"), BlockResolution::Confirmed);
+            stats.resolve_block(&by_hash("bb"), BlockResolution::Orphaned);
+            stats.resolve_block(&by_hash("cc"), BlockResolution::Confirmed);
+
+            let snap = stats.snapshot();
+            assert_eq!(snap.blocks_found, 2);
+            assert_eq!(snap.blocks_orphaned, 1);
+            assert_eq!(snap.blocks_inconclusive, 0);
+        }
+
+        let snap = PoolStats::new_with_store(Some(db_path.clone())).snapshot();
+        assert_eq!(snap.blocks_found, 2);
+        assert_eq!(snap.blocks_orphaned, 1);
+        assert_eq!(snap.blocks_inconclusive, 0);
+        assert_eq!(snap.blocks_pending_confirmation, 0);
 
         std::fs::remove_file(db_path).ok();
     }

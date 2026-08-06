@@ -140,21 +140,23 @@ impl SubmitParams {
 
         let worker = str_at(arr, 0, "mining.submit", "worker")?;
         let job_id = str_at(arr, 1, "mining.submit", "job_id")?;
-        let en2_hex = str_at(arr, 2, "mining.submit", "extranonce2")?;
-        let ntime_hex = str_at(arr, 3, "mining.submit", "ntime")?;
-        let nonce_hex = str_at(arr, 4, "mining.submit", "nonce")?;
+        // These three are decoded on the spot and never stored, so borrow them
+        // rather than allocating a String per submit.
+        let en2_hex = str_ref_at(arr, 2, "mining.submit", "extranonce2")?;
+        let ntime_hex = str_ref_at(arr, 3, "mining.submit", "ntime")?;
+        let nonce_hex = str_ref_at(arr, 4, "mining.submit", "nonce")?;
 
-        let extranonce2 = hex::decode(&en2_hex).map_err(|_| PoolError::InvalidParams {
+        let extranonce2 = hex::decode(en2_hex).map_err(|_| PoolError::InvalidParams {
             method: "mining.submit",
             detail: "extranonce2 is not valid hex".into(),
         })?;
 
-        let ntime = u32::from_str_radix(&ntime_hex, 16).map_err(|_| PoolError::InvalidParams {
+        let ntime = u32::from_str_radix(ntime_hex, 16).map_err(|_| PoolError::InvalidParams {
             method: "mining.submit",
             detail: "ntime is not valid hex u32".into(),
         })?;
 
-        let nonce = u32::from_str_radix(&nonce_hex, 16).map_err(|_| PoolError::InvalidParams {
+        let nonce = u32::from_str_radix(nonce_hex, 16).map_err(|_| PoolError::InvalidParams {
             method: "mining.submit",
             detail: "nonce is not valid hex u32".into(),
         })?;
@@ -406,9 +408,19 @@ fn str_at(
     method: &'static str,
     field: &'static str,
 ) -> Result<String, PoolError> {
+    str_ref_at(arr, idx, method, field).map(String::from)
+}
+
+/// Borrowing form of [`str_at`], for fields that are parsed and discarded rather
+/// than stored.
+fn str_ref_at<'a>(
+    arr: &'a [Value],
+    idx: usize,
+    method: &'static str,
+    field: &'static str,
+) -> Result<&'a str, PoolError> {
     arr.get(idx)
         .and_then(|v| v.as_str())
-        .map(String::from)
         .ok_or_else(|| PoolError::InvalidParams {
             method,
             detail: format!("missing or non-string field `{field}` at index {idx}"),

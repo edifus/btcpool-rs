@@ -42,6 +42,20 @@ pub struct PoolConfig {
     /// resolve against the service working directory, like `stats_db_path`.
     #[serde(default = "default_found_block_dir")]
     pub found_block_dir: String,
+    /// Confirmations before a found block is treated as final.
+    ///
+    /// `submitblock`'s verdict is only true at the instant it is read, so every
+    /// block is re-checked with `getblockheader` until it is this deep on the
+    /// active chain (confirmed) or this deep on a branch that lost (reorged
+    /// out). The same number is used in both directions, and the second is why
+    /// it should not be 1: a block one deep on a side branch is a routine reorg
+    /// that usually resolves in our favour.
+    ///
+    /// 6 is the conventional finality threshold and takes about an hour. 100 is
+    /// coinbase maturity — the depth at which the reward is actually spendable
+    /// — at the cost of holding each block pending for ~17 hours.
+    #[serde(default = "default_confirmation_depth")]
+    pub confirmation_depth: u32,
     /// Optional safety assertion. The pool always detects the actual network
     /// from the connected node (`getblockchaininfo`) and validates the payout
     /// address against it. When this is set ("mainnet" | "testnet" | "testnet4" |
@@ -53,6 +67,10 @@ pub struct PoolConfig {
 
 fn default_found_block_dir() -> String {
     "found-blocks".into()
+}
+
+fn default_confirmation_depth() -> u32 {
+    6
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,7 +141,9 @@ pub struct RpcConfig {
     /// Explicit credentials (used only when cookie_path is absent / unreadable)
     pub user: Option<String>,
     pub password: Option<String>,
-    #[allow(dead_code)]
+    /// Transport timeout for every RPC round trip. Because the calls run on the
+    /// blocking pool, where a task cannot be cancelled, this is what bounds how
+    /// long an unresponsive node holds a thread.
     pub timeout_secs: u64,
 }
 
@@ -267,6 +287,35 @@ impl Config {
                  a zero total extranonce width underflows SV2 channel setup"
             );
         }
+        // Consensus caps the coinbase scriptSig at 100 bytes (`bad-cb-length`),
+        // and everything in it is configured here. Check the worst case — the
+        // widest BIP34 height push — so the pool cannot run for months and then
+        // have its one found block rejected.
+        let widest_height_push = 5; // 1 length byte + up to 4 bytes of height
+        let script_sig_len = widest_height_push
+            + self.pool.coinbase_tag.len()
+            + self.pool.extranonce1_size
+            + self.pool.extranonce2_size;
+        crate::bitcoin::template::check_coinbase_script_sig_len(script_sig_len).map_err(|e| {
+            anyhow::anyhow!(
+                "{e}; shorten [pool] coinbase_tag ({} bytes) or the extranonce sizes ({} + {})",
+                self.pool.coinbase_tag.len(),
+                self.pool.extranonce1_size,
+                self.pool.extranonce2_size,
+            )
+        })?;
+
+        // Zero would resolve every block the instant it was probed, including
+        // one sitting on a side branch mid-reorg; above coinbase maturity there
+        // is nothing left to learn, since the reward is spendable by then.
+        if !(1..=100).contains(&self.pool.confirmation_depth) {
+            anyhow::bail!(
+                "[pool] confirmation_depth must be between 1 and 100 (got {}); \
+                 6 is the conventional finality threshold",
+                self.pool.confirmation_depth
+            );
+        }
+
         if self.sv2.enabled
             && self.sv2.persist_authority_key
             && self.sv2.authority_key_file.trim().is_empty()
@@ -391,7 +440,104 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_env_overrides, PoolConfig};
+    use super::{apply_env_overrides, Config, PoolConfig};
+
+    /// A complete, valid config; tests override single values on top of it.
+    fn config_toml(coinbase_tag: &str, extranonce1: usize, extranonce2: usize) -> String {
+        format!(
+            r#"
+[pool]
+listen_addr = "127.0.0.1:3333"
+coinbase_tag = "{coinbase_tag}"
+initial_difficulty = 4096
+extranonce1_size = {extranonce1}
+extranonce2_size = {extranonce2}
+max_connections = 16
+idle_timeout_secs = 300
+
+[bitcoin_rpc]
+url = "http://127.0.0.1:8332"
+timeout_secs = 10
+
+[zmq]
+hashblock_endpoint = "tcp://127.0.0.1:28332"
+poll_fallback = true
+poll_interval_ms = 1000
+
+[vardiff]
+target_share_time_secs = 15
+retarget_interval_secs = 60
+min_difficulty = 4096
+max_difficulty = 65536
+max_retarget_factor = 4.0
+
+[security]
+max_connections_per_ip = 5
+max_shares_per_sec = 500
+ban_duration_secs = 600
+max_invalid_shares = 5
+max_message_bytes = 4096
+
+[metrics]
+prometheus_addr = "127.0.0.1:9090"
+
+[logging]
+level = "info"
+json = false
+"#
+        )
+    }
+
+    fn validate(coinbase_tag: &str, extranonce1: usize, extranonce2: usize) -> anyhow::Result<()> {
+        let config: Config =
+            toml::from_str(&config_toml(coinbase_tag, extranonce1, extranonce2)).unwrap();
+        config.validate()
+    }
+
+    /// Consensus caps the coinbase scriptSig at 100 bytes. Everything in it is
+    /// configured here, so an over-long tag has to fail at boot — the
+    /// alternative is discovering it as `bad-cb-length` on the one block the
+    /// pool ever finds.
+    #[test]
+    fn coinbase_script_sig_length_is_enforced_at_boot() {
+        assert!(validate("/btcpool-rs/", 4, 4).is_ok());
+
+        let err = validate(&"x".repeat(96), 4, 4).unwrap_err().to_string();
+        assert!(
+            err.contains("coinbase scriptSig"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("coinbase_tag"), "unexpected error: {err}");
+
+        // Wide extranonces count against the same budget.
+        let err = validate("/btcpool-rs/", 64, 32).unwrap_err().to_string();
+        assert!(
+            err.contains("coinbase scriptSig"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A deployed config.toml predates this key, so it has to default rather
+    /// than fail the whole parse — and an out-of-range value has to fail at
+    /// boot, not on the one block the pool ever finds.
+    #[test]
+    fn confirmation_depth_defaults_and_is_range_checked() {
+        let base = config_toml("/btcpool-rs/", 4, 4);
+
+        let config: Config = toml::from_str(&base).unwrap();
+        assert_eq!(config.pool.confirmation_depth, 6);
+        assert!(config.validate().is_ok());
+
+        for (depth, hint) in [(0, "must be between"), (101, "must be between")] {
+            let src = base.replace(
+                "idle_timeout_secs = 300",
+                &format!("idle_timeout_secs = 300\nconfirmation_depth = {depth}"),
+            );
+            let config: Config = toml::from_str(&src).unwrap();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains(hint), "unexpected error for {depth}: {err}");
+        }
+    }
 
     // Fixtures pass vars directly instead of mutating the process environment,
     // so tests stay parallel-safe.

@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
     // Miner payout addresses are validated against this chain at authorization.
     let node_chain = rpc
         .chain()
+        .await
         .context("Querying node chain (getblockchaininfo)")?;
     info!(chain = %node_chain, "Connected node chain detected");
     let runtime_settings = settings::RuntimeSettings::new(&config.pool, &node_chain)?;
@@ -114,11 +115,11 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let interval = tokio::time::Duration::from_secs(30);
             loop {
-                match rpc.network_hashrate(None, None) {
+                match rpc.network_hashrate(None, None).await {
                     Ok(network_hps) => stats.set_network_hashrate(network_hps),
                     Err(e) => tracing::warn!("Failed to poll network hash rate: {e}"),
                 }
-                match rpc.estimate_difficulty_change_pct() {
+                match rpc.estimate_difficulty_change_pct().await {
                     Ok(pct) => stats.set_est_difficulty_change_pct(pct),
                     Err(e) => tracing::warn!("Failed to estimate difficulty change: {e}"),
                 }
@@ -127,16 +128,58 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ── Block confirmation pass ──────────────────────────────────────────────
+    // `submitblock`'s verdict is true at the instant it is read and no longer:
+    // a block that won its height can be reorged out, and one that lost a
+    // same-height race can be promoted by the reorg that follows. This sweeps
+    // the found-block ledger until each is settled. Idle — and silent on the
+    // RPC — whenever nothing is pending, which is nearly always.
+    {
+        let rpc = rpc.clone();
+        let stats = stats.clone();
+        let depth = config.pool.confirmation_depth;
+        tokio::spawn(mining::confirm::run(rpc, stats, depth));
+    }
+
     // ── ZMQ / poll ────────────────────────────────────────────────────────────
     let new_block_rx = zmq::start(&config.zmq, rpc.clone()).await;
 
     // ── Template engine ───────────────────────────────────────────────────────
-    let engine = TemplateEngine::new(rpc.clone(), config.pool.clone());
+    let engine = TemplateEngine::new(rpc.clone(), config.pool.clone(), stats.clone());
 
     // Spawn the template refresh loop
     {
         let engine = engine.clone();
         tokio::spawn(engine.run(new_block_rx));
+    }
+
+    // ── Template freshness watchdog ───────────────────────────────────────────
+    // `/health` and Prometheus are both pull-based, so a freeze is invisible to
+    // an operator who only reads logs. This task is also the only one
+    // positioned to notice that `run`'s own task died: a panic there just stops
+    // the freshness atomics advancing, and nothing inside that task can report
+    // on its own death. Edge-triggered — one `error!` per staleness episode,
+    // not one per tick.
+    {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut was_stale = false;
+            loop {
+                ticker.tick().await;
+                let stale = !engine.is_template_fresh();
+                if stale && !was_stale {
+                    tracing::error!(
+                        age_secs = engine.template_age().as_secs(),
+                        "Template has not refreshed recently; pool may be serving a frozen job"
+                    );
+                } else if !stale && was_stale {
+                    tracing::info!("Template refreshes have recovered");
+                }
+                was_stale = stale;
+            }
+        });
     }
 
     // ── SV2 Noise authority (before the dashboard, which shows the pubkey) ────

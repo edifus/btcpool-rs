@@ -19,12 +19,86 @@ underflow panic). Line references are as of that review and may drift.
 
 ## Medium
 
-- [ ] **Move remaining blocking I/O off the async runtime.** `submit_block` is
-  done (PR #6); still direct: `getblocktemplate` in `TemplateEngine::refresh`,
-  SQLite best-share writes on the share-accept path (behind a sync mutex —
-  funnel through a dedicated writer thread, enable WAL + `synchronous=NORMAL`),
-  and the dashboard `/history` + `/chart` SQLite scans (contend with the share
-  path on the same connection mutex; wrap in `spawn_blocking`).
+- [x] **Move remaining blocking I/O off the async runtime.** `submit_block` was
+  done in PR #6. SQLite followed: writes go to a dedicated `stats-writer` thread
+  over a bounded channel, the store opens with WAL + `synchronous=NORMAL` + a
+  busy timeout, and the dashboard `/history` + `/chart` scans run under
+  `spawn_blocking` against a separate read connection.
+
+  Closed out 2026-08-05 with the Bitcoin RPC. Auditing the surface turned up
+  four sync-in-async call sites, not just the `getblocktemplate` in
+  `TemplateEngine::refresh` this item originally named — also `best_block_hash`
+  in the ZMQ poll fallback (1 Hz), and `network_hashrate` +
+  `estimate_difficulty_change_pct` (five sequential round trips) in the 30 s
+  stats loop. Rather than wrap each call site, `RpcClient`'s synchronous method
+  bodies are now private and the only public surface is `async` wrappers that
+  `spawn_blocking` internally, so a future call site cannot reintroduce the bug.
+  `bitcoin_rpc.timeout_secs` is applied at last (it was parsed, documented, and
+  then dropped on the floor) — it is what bounds how long a wedged node can hold
+  a blocking-pool thread, since a `spawn_blocking` task cannot be cancelled.
+
+- [x] **The template engine can stop refreshing without anyone noticing.**
+  Fixed 2026-08-06, all three suggested directions plus the observability the
+  title asks for. The ZMQ listener is supervised and reconnects forever with
+  capped exponential backoff (1 s → 60 s, resetting only after a connection
+  survives 60 s), so its `watch::Sender` is never dropped; `run` additionally
+  survives a closed channel by latching that `select!` branch off rather than
+  breaking, degrading to a 30 s-latency polling pool instead of freezing. The
+  poll fallback became a permanent concurrent backstop, because the worst case
+  turned out to be a socket that connects and never publishes — `zmq_connect` is
+  asynchronous, so a wrong port or a node in IBD produces no error for a
+  supervisor to react to. Freshness is exposed via `GET /health` (503 past 180 s,
+  and before the first refresh ever lands),
+  `pool_template_last_refresh_timestamp_seconds`,
+  `pool_tip_changes_discovered_by_timer_total` and an edge-triggered `error!`.
+
+  Two corrections to this entry's original framing, found while fixing it.
+  A block mined on a frozen template is not orphaned — it is consensus-valid
+  (the frozen template is internally consistent), so the node stores it on a
+  side branch and `submitblock` returns `"inconclusive"`. The real cost is
+  wasted hashrate with a low-probability catastrophic tail:
+  `(h/H) × (D/600)` expected blocks forfeited over a freeze of `D` seconds.
+  And the damage was not limited to the frozen case — the ntime timer
+  broadcast newly-discovered tips as `clean=false`, which on SV2 meant an
+  immediate job on a prev-hash the device had not been moved to, rejecting
+  100% of its shares until the session was dropped. `refresh` now derives
+  `clean` by comparing `prev_hash`.
+
+- [x] **Stale-tip blocks are reported as wins** (fixed 2026-08-06):
+  `submit_block` now returns `BlockSubmitOutcome::{Accepted, Duplicate,
+  Inconclusive}`, threaded through `submit_found_block`, and only `is_win()`
+  outcomes reach `metrics::block_found()` / `stats.block_found()`.
+
+  Three corrections to this entry's original framing, found while fixing it.
+  `"duplicate-inconclusive"` was grouped with plain `"duplicate"` and had the
+  identical false-win problem, so it is `Inconclusive` too. There was a third
+  reporting site the entry missed — the background resubmit task in
+  `engine.rs` — and it is the one most likely to see an inconclusive result,
+  because it runs minutes after the block was found. And the reporting sequence
+  existed as three hand-written copies, which is how the miscount spread; it now
+  lives in `accounting::record_block_outcome`, alongside the share-accounting
+  helpers that exist for the same reason.
+- [x] **Confirm block wins survive a reorg** (fixed 2026-08-06): every block the
+  node stores is enrolled in a `found_blocks` ledger in SQLite and re-checked
+  with `getblockheader` on a 60 s sweep until it is `[pool] confirmation_depth`
+  (default 6) deep on the active chain or that deep on a branch that lost.
+  `pool_blocks_orphaned_total` carries the correction Prometheus cannot make to
+  a counter; the dashboard count drops back and the card is marked.
+
+  Four things this entry's framing missed, found while fixing it.
+  The reconciliation is bidirectional — an `inconclusive` block that a later
+  reorg puts on the active chain is a win the submit-time verdict can never
+  count, and it costs two extra match arms. "After N confirmations" is not
+  sufficient on its own: the orphan side needs the *losing* branch buried by the
+  same depth, or a routine one-block reorg resolves the block as orphaned during
+  the very reorg that was about to restore it. There was no durable record of a
+  found block to re-check at all — only the archived hex, which is written for
+  every attempt including rejects — hence the ledger, which also makes the
+  dashboard's "found blocks survive restarts" label true for the first time.
+  And the hash the pool recorded was the raw little-endian double-SHA256, so it
+  would have been rejected by `getblockheader` outright; it was reversed at the
+  source, which incidentally fixes the dashboard card, the log lines and the
+  archive filenames, none of which resolved in a block explorer.
 - [x] **Harden the duplicate-share set** (shipped in v0.6.0, 2026-07-02):
   shares are recorded for dedup only after validation passes, and the
   per-session set clears on every clean-job broadcast (live-jobs scoping); the
@@ -43,7 +117,7 @@ underflow panic). Line references are as of that review and may drift.
   `active_sessions` per call but disconnect decrements once, for the last name
   only. (Fixed alongside the authorization cap: same-name re-auth is a no-op,
   switching names releases the previous one.)
-- [ ] Hot-path cleanups: recompute hashrate windows only on accepted shares
+- [x] Hot-path cleanups: recompute hashrate windows only on accepted shares
   (today: 4 full deque scans per inbound message); move per-share hex/format
   allocations inside `debug!` so they're skipped when disabled; reuse a scratch
   buffer instead of cloning `coinbase_template` per share.
@@ -52,10 +126,29 @@ underflow panic). Line references are as of that review and may drift.
   - [x] Hashrate no longer performs deque scans per inbound message. Accepted
     shares add to per-session accumulators, and the ckpool-style decay task
     folds them into all seven windows every two seconds.
-  - [ ] Move the remaining eager per-share hex/format allocations behind the
-    relevant tracing level.
-  - [ ] Reuse a scratch buffer instead of cloning `coinbase_template` for each
-    validated share.
+
+  Completed (2026-08-06):
+  - [x] The three eager `String`s above the "Validating submitted share"
+    `debug!` are now field expressions inside it. `tracing` only evaluates
+    those when the callsite is enabled, so they cost nothing at the default
+    `info` level; log output is unchanged. The below-target `warn!` in the
+    validator now reuses `block_hash_display` instead of open-coding a second
+    reverse-and-encode.
+  - [x] `assemble_coinbase_into` splices into a caller-owned buffer, and the
+    validator holds one per blocking-pool thread (`COINBASE_SCRATCH`), so a
+    validated share no longer clones `coinbase_template`. Width-mismatch
+    behaviour is unchanged: the region stays zeroed and the share fails on its
+    merits.
+  - [x] Adjacent allocations in the same functions: dropped the never-read
+    `ShareParams.worker` (one `String` per share on both SV1 and SV2), stopped
+    building three throwaway `String`s in `mining.submit` parsing, and switched
+    `build_header`'s prev-hash decode to `hex::decode_to_slice` into a `[u8; 32]`
+    — which also turns a would-be `copy_from_slice` panic on a wrong-length
+    prev-hash into `PoolError::InvalidHeader`.
+
+  Not done, deliberately: the `metrics`/`stats` per-share label allocations
+  (`worker.to_string()` twice per accepted share, three times per rejected one).
+  Those need worker-name interning or a label-API change, not a cleanup.
 
 ## Planned features
 
@@ -78,6 +171,7 @@ underflow panic). Line references are as of that review and may drift.
   untrusted network (a shrinking niche), and client support for `stratum+ssl` is
   spotty (cgminer/Avalon yes; AxeOS/ESP-Miner version-dependent). Revisit only
   if a real user asks for it.
+- [ ] Cookie to save selected chart options for viewing in browser.
 
   Design notes for when/if that happens, so it doesn't become a support burden:
   - **rustls / `tokio-rustls`, not OpenSSL** — keeps the pure-Rust single-binary

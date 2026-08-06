@@ -395,6 +395,7 @@ With `prometheus_addr` set (default `0.0.0.0:9090`), an HTTP server exposes:
 | `GET /chart` | ECharts option data (`?window=1h\|6h\|24h\|1w\|30d\|180d\|all`) |
 | `GET /api/info` | Pool version, network, Stratum port, SV2 status, and authority public key |
 | `GET /metrics` | Prometheus text exposition |
+| `GET /health` | `200` while the block template is refreshing, `503` once it has been stale for 180s (JSON, carries `template_age_secs`) |
 
 Key Prometheus metrics:
 
@@ -403,16 +404,60 @@ Key Prometheus metrics:
 | `pool_connected_miners` | Current live connections |
 | `pool_shares_accepted_total` | Lifetime valid shares |
 | `pool_shares_rejected_total{reason}` | Rejected shares by reason |
-| `pool_blocks_found_total` | 🏆 Blocks found and submitted |
+| `pool_blocks_found_total` | 🏆 Blocks that won their height |
+| `pool_blocks_orphaned_total` | Blocks that won their height and were later reorged out |
+| `pool_block_submissions_total{outcome}` | The node's verdict per submitted block: `accepted`, `duplicate`, `inconclusive` |
+| `pool_block_confirmations_total{result}` | How the confirmation pass decided a block: `confirmed`, `orphaned`, `abandoned` |
+| `pool_blocks_pending_confirmation` | Found blocks not yet decided (normally 0) |
 | `pool_hashrate_hps{window}` | Pool H/s, one series per averaging window (`1m`, `5m`, `10m`, `1h`, `3h`, `6h`, `24h`) |
 | `pool_worker_hashrate_hps{worker,window}` | Per-worker H/s, same windows |
 | `pool_job_height` | Current template block height |
+| `pool_template_last_refresh_timestamp_seconds` | Unix time of the last successful template refresh |
+| `pool_tip_changes_discovered_by_timer_total` | New tips the ntime timer saw before ZMQ did |
+| `pool_zmq_reconnects_total` | ZMQ listener restarts |
 
 Hashrate gauges are decaying averages with the labelled window as their time
 constant, refreshed every 2s. A freshly connected worker reads well below its
 true rate on the longer windows until they have filled — the `24h` series is
 still climbing a day in. Alert on `pool_hashrate_hps{window="10m"}`; it carries
 no worker label, so it does not fan out with the fleet.
+
+`pool_blocks_found_total` counts only blocks that became the chain tip. A block
+that is consensus-valid but lost a same-height race earns nothing, and lands in
+`pool_block_submissions_total{outcome="inconclusive"}` instead — a non-zero rate
+there means hashrate is being spent on a stale tip, usually because template
+refreshes are lagging. `pool_blocks_found_total` is equivalent to
+`sum(pool_block_submissions_total{outcome=~"accepted|duplicate"})`; it exists
+unlabelled because it is the headline number.
+
+That verdict comes from `submitblock` and is only true at the instant it is
+read: a block that wins its height can still be reorged out. Every found block
+is therefore re-checked with `getblockheader` until it is `confirmation_depth`
+(default 6) deep on the active chain or that deep on a branch that lost. Blocks
+that turn out to have been reorged away move `pool_blocks_orphaned_total`, so
+**the blocks the pool actually kept are
+`pool_blocks_found_total - pool_blocks_orphaned_total`** — a counter cannot be
+decremented, so the correction is exported alongside rather than folded in. The
+dashboard shows the net figure directly, and marks the last-block card when the
+block it names has been reorged out. The reconciliation runs in both directions:
+a block that lost its height race and is later promoted onto the active chain by
+a reorg is counted then.
+
+`pool_blocks_pending_confirmation` should sit at 0 and briefly rise to 1 after a
+block. Stuck above 0 for hours means the pass cannot reach the node. The
+partition `found = confirmations{confirmed} + confirmations{orphaned} +
+confirmations{abandoned} + pending` holds over the process lifetime.
+`abandoned` means the node stopped recognising the hash entirely for 24 h —
+reindexed, restored from a snapshot, or replaced — and the submit-time verdict
+was left standing.
+
+For template freshness, alert on
+`time() - pool_template_last_refresh_timestamp_seconds`. The raw timestamp is
+exported rather than an age so you can pick your own threshold; `/health` uses a
+fixed 180s. A rising `pool_tip_changes_discovered_by_timer_total` is the sharper
+signal that ZMQ specifically has stopped delivering — it counts blocks the
+30-second timer found before the notification did, so a sustained rate means the
+pool is learning about new tips up to 30 seconds late.
 
 ---
 

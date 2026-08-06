@@ -18,7 +18,7 @@
 /// for *any* `Δt`. And as `Δt → 0` the contribution `fadd/fsecs · fprop`
 /// converges to `fadd/interval` instead of diverging, so a burst of shares can
 /// never produce an unbounded reading.
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Expected hashes behind one difficulty-1 share (2³²).
 pub const NONCES: f64 = 4_294_967_296.0;
@@ -100,6 +100,52 @@ impl HashrateDecay {
             dsps: [0.0; WINDOW_COUNT],
             pending: 0.0,
             last_decay: now,
+        }
+    }
+
+    /// Restore a checkpointed hashrate and decay it across time spent offline.
+    ///
+    /// `Instant` cannot be persisted, so callers supply the wall-clock gap from
+    /// the checkpoint separately. The gap is applied at the normal ticker
+    /// cadence; doing one very large `decay_time` step would only halve an idle
+    /// value because ckpool clamps that function's exponent.
+    pub(crate) fn restored(
+        now: Instant,
+        hashrates: [f64; WINDOW_COUNT],
+        offline_for: Duration,
+    ) -> Self {
+        let mut decay = Self {
+            dsps: hashrates.map(|hps| {
+                if hps.is_finite() && hps > 0.0 {
+                    hps / NONCES
+                } else {
+                    0.0
+                }
+            }),
+            pending: 0.0,
+            last_decay: now,
+        };
+        decay.decay_idle_for(offline_for.as_secs_f64());
+        decay
+    }
+
+    fn decay_idle_for(&mut self, elapsed_secs: f64) {
+        if !elapsed_secs.is_finite() || elapsed_secs <= 0.0 {
+            return;
+        }
+
+        let step = TICK_SECS as f64;
+        let whole_ticks = (elapsed_secs / step).floor();
+        let remainder = elapsed_secs - whole_ticks * step;
+        for (value, interval) in self.dsps.iter_mut().zip(WINDOW_SECS) {
+            let step_factor = 1.0 / (2.0 - (-step / interval).exp());
+            *value *= step_factor.powf(whole_ticks);
+            if remainder > 0.0 {
+                decay_time(value, 0.0, remainder, interval);
+            }
+            if *value < 2e-16 {
+                *value = 0.0;
+            }
         }
     }
 
@@ -282,6 +328,26 @@ mod tests {
         let hr = decay.hashrates();
         for i in 0..WINDOW_COUNT {
             assert!((hr[i] - dsps[i] * NONCES).abs() < 1.0);
+        }
+    }
+
+    #[test]
+    fn restored_state_matches_idle_ticks_across_downtime() {
+        let start = Instant::now();
+        let saved = [10.0 * TH; WINDOW_COUNT];
+
+        let restored = HashrateDecay::restored(start, saved, Duration::from_secs(300));
+
+        let mut ticked = HashrateDecay::restored(start, saved, Duration::ZERO);
+        let mut now = start;
+        for _ in 0..(300 / TICK_SECS) {
+            now += Duration::from_secs(TICK_SECS);
+            ticked.tick(now);
+        }
+
+        for (actual, expected) in restored.hashrates().into_iter().zip(ticked.hashrates()) {
+            let error = (actual - expected).abs() / expected;
+            assert!(error < 1e-12, "restored value differed by {error:e}");
         }
     }
 

@@ -439,6 +439,47 @@ fn grind_respects_deadline() {
     );
 }
 
+/// Minimal HTTP GET against the pool's dashboard. This test already speaks raw
+/// TCP to the Stratum port; pulling in an HTTP client for two requests is not
+/// worth it.
+fn http_get(port: u16, path: &str) -> Option<String> {
+    use std::io::Read;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    raw.split_once("\r\n\r\n").map(|(_, body)| body.to_string())
+}
+
+/// Poll `/stats` until `check` passes, so the test waits on the confirmation
+/// sweep's actual cadence rather than a guessed sleep.
+fn await_stats(
+    port: u16,
+    timeout: Duration,
+    check: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    let mut last = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        if let Some(body) = http_get(port, "/stats") {
+            if let Ok(stats) = serde_json::from_str::<serde_json::Value>(&body) {
+                if check(&stats) {
+                    return stats;
+                }
+                last = stats;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    panic!("/stats never reached the expected state within {timeout:?}; last was {last}");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The test
 // ─────────────────────────────────────────────────────────────────────────────
@@ -481,6 +522,9 @@ extranonce2_size = 4
 max_connections = 16
 idle_timeout_secs = 1800
 found_block_dir = "{found}"
+# Shallow enough that the reorg phase below only needs a handful of generated
+# blocks; the burial rule is the same at any depth.
+confirmation_depth = 2
 
 [bitcoin_rpc]
 url = "http://127.0.0.1:{rpc_port}"
@@ -508,13 +552,14 @@ max_message_bytes = 8192
 
 [metrics]
 prometheus_addr = "127.0.0.1:{dash_port}"
-stats_db_path = ""
+stats_db_path = "{stats_db}"
 
 [logging]
 level = "warn"
 json = false
 "#,
             found = tmp.join("found-blocks").display(),
+            stats_db = tmp.join("stats.db").display(),
             cookie = cookie.display(),
         ),
     )
@@ -639,12 +684,107 @@ json = false
         "block-1 coinbase scriptSig should start with OP_1 (0x51): {script_sig}"
     );
 
+    // BIP141: a block carrying the witness commitment must carry the 32-byte
+    // witness reserved value in its coinbase input. `submitblock` inserts a
+    // missing one itself, so this asserts the *pool* produced it — the archived
+    // block hex and any non-submitblock path depend on that.
+    //
+    // Segwit is active from height 0 on regtest, so getblocktemplate always
+    // returns default_witness_commitment and the pool always adds the output;
+    // assert that rather than guarding, or a silent skip would pass forever.
+    assert!(
+        coinbase["vout"].as_array().unwrap().iter().any(|out| {
+            out["scriptPubKey"]["hex"]
+                .as_str()
+                .is_some_and(|hex| hex.starts_with("6a24aa21a9ed"))
+        }),
+        "coinbase is missing the witness commitment output: {coinbase}"
+    );
+    let witness = coinbase["vin"][0]["txinwitness"]
+        .as_array()
+        .expect("coinbase has a witness commitment but no txinwitness");
+    assert_eq!(witness.len(), 1, "expected one witness item: {witness:?}");
+    assert_eq!(
+        witness[0].as_str().unwrap(),
+        "0".repeat(64),
+        "witness reserved value must be 32 zero bytes"
+    );
+
     let archived = std::fs::read_dir(tmp.join("found-blocks"))
         .map(|d| d.count())
         .unwrap_or(0);
     assert!(archived >= 1, "found-block hex was not archived");
 
     eprintln!("✅ block 1 accepted by node; coinbase pays {paid}");
+
+    // ── The hash the pool reports is the one the rest of Bitcoin uses ────────
+    // The raw double-SHA256 is little-endian; reporting it unreversed gives a
+    // string no explorer resolves and no RPC accepts, which is also what would
+    // break the confirmation pass below.
+    let stats = await_stats(dash_port, Duration::from_secs(30), |s| {
+        s["last_block_hash"].as_str() == Some(hash.as_str())
+    });
+    assert_eq!(
+        stats["blocks_found"].as_u64(),
+        Some(1),
+        "the accepted block was not counted: {stats}"
+    );
+    assert_eq!(
+        stats["blocks_pending_confirmation"].as_u64(),
+        Some(1),
+        "the accepted block was not enrolled for confirmation: {stats}"
+    );
+
+    // ── A win that is reorged out stops counting ─────────────────────────────
+    // Invalidating drops the tip back to 0, so `confirmation_depth` blocks
+    // alone would leave the tip level with the burial threshold rather than
+    // past it: generate one more than the depth.
+    node.cli(&["invalidateblock", &hash])
+        .expect("invalidateblock");
+    node.cli(&["generatetoaddress", "3", &payout])
+        .expect("generatetoaddress");
+    assert_eq!(
+        node.cli(&["getblockcount"]).unwrap(),
+        "3",
+        "competing branch did not bury the pool's block"
+    );
+
+    let stats = await_stats(dash_port, Duration::from_secs(180), |s| {
+        s["blocks_orphaned"].as_u64() == Some(1)
+    });
+    assert_eq!(
+        stats["blocks_found"].as_u64(),
+        Some(0),
+        "a reorged-out block is still being counted as found: {stats}"
+    );
+    assert_eq!(
+        stats["blocks_pending_confirmation"].as_u64(),
+        Some(0),
+        "the block was decided but never left the pending set: {stats}"
+    );
+    assert_eq!(
+        stats["last_block_status"].as_str(),
+        Some("orphaned"),
+        "the last-block card still claims the block stood: {stats}"
+    );
+
+    // Prometheus keeps both numbers: a counter cannot go down, so the truth is
+    // found minus orphaned.
+    let metrics = http_get(dash_port, "/metrics").expect("GET /metrics");
+    assert!(
+        metrics.contains("pool_blocks_found_total 1"),
+        "pool_blocks_found_total should stay at 1: {metrics}"
+    );
+    assert!(
+        metrics.contains("pool_blocks_orphaned_total 1"),
+        "pool_blocks_orphaned_total was not recorded: {metrics}"
+    );
+    assert!(
+        metrics.contains(r#"pool_block_confirmations_total{result="orphaned"} 1"#),
+        "the confirmation breakdown is missing the orphaned series: {metrics}"
+    );
+
+    eprintln!("✅ reorged-out block reconciled: found 1 → 0, orphaned 1");
 
     drop(pool);
     drop(node);

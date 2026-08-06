@@ -25,7 +25,14 @@ listen_addr = "0.0.0.0:3333"
 # miner as BITCOIN_ADDRESS or BITCOIN_ADDRESS.worker. The address must match the
 # connected node's network.
 
-# Tag embedded in the coinbase scriptSig (max ~20 bytes)
+# Tag embedded in the coinbase scriptSig.
+#
+# Consensus limits the whole coinbase scriptSig to 100 bytes, and it also holds
+# the BIP34 block height (up to 5 bytes) and the extranonce
+# (extranonce1_size + extranonce2_size). The pool refuses to start if the total
+# would exceed 100 — with the default 4 + 4 extranonce that leaves ~91 bytes for
+# this tag, but there is no reason to use them: it only appears in the coinbase
+# of a block you find.
 coinbase_tag = "/btcpool-rs/"
 
 # Optional safety assertion. The pool always detects the actual network from
@@ -69,6 +76,22 @@ idle_timeout_secs = 300
 # by hand (`bitcoin-cli submitblock "$(cat <file>)"`). Relative paths resolve
 # against the service working directory, like stats_db_path.
 found_block_dir = "found-blocks"
+
+# Confirmations before a found block is treated as final.
+#
+# The submitblock response is only true at the instant it is read: a block that
+# wins its height can still be reorged out, and one that loses a same-height
+# race can be promoted by the reorg that follows. Every found block is
+# re-checked with getblockheader until it is this deep on the active chain
+# (confirmed) or this deep on a branch that lost (reorged out), then reconciled
+# against the counts. See pool_blocks_orphaned_total.
+#
+# 6 is the conventional finality threshold and takes about an hour. 100 is
+# coinbase maturity — the depth at which the reward is actually spendable — at
+# the cost of holding each block pending for ~17 hours. Do not set this to 1:
+# a block one deep on a side branch is a routine reorg that usually resolves in
+# our favour. Range 1–100.
+confirmation_depth = 6
 
 [sv2]
 # Accept Stratum V2 (Extended Channel, Noise-encrypted) connections on the SAME

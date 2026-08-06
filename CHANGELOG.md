@@ -9,6 +9,186 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+### Added
+- `GET /health` on the dashboard/metrics port: 200 with
+  `{"status":"ok","template_age_secs":N}` while the template is refreshing, 503
+  with `"status":"stale"` once it has not refreshed for 180 seconds — or before
+  the first refresh has ever landed, so a node that was already unreachable at
+  startup is visible immediately. Deliberately a readiness/alerting probe:
+  pointing a container `HEALTHCHECK` at it that restarts the process fixes
+  nothing when the freeze is upstream in bitcoind, and drops every connected
+  miner for no gain.
+- `pool_template_last_refresh_timestamp_seconds` — the raw unix timestamp of the
+  last successful template refresh, not an age, so freshness is
+  `time() - pool_template_last_refresh_timestamp_seconds` in PromQL and
+  operators can pick a threshold independent of `/health`'s fixed one.
+- `pool_tip_changes_discovered_by_timer_total` — counts tips the 30-second ntime
+  timer noticed before the block-notification path did. One is a coincidence; a
+  run of them is direct evidence that ZMQ has stopped delivering, which no
+  timeout can detect on a socket that connects but never publishes.
+- `pool_zmq_reconnects_total` now has a caller. It was declared and dead since
+  it was written, because nothing ever reconnected.
+- Boot now fails when `[pool] coinbase_tag` plus the extranonce widths would
+  push the coinbase scriptSig past the 100-byte consensus limit. All of it is
+  operator-configured, so an over-long tag would otherwise only surface as a
+  `bad-cb-length` rejection on the one block the pool ever finds.
+- **Deferred confirmation pass for found blocks.** Every block the node stores
+  is enrolled in a `found_blocks` ledger in the stats database and re-checked
+  with `getblockheader` on a 60-second sweep until it is `confirmation_depth`
+  deep on the active chain or that deep on a branch that lost. New config key
+  `[pool] confirmation_depth` (default 6, range 1–100); new metrics
+  `pool_blocks_orphaned_total`, `pool_block_confirmations_total{result}` and the
+  `pool_blocks_pending_confirmation` gauge; new `/stats` fields
+  `blocks_orphaned`, `blocks_pending_confirmation` and `last_block_status`.
+  The sweep makes no RPC call when nothing is pending, which is nearly always.
+- Block counts now survive a restart. `blocks_found`, `blocks_inconclusive` and
+  `blocks_orphaned` are recomputed from the `found_blocks` ledger at boot, which
+  is what the dashboard's "found blocks survive restarts" label has claimed
+  since v0.1.3 without it being true. Requires `[metrics] stats_db_path`; with
+  no stats database the ledger lives in memory only and still drives the
+  confirmation pass for the life of the process.
+
+### Changed
+- **`[zmq] poll_fallback = true` now polls alongside ZMQ instead of only after
+  it fails.** It was a one-way switch armed by a ZMQ *error*, which meant it
+  never armed for the failure it was most needed for: `zmq_connect` is
+  asynchronous, so a wrong port or a node without `zmqpubhashblock` connects
+  successfully and then simply never publishes. There is no error to react to.
+  The cost is one `getbestblockhash` per `poll_interval_ms` (default 1 s)
+  forever, which is cheap and already runs off the async runtime.
+  `pool_rpc_fallback_used_total` correspondingly shifts meaning from "we had to
+  fall back" to "the backstop is enabled", and still fires exactly once, at
+  startup.
+- Blocks are submitted with the BIP141 witness reserved value (32 zero bytes)
+  already in the coinbase input's witness when the template carries a witness
+  commitment. Core's `submitblock` RPC inserts a missing one itself, so blocks
+  were being accepted, but the archived `found-blocks/*.hex` was not a block any
+  other path would take — P2P relay and Core's IPC mining interface both reject
+  it with `bad-witness-nonce-size`. `coinbase1`/`coinbase2` and the merkle root
+  keep using the stripped serialization, so the txid is unchanged.
+- Share statistics and metrics for SV1 and SV2 now go through one shared
+  accounting path, and rejection reasons are a closed enum rather than
+  duplicated string literals at each site. Block-submission reporting now goes
+  through that same path.
+- **Breaking (metrics): `pool_block_submissions_success_total` is removed,**
+  replaced by `pool_block_submissions_total{outcome="accepted"|"duplicate"|
+  "inconclusive"}`. The old counter was incremented on the line directly after
+  every `pool_blocks_found_total` increment and nowhere else, so the two always
+  carried identical values under different names; the labelled counter gives the
+  node's actual verdict instead. `pool_blocks_found_total` keeps its name and
+  stays unlabelled — it is the headline number and should not need a label
+  matcher to read — and is now equivalent to
+  `sum(pool_block_submissions_total{outcome=~"accepted|duplicate"})`.
+  `pool_block_submissions_failed_total{reason}` is unchanged.
+- `GET /stats` gains `blocks_inconclusive`, the count of valid blocks that lost
+  their height race. Like `blocks_found` it is in-memory only and resets on
+  restart.
+- SQLite persistence moved off the async runtime: writes are queued to a
+  dedicated writer thread, dashboard history queries run on the blocking pool,
+  and the database is opened with `journal_mode=WAL`, `synchronous=NORMAL` and a
+  5-second busy timeout. Share submissions and dashboard chart queries no longer
+  contend on one connection mutex.
+- Bitcoin RPC moved off the async runtime as well, finishing that work.
+  `getblocktemplate` ran synchronously inside the template loop, parking a tokio
+  worker for the whole round trip on every new block and every 30-second ntime
+  refresh — and it is the heaviest RPC the node serves, since it re-runs block
+  assembly over the mempool. On a 2–4 core home node that stalled a quarter to a
+  half of the runtime's capacity while connected miners' share submissions
+  queued behind it. Three further synchronous calls were doing the same thing:
+  the ZMQ poll fallback's `getbestblockhash` at 1 Hz, and `getnetworkhashps`
+  plus the five-round-trip difficulty estimate in the 30-second stats loop.
+  `RpcClient` now exposes only `async` methods, which run the call on the
+  blocking pool; the synchronous bodies are private, so the mistake cannot
+  recur.
+
+### Fixed
+- **A block that won its height and was then reorged out kept counting as a
+  win.** `pool_blocks_found_total`, the `/stats` block count and the dashboard's
+  "Last block found" card were all decided by the `submitblock` response, which
+  is only true at the instant it is read. A deferred pass now re-checks each
+  found block and reconciles: the dashboard count drops back and the card is
+  marked `reorged out`, while Prometheus — where a counter cannot go down —
+  gains `pool_blocks_orphaned_total`, so the blocks the pool kept are
+  `pool_blocks_found_total - pool_blocks_orphaned_total`. The correction runs in
+  both directions: a block reported `inconclusive` that a later reorg puts on
+  the active chain is counted then, which the submit-time verdict could never
+  do. Orphaning requires the losing branch to be buried by the full
+  `confirmation_depth`, so the routine one-block reorg that resolves in our
+  favour does not flap the count.
+- **The block hash the pool reported was byte-reversed.** The raw double-SHA256
+  is internal (little-endian) order, and it was hex-encoded as-is into the
+  dashboard's last-block card, every log line, and the
+  `found-blocks/block_<height>_<hash>.hex` filename — putting proof-of-work's
+  leading zeros at the wrong end. The string resolved in no block explorer and
+  was accepted by no RPC. All of them now carry the conventional big-endian
+  display form; already-archived filenames keep their old spelling.
+- **Blocks that lost a same-height race were reported as wins.** `submitblock`
+  answers `"inconclusive"` when it accepts and stores a consensus-valid block
+  that did not become the chain tip — the block sits on a side branch and earns
+  nothing. That was mapped to a bare `Ok(())`, indistinguishable from a real
+  find, so a superseded block incremented `pool_blocks_found_total`, incremented
+  the `/stats` block count, overwrote the dashboard's "Last block found" card
+  and logged `🏆 Block submitted!`. `submit_block` now returns a three-way
+  `BlockSubmitOutcome`, and only `Accepted`/`Duplicate` count as a find.
+  `"duplicate-inconclusive"` was grouped with plain `"duplicate"` and had the
+  same problem; it is now `Inconclusive` too. The miner is unaffected: its share
+  is still credited and acked, because a valid block-difficulty share losing a
+  race is not its fault. Fixed at all three reporting sites — SV1, SV2, and the
+  background resubmit task, which is the one most likely to see it, since it
+  runs minutes after the block was found.
+- **The template engine could stop refreshing without anyone noticing.** The ZMQ
+  listener had no reconnect — a single receive error ended it permanently. With
+  `poll_fallback = false` that dropped the only `watch::Sender`, and the
+  template loop `break`ed out on the closed channel, taking the 30-second ntime
+  refresh with it. The pool then served one frozen template until restart, with
+  a single `warn!` as the only evidence. The listener is now supervised and
+  reconnects forever with capped exponential backoff (1 s → 60 s), so the sender
+  is never dropped; the refresh loop additionally survives a closed channel by
+  latching that `select!` branch off and running on the ntime timer alone.
+- **A tip discovered by the ntime timer was broadcast as `clean=false`,** telling
+  miners they could keep grinding a job built on a dead tip. `refresh` trusted
+  its caller's flag; it now derives the flag by comparing `prev_hash` against the
+  outgoing template, so any tip change forces a clean job no matter which path
+  noticed it. `prev_hash` rather than height, because `hashPrevBlock` is the only
+  header field that binds work to a chain — height lives only in the BIP34
+  coinbase push and misses a same-height reorg. Consequences differed sharply by
+  protocol: SV1 miners switched jobs but the stale job stayed live, so a block
+  found on it was assembled with the old `prev_hash` and silently earned nothing;
+  SV2 was worse, since `clean` gates `SetNewPrevHash` and `min_ntime`, so devices
+  were handed an immediate job on a prev-hash they had not been moved to and
+  **every** subsequent share failed the target check until the session was
+  dropped for invalid shares.
+- **`bitcoin_rpc.timeout_secs` was parsed, documented, and then never applied.**
+  The client was built with the JSON-RPC transport's hardcoded 15-second
+  default, so setting the option did nothing — including on the client rebuilt
+  after a cookie rotation. It is now honoured on both construction paths. This
+  matters more than it used to: RPC calls run on the blocking pool, where a task
+  cannot be cancelled, so the transport timeout is the only bound on how long an
+  unresponsive node can hold a thread. Operators whose node needs more than the
+  default 10 seconds to answer `getblocktemplate` should raise the value — it is
+  now enforced where 15 seconds silently applied before.
+- Hashrate averages no longer restart from zero when the service restarts.
+  Per-worker decay state is checkpointed with the chart history, restored from
+  SQLite at startup, and decayed across the time the service was offline.
+- **Reported hashrate was inflated for miners that ignore `set_difficulty`.**
+  Shares are validated against the vardiff floor (so cgminer/Avalon firmware
+  pinned to its configure-time `minimum-difficulty` isn't rejected) but were
+  credited to the estimator at the session's current vardiff. A session that
+  keeps submitting below the difficulty it was sent is now detected — three
+  such shares outside a 30-second post-retarget grace window — and credited at
+  the floor instead, which is the threshold actually governing how often it
+  submits. Miners that honour `set_difficulty` are unaffected. The Prometheus
+  share-difficulty histogram now records the same credited value the dashboard
+  hashrate is built from; the two previously disagreed.
+- Shares submitted after a connection re-authorized under a different worker
+  name were credited to the previous name for the life of that connection.
+- Workers restored from the hashrate checkpoint that have not reconnected yet
+  showed a zero row in the dashboard worker table while still contributing to
+  the pool total.
+- Block height, network difficulty and the coinbase value on the dashboard are
+  now published by the template engine on every refresh instead of by each
+  miner session, so they stay current when no miner is connected.
+
 ## [0.1.3] - 2026-08-05
 
 Upstream v0.6.3 compatibility fixes and live BIP110/RDTS visibility.
@@ -27,6 +207,9 @@ Upstream v0.6.3 compatibility fixes and live BIP110/RDTS visibility.
 - The block-acceptance test now abandons a nonce sweep after two minutes and
   resynchronizes with the latest job. Slow CI runners can no longer spend long
   enough on one sweep for the pool to evict that job before submission.
+- Hashrate chart lines, legend markers, hover points, and tooltip swatches now
+  use the same name-based color mapping. Building ECharts' global palette in
+  legend order had rotated all six marker colors away from their plotted lines.
 
 ## [0.1.2] - 2026-08-05
 

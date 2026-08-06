@@ -86,8 +86,19 @@ pub fn miner_disconnect(reason: &str, worker: &str) {
     .increment(1);
 }
 
-pub fn block_submission_success() {
-    counter!("pool_block_submissions_success_total").increment(1);
+/// The node's verdict on a block we submitted, one series per outcome.
+///
+/// `outcome` is a closed set (`BlockSubmitOutcome::label`) — same contract as
+/// the `reason` label below, and for the same reason.
+///
+/// This is the breakdown; `block_found` below is the headline. Only outcomes
+/// that won their height increment both.
+pub fn block_submission_outcome(outcome: &'static str) {
+    counter!(
+        "pool_block_submissions_total",
+        "outcome" => outcome
+    )
+    .increment(1);
 }
 
 pub fn block_submission_failure(reason: &'static str) {
@@ -103,7 +114,6 @@ pub fn job_broadcast(miners_count: usize) {
     counter!("pool_job_broadcasts_total").increment(1);
 }
 
-#[allow(dead_code)]
 pub fn zmq_reconnect() {
     counter!("pool_zmq_reconnects_total").increment(1);
 }
@@ -117,8 +127,37 @@ pub fn vardiff_retarget(worker: &str, old_diff: u64, new_diff: u64) {
     histogram!("pool_vardiff_change_ratio").record(new_diff as f64 / old_diff as f64);
 }
 
+/// A block that won its height. Deliberately unlabelled: this is the number an
+/// operator puts on a wall, and reading it should not need a label matcher.
+///
+/// Call this only when `BlockSubmitOutcome::is_win` — a valid block that lost a
+/// same-height race is not a find.
 pub fn block_found() {
     counter!("pool_blocks_found_total").increment(1);
+}
+
+/// A block that won its height and was later reorged off the chain — the
+/// correction to `pool_blocks_found_total`, which cannot itself go down.
+///
+/// Unlabelled for the same reason as `block_found`: subtracting one from the
+/// other should not need a label matcher.
+pub fn block_orphaned() {
+    counter!("pool_blocks_orphaned_total").increment(1);
+}
+
+/// How the deferred confirmation pass decided a block, one series per outcome.
+///
+/// `result` is a closed set (`stats::BlockResolution::label`); this is the
+/// breakdown that makes `found = confirmed + orphaned + abandoned + pending`
+/// checkable against the gauge below.
+pub fn block_confirmation(result: &'static str) {
+    counter!("pool_block_confirmations_total", "result" => result).increment(1);
+}
+
+/// Found blocks the confirmation pass has not yet decided. Normally zero; a
+/// value stuck above zero for hours means the pass is not making progress.
+pub fn update_blocks_pending_confirmation(pending: u64) {
+    gauge!("pool_blocks_pending_confirmation").set(pending as f64);
 }
 
 /// `window` label values for the hashrate gauges, in the order
@@ -151,4 +190,21 @@ pub fn update_worker_hashrate(worker: &str, windows: [f64; 7]) {
 
 pub fn update_job_height(height: u64) {
     gauge!("pool_job_height").set(height as f64);
+}
+
+/// Raw unix timestamp of the last fully successful template refresh — not an
+/// age, so PromQL derives freshness with
+/// `time() - pool_template_last_refresh_timestamp_seconds`, the same idiom as
+/// `process_start_time_seconds`. Lets operators pick an alerting threshold
+/// independent of `/health`'s fixed `TEMPLATE_STALE_AFTER` cutoff.
+pub fn update_template_last_refresh(unix_secs: u64) {
+    gauge!("pool_template_last_refresh_timestamp_seconds").set(unix_secs as f64);
+}
+
+/// A refresh derived `clean=true` that its caller did not request — the ntime
+/// timer, not the block-notification path, is what noticed the tip moved. One
+/// is a coincidence (the block landed between the notification firing and the
+/// timer tick); a handful in a row is evidence that path stopped delivering.
+pub fn tip_change_discovered_by_timer() {
+    counter!("pool_tip_changes_discovered_by_timer_total").increment(1);
 }

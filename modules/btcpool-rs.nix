@@ -26,6 +26,7 @@ let
           max_connections = 256;
           idle_timeout_secs = 300;
           found_block_dir = "found-blocks";
+          confirmation_depth = 6;
         };
 
         sv2 = {

@@ -7,6 +7,11 @@
 ///   GET /favicon.ico → embedded site icon
 ///   GET /stats       → JSON snapshot of PoolStats
 ///   GET /metrics  → Prometheus text (via PrometheusHandle::render)
+///   GET /health   → 200/503 liveness probe (JSON, template_age_secs). Pull-based
+///                   readiness/alerting signal — do not wire to a container
+///                   HEALTHCHECK that restarts the process: that fixes nothing
+///                   when the freeze is upstream (bitcoind), and drops every
+///                   connected miner for no gain.
 use crate::{
     mining::engine::TemplateEngine,
     settings::RuntimeSettings,
@@ -99,6 +104,7 @@ pub async fn start(
         .route("/chart", get(chart_json))
         .route("/api/info", get(info_get))
         .route("/metrics", get(metrics_text))
+        .route("/health", get(health))
         .with_state(state);
 
     match tokio::net::TcpListener::bind(socket_addr).await {
@@ -198,6 +204,27 @@ async fn info_get(State(state): State<DashState>) -> Json<InfoView> {
     })
 }
 
+/// Liveness/readiness probe. Pull-based rather than pushed from `run`'s own
+/// task deliberately: if that task panics, the freshness atomics simply stop
+/// advancing and this independent request still reports unhealthy correctly,
+/// where a self-reported "I'm fine" from the dying task could not.
+async fn health(State(state): State<DashState>) -> Response {
+    let template_age_secs = state.engine.template_age().as_secs();
+    if state.engine.is_template_fresh() {
+        (
+            StatusCode::OK,
+            Json(json!({ "status": "ok", "template_age_secs": template_age_secs })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "stale", "template_age_secs": template_age_secs })),
+        )
+            .into_response()
+    }
+}
+
 async fn metrics_text(State(state): State<DashState>) -> Response {
     match &state.prometheus {
         Some(handle) => {
@@ -235,9 +262,8 @@ async fn history_json(
     Query(params): Query<HistoryParams>,
 ) -> Json<Vec<HistoryPoint>> {
     let since = params.since.unwrap_or(0);
-    let points = state
-        .stats
-        .get_hashrate_history(since, 60)
+    let points = hashrate_history(&state, since, 60)
+        .await
         .into_iter()
         .filter_map(|point| {
             point
@@ -300,6 +326,23 @@ fn chart_window(value: Option<&str>) -> ChartWindow {
     }
 }
 
+/// Run a history query on the blocking pool.
+///
+/// It is a grouped scan over a table that holds months of samples, against a
+/// SQLite connection shared with the rest of the process. Doing that inline
+/// would park a runtime worker thread on disk I/O for as long as it takes —
+/// with enough dashboard tabs open, long enough to stall the share path.
+async fn hashrate_history(
+    state: &DashState,
+    since: u64,
+    bucket_secs: u64,
+) -> Vec<HashrateHistoryPoint> {
+    let stats = state.stats.clone();
+    tokio::task::spawn_blocking(move || stats.get_hashrate_history(since, bucket_secs))
+        .await
+        .unwrap_or_default()
+}
+
 fn chart_series_data(
     history: &[HashrateHistoryPoint],
     value: fn(&HashrateHistoryPoint) -> Option<f64>,
@@ -324,7 +367,7 @@ async fn chart_json(
         .map(|duration| now.saturating_sub(duration))
         .unwrap_or(0);
 
-    let mut history = state.stats.get_hashrate_history(since, window.bucket_secs);
+    let mut history = hashrate_history(&state, since, window.bucket_secs).await;
 
     // Append the current live value as the trailing edge of the chart, snapped
     // to the bucket grid. Every other point is a bucket mean, so plotting a raw
@@ -792,6 +835,7 @@ tr:last-child td { border-bottom: none; }
       <div class="val" id="v-last-block-worker">&mdash;</div>
       <div class="sub trunc" id="v-last-block-payout" title="Payout address encoded in the found block">&mdash;</div>
       <div class="sub" id="v-last-block-time">&mdash;</div>
+      <div class="sub" id="v-last-block-status" title="A block is only final once it is buried under the configured number of confirmations; until then a reorg can still take it away">&mdash;</div>
       <div class="sub trunc" id="v-last-block-hash" title="Hash of the last block this pool found">&mdash;</div>
     </div>
   </div>
@@ -1225,11 +1269,15 @@ async function loadChart(window) {
       '24h': light ? '#0e7490' : '#22d3ee'
     };
     const series = Array.isArray(options.series) ? options.series : [options.series].filter(Boolean);
-    const legendOrder = (options.legend && options.legend.data) || series.map(s => s.name);
-    options.color = legendOrder.map(name => palette[name]).filter(Boolean);
+    // ECharts assigns global colours by series order, not legend order. The
+    // two are deliberately reversed here, so feeding it legend order rotates
+    // every legend icon, hover point, and tooltip swatch away from its line.
+    options.color = series.map(line => palette[line.name]).filter(Boolean);
     series.forEach(line => {
+      const color = palette[line.name];
       line.smooth = false;
-      line.lineStyle = Object.assign(line.lineStyle || {}, { color: palette[line.name] });
+      line.lineStyle = Object.assign(line.lineStyle || {}, { color });
+      line.itemStyle = Object.assign(line.itemStyle || {}, { color });
     });
     if (options.legend) {
       options.legend.textStyle = { color: muted, fontSize: 11 };
@@ -1253,7 +1301,7 @@ async function loadChart(window) {
         const rows = params
           .filter(p => Array.isArray(p.value) && p.value[1] !== null && p.value[1] !== undefined)
           .sort((a, b) => order.indexOf(a.seriesName) - order.indexOf(b.seriesName))
-          .map(p => '<span style="color:' + p.color + '">&#9632;</span> ' + p.seriesName + ': ' + fmtHr(p.value[1], false));
+          .map(p => '<span style="color:' + (palette[p.seriesName] || p.color) + '">&#9632;</span> ' + p.seriesName + ': ' + fmtHr(p.value[1], false));
         return date + '<br/>' + rows.join('<br/>');
       };
     }
@@ -1305,6 +1353,19 @@ async function refresh() {
     document.getElementById('v-last-block-payout').textContent = d.last_block_payout || '—';
     document.getElementById('v-last-block-hash').textContent = d.last_block_hash || '—';
     document.getElementById('v-last-block-time').textContent = fmtTimestamp(d.last_block_ts);
+    // The submitblock verdict is provisional until the confirmation pass
+    // settles it, so say which it is rather than letting the card imply the
+    // block is safe.
+    const lastBlockStatus = document.getElementById('v-last-block-status');
+    const statusText = {
+      pending: 'awaiting confirmation',
+      confirmed: 'confirmed',
+      orphaned: 'reorged out — earned nothing',
+      abandoned: 'unconfirmed: node no longer has it',
+    };
+    lastBlockStatus.textContent = d.last_block_ts ? (statusText[d.last_block_status] || d.last_block_status) : '—';
+    lastBlockStatus.classList.toggle('ok', d.last_block_status === 'confirmed');
+    lastBlockStatus.classList.toggle('bad', d.last_block_status === 'orphaned' || d.last_block_status === 'abandoned');
     document.getElementById('v-best-share').textContent = fmtDiff(d.best_share_difficulty);
     document.getElementById('v-session-best-share').textContent = fmtDiff(d.session_best_share_difficulty);
     document.getElementById('v-best-over-network').textContent = d.best_share_difficulty >= Math.ceil(d.network_difficulty) ? 'YES' : 'no';
@@ -1719,11 +1780,23 @@ mod tests {
             assert!(legend.contains(name), "series {name} missing from legend");
         }
 
-        // The client keys colours by series name; a positional palette would
-        // silently invert now that the two orders differ.
+        // ECharts consumes its global palette in draw order, while each visual
+        // component is also pinned by name. Building the global palette in
+        // legend order rotates all six legend/tooltip colours because the two
+        // orders are opposite.
         assert!(
-            DASHBOARD_HTML.contains("palette[line.name]"),
-            "chart colours must be keyed by series name, not array index"
+            DASHBOARD_HTML
+                .contains("options.color = series.map(line => palette[line.name]).filter(Boolean)"),
+            "global chart colours must follow series draw order"
+        );
+        assert!(
+            DASHBOARD_HTML
+                .contains("line.itemStyle = Object.assign(line.itemStyle || {}, { color })"),
+            "legend and hover markers must use the line's name-based colour"
+        );
+        assert!(
+            DASHBOARD_HTML.contains("palette[p.seriesName] || p.color"),
+            "tooltip swatches must use the series-name palette"
         );
     }
 

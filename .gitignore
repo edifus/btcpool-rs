@@ -4,19 +4,21 @@
 !*/
 
 # Root repository files.
-!/.gitignore
 !/.dockerignore
-!/Cargo.lock
-!/Cargo.toml
+!/.envrc
+!/.gitignore
 !/CHANGELOG.md
 !/CONTRIBUTING.md
+!/Cargo.lock
+!/Cargo.toml
+!/Dockerfile
 !/LICENSE-*
 !/README.md
 !/SECURITY.md
 !/TODO.md
 !/config.toml.example
+!/default.nix
 !/docker-compose.yml
-!/Dockerfile
 !/flake.lock
 !/flake.nix
 

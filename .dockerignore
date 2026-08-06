@@ -1,11 +1,9 @@
-target
-.git
-.github
-*.sqlite
-config.toml
-examples
-docs
-.vscode
-.cursor
-.windsurf
-.claude
+# Ignore everything, then re-include exactly what the image build reads.
+
+*
+
+# Everything the Dockerfile COPYs. src/ is taken whole: it holds favicon.ico,
+# which dashboard.rs embeds with include_bytes!.
+!/Cargo.toml
+!/Cargo.lock
+!/src
