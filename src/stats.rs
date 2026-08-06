@@ -40,72 +40,62 @@ pub const SNAPSHOT_INTERVAL_SECS: u64 = 10;
 /// being thinned to one a minute.
 const FINE_HISTORY_RETENTION_SECS: u64 = 48 * 3600;
 
-/// Hashrate averages over the windows in `mining::hashrate::WINDOW_SECS`,
-/// in H/s. These are decaying averages with the named window as their time
-/// constant, not trailing sliding windows: a freshly started source reads far
-/// below its true rate on the longer windows until they have had time to fill.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct HashrateWindows {
-    pub one_minute: f64,
-    pub five_minutes: f64,
-    pub ten_minutes: f64,
-    pub one_hour: f64,
-    pub three_hours: f64,
-    pub six_hours: f64,
-    pub twenty_four_hours: f64,
+// Generates `HashrateWindows` and everything that has to walk its fields in
+// window order, from the single table below the macro.
+//
+// The four operations (`add`, `from_windows`, `to_windows`, `uniform`) were
+// four hand-written lists of the same seven fields in the same order, and
+// `to_windows`' order additionally has to match the Prometheus window labels.
+// Any one of them could drift and silently mislabel every exported series, so
+// the field ↔ window-index correspondence is stated exactly once.
+macro_rules! hashrate_windows {
+    ($($field:ident => $index:path),+ $(,)?) => {
+        /// Hashrate averages over the windows in
+        /// `mining::hashrate::WINDOW_SECS`, in H/s. These are decaying averages
+        /// with the named window as their time constant, not trailing sliding
+        /// windows: a freshly started source reads far below its true rate on
+        /// the longer windows until they have had time to fill.
+        #[derive(Debug, Clone, Copy, Default)]
+        pub struct HashrateWindows {
+            $(pub $field: f64,)+
+        }
+
+        impl HashrateWindows {
+            fn add(&mut self, other: Self) {
+                $(self.$field += other.$field;)+
+            }
+
+            /// Build from a `mining::hashrate` window array, which is indexed
+            /// by the `W_*` constants.
+            fn from_windows(hps: [f64; hashrate::WINDOW_COUNT]) -> Self {
+                Self { $($field: hps[$index],)+ }
+            }
+
+            /// Back to the `W_*`-indexed array, which is the order the
+            /// Prometheus window labels are in
+            /// (`metrics::HASHRATE_WINDOW_LABELS`).
+            pub fn to_windows(self) -> [f64; hashrate::WINDOW_COUNT] {
+                let mut out = [0.0; hashrate::WINDOW_COUNT];
+                $(out[$index] = self.$field;)+
+                out
+            }
+
+            #[cfg(test)]
+            fn uniform(hps: f64) -> Self {
+                Self { $($field: hps,)+ }
+            }
+        }
+    };
 }
 
-impl HashrateWindows {
-    fn add(&mut self, other: Self) {
-        self.one_minute += other.one_minute;
-        self.five_minutes += other.five_minutes;
-        self.ten_minutes += other.ten_minutes;
-        self.one_hour += other.one_hour;
-        self.three_hours += other.three_hours;
-        self.six_hours += other.six_hours;
-        self.twenty_four_hours += other.twenty_four_hours;
-    }
-
-    /// Build from a `mining::hashrate` window array, which is indexed by the
-    /// `W_*` constants.
-    fn from_windows(hps: [f64; hashrate::WINDOW_COUNT]) -> Self {
-        Self {
-            one_minute: hps[hashrate::W_1M],
-            five_minutes: hps[hashrate::W_5M],
-            ten_minutes: hps[hashrate::W_10M],
-            one_hour: hps[hashrate::W_1H],
-            three_hours: hps[hashrate::W_3H],
-            six_hours: hps[hashrate::W_6H],
-            twenty_four_hours: hps[hashrate::W_24H],
-        }
-    }
-
-    /// Back to the `W_*`-indexed array, which is the order the Prometheus
-    /// window labels are in (`metrics::HASHRATE_WINDOW_LABELS`).
-    pub fn to_windows(self) -> [f64; hashrate::WINDOW_COUNT] {
-        let mut out = [0.0; hashrate::WINDOW_COUNT];
-        out[hashrate::W_1M] = self.one_minute;
-        out[hashrate::W_5M] = self.five_minutes;
-        out[hashrate::W_10M] = self.ten_minutes;
-        out[hashrate::W_1H] = self.one_hour;
-        out[hashrate::W_3H] = self.three_hours;
-        out[hashrate::W_6H] = self.six_hours;
-        out[hashrate::W_24H] = self.twenty_four_hours;
-        out
-    }
-
-    #[cfg(test)]
-    fn uniform(hps: f64) -> Self {
-        Self {
-            one_minute: hps,
-            five_minutes: hps,
-            ten_minutes: hps,
-            one_hour: hps,
-            three_hours: hps,
-            six_hours: hps,
-            twenty_four_hours: hps,
-        }
-    }
+hashrate_windows! {
+    one_minute => hashrate::W_1M,
+    five_minutes => hashrate::W_5M,
+    ten_minutes => hashrate::W_10M,
+    one_hour => hashrate::W_1H,
+    three_hours => hashrate::W_3H,
+    six_hours => hashrate::W_6H,
+    twenty_four_hours => hashrate::W_24H,
 }
 
 #[derive(Debug, Clone, Copy)]
