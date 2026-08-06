@@ -9,10 +9,51 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+### Added
+- Boot now fails when `[pool] coinbase_tag` plus the extranonce widths would
+  push the coinbase scriptSig past the 100-byte consensus limit. All of it is
+  operator-configured, so an over-long tag would otherwise only surface as a
+  `bad-cb-length` rejection on the one block the pool ever finds.
+
+### Changed
+- Blocks are submitted with the BIP141 witness reserved value (32 zero bytes)
+  already in the coinbase input's witness when the template carries a witness
+  commitment. Core's `submitblock` RPC inserts a missing one itself, so blocks
+  were being accepted, but the archived `found-blocks/*.hex` was not a block any
+  other path would take — P2P relay and Core's IPC mining interface both reject
+  it with `bad-witness-nonce-size`. `coinbase1`/`coinbase2` and the merkle root
+  keep using the stripped serialization, so the txid is unchanged.
+- Share statistics and metrics for SV1 and SV2 now go through one shared
+  accounting path, and rejection reasons are a closed enum rather than
+  duplicated string literals at each site.
+- SQLite persistence moved off the async runtime: writes are queued to a
+  dedicated writer thread, dashboard history queries run on the blocking pool,
+  and the database is opened with `journal_mode=WAL`, `synchronous=NORMAL` and a
+  5-second busy timeout. Share submissions and dashboard chart queries no longer
+  contend on one connection mutex.
+
 ### Fixed
 - Hashrate averages no longer restart from zero when the service restarts.
   Per-worker decay state is checkpointed with the chart history, restored from
   SQLite at startup, and decayed across the time the service was offline.
+- **Reported hashrate was inflated for miners that ignore `set_difficulty`.**
+  Shares are validated against the vardiff floor (so cgminer/Avalon firmware
+  pinned to its configure-time `minimum-difficulty` isn't rejected) but were
+  credited to the estimator at the session's current vardiff. A session that
+  keeps submitting below the difficulty it was sent is now detected — three
+  such shares outside a 30-second post-retarget grace window — and credited at
+  the floor instead, which is the threshold actually governing how often it
+  submits. Miners that honour `set_difficulty` are unaffected. The Prometheus
+  share-difficulty histogram now records the same credited value the dashboard
+  hashrate is built from; the two previously disagreed.
+- Shares submitted after a connection re-authorized under a different worker
+  name were credited to the previous name for the life of that connection.
+- Workers restored from the hashrate checkpoint that have not reconnected yet
+  showed a zero row in the dashboard worker table while still contributing to
+  the pool total.
+- Block height, network difficulty and the coinbase value on the dashboard are
+  now published by the template engine on every refresh instead of by each
+  miner session, so they stay current when no miner is connected.
 
 ## [0.1.3] - 2026-08-05
 

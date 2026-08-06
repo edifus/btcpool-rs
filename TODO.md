@@ -20,11 +20,11 @@ underflow panic). Line references are as of that review and may drift.
 ## Medium
 
 - [ ] **Move remaining blocking I/O off the async runtime.** `submit_block` is
-  done (PR #6); still direct: `getblocktemplate` in `TemplateEngine::refresh`,
-  SQLite best-share writes on the share-accept path (behind a sync mutex —
-  funnel through a dedicated writer thread, enable WAL + `synchronous=NORMAL`),
-  and the dashboard `/history` + `/chart` SQLite scans (contend with the share
-  path on the same connection mutex; wrap in `spawn_blocking`).
+  done (PR #6). SQLite is now done too: writes go to a dedicated `stats-writer`
+  thread over a bounded channel, the store opens with WAL +
+  `synchronous=NORMAL` + a busy timeout, and the dashboard `/history` +
+  `/chart` scans run under `spawn_blocking` against a separate read connection.
+  Still direct: `getblocktemplate` in `TemplateEngine::refresh`.
 - [x] **Harden the duplicate-share set** (shipped in v0.6.0, 2026-07-02):
   shares are recorded for dedup only after validation passes, and the
   per-session set clears on every clean-job broadcast (live-jobs scoping); the
