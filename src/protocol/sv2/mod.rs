@@ -22,7 +22,7 @@ mod noise;
 pub use noise::init as init_noise_authority;
 
 use crate::{
-    bitcoin::template::{bits_to_difficulty, build_job_for_payout, JobTemplate},
+    bitcoin::template::{build_job_for_payout, JobTemplate},
     config::{Config, VardiffConfig},
     metrics,
     mining::{
@@ -335,11 +335,6 @@ pub async fn run(
                             // ntime refresh: immediate job on the existing prev-hash.
                             if !send_job(&mut session, &mut writer, template.clone(), clean, peer).await {
                                 break;
-                            }
-                            metrics::update_job_height(template.height);
-                            session.stats.update_height(template.height, template.coinbase_value, template.transactions.len() as u64);
-                            if let Ok(net_diff) = bits_to_difficulty(&template.bits) {
-                                session.stats.set_network_difficulty(net_diff);
                             }
                         }
                         session.pending_template = Some(template);

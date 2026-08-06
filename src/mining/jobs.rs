@@ -79,7 +79,6 @@ mod tests {
             extranonce1_len: 0,
             extranonce2_len: 0,
             transactions: Arc::new(Vec::new()),
-            coinbase_value: 0,
             payout_address: "test".to_string(),
             has_witness_commitment: false,
         })

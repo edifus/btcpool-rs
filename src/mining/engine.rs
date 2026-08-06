@@ -71,16 +71,26 @@ pub struct TemplateEngine {
 
     /// Broadcast channel — sessions subscribe on connect
     job_tx: broadcast::Sender<JobBroadcast>,
+
+    /// Chain figures for the dashboard are published from here rather than from
+    /// the per-session broadcast handler: with no miners connected there is no
+    /// session to run that code, and the dashboard would sit on a stale height.
+    stats: Arc<crate::stats::PoolStats>,
 }
 
 impl TemplateEngine {
-    pub fn new(rpc: Arc<RpcClient>, pool_cfg: PoolConfig) -> Arc<Self> {
+    pub fn new(
+        rpc: Arc<RpcClient>,
+        pool_cfg: PoolConfig,
+        stats: Arc<crate::stats::PoolStats>,
+    ) -> Arc<Self> {
         let (job_tx, _) = broadcast::channel(JOB_BROADCAST_CAP);
         Arc::new(Self {
             rpc,
             pool_cfg,
             current_template: RwLock::new(None),
             job_tx,
+            stats,
         })
     }
 
@@ -139,6 +149,17 @@ impl TemplateEngine {
                         );
 
                         *self.current_template.write().await = Some(template.clone());
+
+                        self.stats.update_height(
+                            template.height,
+                            template.coinbase_value,
+                            template.transactions.len() as u64,
+                        );
+                        match template::bits_to_difficulty(&template.bits) {
+                            Ok(net_diff) => self.stats.set_network_difficulty(net_diff),
+                            Err(e) => warn!("Unusable nbits {}: {e}", template.bits),
+                        }
+                        metrics::update_job_height(template.height);
 
                         // Broadcast — ignore "no receivers" errors (normal before first miner)
                         let receiver_count = self.job_tx.receiver_count();

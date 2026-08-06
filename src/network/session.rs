@@ -12,7 +12,7 @@
 ///   - Submit latency tracking
 ///   - Security guards (rate limiting, invalid share counting, message size)
 use crate::{
-    bitcoin::template::{bits_to_difficulty, build_job_for_payout, JobTemplate, StratumJob},
+    bitcoin::template::{build_job_for_payout, JobTemplate, StratumJob},
     config::{Config, VardiffConfig},
     error::PoolError,
     metrics,
@@ -303,13 +303,6 @@ pub async fn run(
 
                             if !send_messages(&writer, peer, msgs).await {
                                 break;
-                            }
-
-                            metrics::update_job_height(job.height);
-                            session.stats.update_height(job.height, job.coinbase_value, job.transactions.len() as u64);
-
-                            if let Ok(net_diff) = bits_to_difficulty(&job.bits) {
-                                session.stats.set_network_difficulty(net_diff);
                             }
                         } else {
                             session.current_template = Some(template);

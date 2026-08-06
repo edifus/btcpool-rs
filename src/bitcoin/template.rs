@@ -122,9 +122,6 @@ pub struct StratumJob {
     /// All transaction data (for block assembly)
     pub transactions: Arc<Vec<Vec<u8>>>,
 
-    /// Total block reward in satoshis (subsidy + fees), from GBT coinbasevalue
-    pub coinbase_value: u64,
-
     /// Network-checked destination encoded in this job's coinbase.
     pub payout_address: String,
 
@@ -254,7 +251,6 @@ pub fn build_job_for_payout(
         extranonce1_len,
         extranonce2_len,
         transactions: template.transactions.clone(),
-        coinbase_value: template.coinbase_value,
         payout_address: payout.address.clone(),
         has_witness_commitment: template.witness_commitment.is_some(),
     })
