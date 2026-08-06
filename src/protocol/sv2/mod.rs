@@ -695,7 +695,6 @@ async fn handle_submit(
 
     let mask = VERSION_ROLLING_MASK;
     let share_params = ShareParams {
-        worker: worker.clone(),
         job_id: job_entry.job.job_id.clone(),
         extranonce2: submit.extranonce.clone(),
         ntime: submit.ntime,

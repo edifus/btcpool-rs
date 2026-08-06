@@ -111,7 +111,7 @@ pub struct StratumJob {
     pub network_target: [u8; 32],
 
     /// Full serialized coinbase (for block assembly after share submit)
-    /// extranonce1 + extranonce2 slots are zero until filled by `assemble_coinbase`
+    /// extranonce1 + extranonce2 slots are zero until filled by `assemble_coinbase_into`
     pub coinbase_template: Vec<u8>,
 
     /// Byte offsets of the extranonce field inside `coinbase_template`
@@ -142,16 +142,29 @@ impl StratumJob {
     /// prefix length (`total - granted`) as long as the two still sum to the
     /// reserved width. A mismatched total leaves the region zeroed so the share
     /// simply fails validation instead of panicking.
-    pub fn assemble_coinbase(&self, extranonce1: &[u8], extranonce2: &[u8]) -> Vec<u8> {
-        let mut cb = self.coinbase_template.clone();
+    ///
+    /// `cb` is overwritten, not appended to: it is a caller-owned scratch buffer
+    /// so the share hot path can splice a coinbase per submit without allocating
+    /// (see `COINBASE_SCRATCH` in `mining::validator`).
+    pub fn assemble_coinbase_into(&self, extranonce1: &[u8], extranonce2: &[u8], cb: &mut Vec<u8>) {
+        cb.clear();
+        cb.extend_from_slice(&self.coinbase_template);
         let off = self.extranonce_offset;
         let total = self.extranonce1_len + self.extranonce2_len;
         let (p, m) = (extranonce1.len(), extranonce2.len());
         if p + m != total {
-            return cb;
+            return;
         }
         cb[off..off + p].copy_from_slice(extranonce1);
         cb[off + p..off + p + m].copy_from_slice(extranonce2);
+    }
+
+    /// Allocating form of [`Self::assemble_coinbase_into`], for tests only —
+    /// production callers pass a reused buffer.
+    #[cfg(test)]
+    pub fn assemble_coinbase(&self, extranonce1: &[u8], extranonce2: &[u8]) -> Vec<u8> {
+        let mut cb = Vec::new();
+        self.assemble_coinbase_into(extranonce1, extranonce2, &mut cb);
         cb
     }
 
@@ -722,6 +735,68 @@ mod tests {
             &[0x12, 0x34]
         );
         assert_eq!(assembled.len(), job.coinbase_template.len());
+    }
+
+    /// `assemble_coinbase_into` replaced a `coinbase_template.clone()` per
+    /// validated share. Pin the two properties that swap depends on: the bytes
+    /// are unchanged, and a reused buffer stops allocating.
+    #[test]
+    fn assemble_coinbase_into_matches_the_cloning_form() {
+        let payout = payout("address", vec![0x51]);
+        let job = build_job_for_payout(sample_template(), &payout, "/test/", 4, 4).unwrap();
+
+        // The reference: what the old implementation did — clone the template,
+        // then splice the extranonce in at the reserved offset.
+        let splice = |en1: &[u8], en2: &[u8]| -> Vec<u8> {
+            let mut cb = job.coinbase_template.clone();
+            let off = job.extranonce_offset;
+            if en1.len() + en2.len() == job.extranonce1_len + job.extranonce2_len {
+                cb[off..off + en1.len()].copy_from_slice(en1);
+                cb[off + en1.len()..off + en1.len() + en2.len()].copy_from_slice(en2);
+            }
+            cb
+        };
+
+        // Exact width, and the SV2-style split that shifts the boundary but
+        // still fills the reserved region.
+        for (en1, en2) in [
+            (vec![0xAB; 4], vec![0xCD; 4]),
+            (vec![0xAB; 6], vec![0xCD; 2]),
+        ] {
+            let mut buf = Vec::new();
+            job.assemble_coinbase_into(&en1, &en2, &mut buf);
+            assert_eq!(buf, splice(&en1, &en2));
+        }
+
+        // Width mismatch: the region must stay zeroed so the share fails
+        // validation on its merits rather than panicking.
+        let mut buf = Vec::new();
+        job.assemble_coinbase_into(&[0xAB; 4], &[0xCD; 3], &mut buf);
+        assert_eq!(buf, job.coinbase_template);
+        let off = job.extranonce_offset;
+        assert!(buf[off..off + 8].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn assemble_coinbase_into_reuses_buffer_capacity() {
+        let payout = payout("address", vec![0x51]);
+        let job = build_job_for_payout(sample_template(), &payout, "/test/", 4, 4).unwrap();
+
+        let mut buf = Vec::new();
+        job.assemble_coinbase_into(&[0x01; 4], &[0x02; 4], &mut buf);
+        let capacity_after_first = buf.capacity();
+
+        for n in 0..8u8 {
+            job.assemble_coinbase_into(&[n; 4], &[n; 4], &mut buf);
+            assert_eq!(
+                buf.capacity(),
+                capacity_after_first,
+                "a reused buffer must not reallocate"
+            );
+            assert_eq!(buf.len(), job.coinbase_template.len());
+            let off = job.extranonce_offset;
+            assert_eq!(&buf[off..off + 8], &[n; 8]);
+        }
     }
 
     /// The extranonce offset is now computed from the serialization layout

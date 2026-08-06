@@ -117,7 +117,7 @@ underflow panic). Line references are as of that review and may drift.
   `active_sessions` per call but disconnect decrements once, for the last name
   only. (Fixed alongside the authorization cap: same-name re-auth is a no-op,
   switching names releases the previous one.)
-- [ ] Hot-path cleanups: recompute hashrate windows only on accepted shares
+- [x] Hot-path cleanups: recompute hashrate windows only on accepted shares
   (today: 4 full deque scans per inbound message); move per-share hex/format
   allocations inside `debug!` so they're skipped when disabled; reuse a scratch
   buffer instead of cloning `coinbase_template` per share.
@@ -126,10 +126,29 @@ underflow panic). Line references are as of that review and may drift.
   - [x] Hashrate no longer performs deque scans per inbound message. Accepted
     shares add to per-session accumulators, and the ckpool-style decay task
     folds them into all seven windows every two seconds.
-  - [ ] Move the remaining eager per-share hex/format allocations behind the
-    relevant tracing level.
-  - [ ] Reuse a scratch buffer instead of cloning `coinbase_template` for each
-    validated share.
+
+  Completed (2026-08-06):
+  - [x] The three eager `String`s above the "Validating submitted share"
+    `debug!` are now field expressions inside it. `tracing` only evaluates
+    those when the callsite is enabled, so they cost nothing at the default
+    `info` level; log output is unchanged. The below-target `warn!` in the
+    validator now reuses `block_hash_display` instead of open-coding a second
+    reverse-and-encode.
+  - [x] `assemble_coinbase_into` splices into a caller-owned buffer, and the
+    validator holds one per blocking-pool thread (`COINBASE_SCRATCH`), so a
+    validated share no longer clones `coinbase_template`. Width-mismatch
+    behaviour is unchanged: the region stays zeroed and the share fails on its
+    merits.
+  - [x] Adjacent allocations in the same functions: dropped the never-read
+    `ShareParams.worker` (one `String` per share on both SV1 and SV2), stopped
+    building three throwaway `String`s in `mining.submit` parsing, and switched
+    `build_header`'s prev-hash decode to `hex::decode_to_slice` into a `[u8; 32]`
+    — which also turns a would-be `copy_from_slice` panic on a wrong-length
+    prev-hash into `PoolError::InvalidHeader`.
+
+  Not done, deliberately: the `metrics`/`stats` per-share label allocations
+  (`worker.to_string()` twice per accepted share, three times per rejected one).
+  Those need worker-name interning or a label-API change, not a cleanup.
 
 ## Planned features
 

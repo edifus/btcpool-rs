@@ -726,7 +726,6 @@ async fn handle_submit(
     };
 
     let share_params = ShareParams {
-        worker: worker.to_string(),
         job_id: params.job_id.clone(),
         extranonce2: params.extranonce2.clone(),
         ntime: params.ntime,
@@ -743,16 +742,14 @@ async fn handle_submit(
         },
     };
 
-    let extranonce2_hex = hex::encode(&params.extranonce2);
-    let ntime_hex = format!("{:08x}", params.ntime);
-    let nonce_hex = format!("{:08x}", params.nonce);
-
+    // Field expressions stay inside the macro: `tracing` only evaluates them when
+    // the callsite is enabled, so these cost nothing at the default `info` level.
     debug!(
         worker = worker,
         job_id = %params.job_id,
-        extranonce2 = %extranonce2_hex,
-        ntime = %ntime_hex,
-        nonce = %nonce_hex,
+        extranonce2 = %hex::encode(&params.extranonce2),
+        ntime = %format!("{:08x}", params.ntime),
+        nonce = %format!("{:08x}", params.nonce),
         version_bits = ?params.version_bits,
         session_version_rolling = session.version_rolling_enabled,
         session_mask = %format!("{:08x}", session.version_rolling_mask),

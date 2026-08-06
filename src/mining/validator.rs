@@ -13,7 +13,20 @@ use crate::{
     mining::jobs::JobEntry,
 };
 
-use std::collections::{HashSet, VecDeque};
+use std::{
+    cell::RefCell,
+    collections::{HashSet, VecDeque},
+};
+
+thread_local! {
+    /// Scratch buffer for the per-share coinbase splice.
+    ///
+    /// Validation only ever runs inside `spawn_blocking`, so this lives on the
+    /// blocking pool's threads and amortises to zero allocations after the first
+    /// share each thread handles. `validate_share_no_dedup` is not recursive and
+    /// calls nothing that re-enters it, so the `RefCell` cannot be double-borrowed.
+    static COINBASE_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BIP320 version-rolling mask
@@ -116,8 +129,6 @@ impl ShareSet {
 
 #[derive(Debug)]
 pub struct ShareParams {
-    #[allow(dead_code)]
-    pub worker: String,
     pub job_id: String,
     pub extranonce2: Vec<u8>,
     pub ntime: u32,
@@ -185,72 +196,75 @@ pub fn validate_share_no_dedup(
         });
     }
 
-    // ── 3. Assemble coinbase ──────────────────────────────────────────────────
-    let coinbase = job.assemble_coinbase(extranonce1, &params.extranonce2);
+    // Steps 3-9 borrow the thread-local coinbase scratch for the whole run so the
+    // splice, the merkle root and (on the block path) block assembly all read the
+    // same buffer without anyone allocating a fresh coinbase per share.
+    COINBASE_SCRATCH.with_borrow_mut(|coinbase| {
+        // ── 3. Assemble coinbase ──────────────────────────────────────────────
+        job.assemble_coinbase_into(extranonce1, &params.extranonce2, coinbase);
 
-    // ── 4. Compute merkle root ────────────────────────────────────────────────
-    let merkle_root = job.merkle_root(&coinbase);
+        // ── 4. Compute merkle root ────────────────────────────────────────────
+        let merkle_root = job.merkle_root(coinbase);
 
-    // ── 5. Resolve version (with optional BIP320 rolling) ────────────────────
-    let version = resolve_version(
-        job.version,
-        params.version_bits,
-        params.version_rolling_mask,
-    )?;
+        // ── 5. Resolve version (with optional BIP320 rolling) ────────────────
+        let version = resolve_version(
+            job.version,
+            params.version_bits,
+            params.version_rolling_mask,
+        )?;
 
-    // ── 7. Assemble 80-byte block header ─────────────────────────────────────
-    let header = build_header(
-        version,
-        &job.prev_hash,
-        &merkle_root,
-        params.ntime,
-        &job.bits,
-        params.nonce,
-    )?;
+        // ── 7. Assemble 80-byte block header ─────────────────────────────────
+        let header = build_header(
+            version,
+            &job.prev_hash,
+            &merkle_root,
+            params.ntime,
+            &job.bits,
+            params.nonce,
+        )?;
 
-    // ── 8. Double-SHA256 of header ────────────────────────────────────────────
-    let hash = double_sha256(&header);
+        // ── 8. Double-SHA256 of header ────────────────────────────────────────
+        let hash = double_sha256(&header);
 
-    // ── 9. Check hash meets pool share target ─────────────────────────────────
-    let share_target = difficulty_to_target(session_difficulty);
-    if !meets_target(&hash, &share_target) {
-        let mut hash_be = hash;
-        hash_be.reverse();
-        tracing::warn!(
-            hash_le = %hex::encode(hash),
-            hash_be = %hex::encode(hash_be),
-            share_target = %hex::encode(share_target),
-            session_difficulty = session_difficulty,
-            "Share failed target check"
-        );
-        return Err(PoolError::LowDifficulty);
-    }
+        // ── 9. Check hash meets pool share target ─────────────────────────────
+        let share_target = difficulty_to_target(session_difficulty);
+        if !meets_target(&hash, &share_target) {
+            tracing::warn!(
+                hash_le = %hex::encode(hash),
+                hash_be = %block_hash_display(&hash),
+                share_target = %hex::encode(share_target),
+                session_difficulty = session_difficulty,
+                "Share failed target check"
+            );
+            return Err(PoolError::LowDifficulty);
+        }
 
-    let hash_difficulty = hash_to_difficulty(&hash);
+        let hash_difficulty = hash_to_difficulty(&hash);
 
-    // ── 6. Check if hash also meets network target (BLOCK FOUND!) ────────────
-    if meets_target(&hash, &job.network_target) {
-        let block_hex = assemble_block_hex(
-            &header,
-            &coinbase,
-            &job.transactions,
-            job.has_witness_commitment,
-        );
-        tracing::info!(
-            "🎉 BLOCK FOUND! height={} hash={}",
-            job.height,
-            block_hash_display(&hash)
-        );
-        return Ok(ShareResult::Block {
+        // ── 6. Check if hash also meets network target (BLOCK FOUND!) ────────
+        if meets_target(&hash, &job.network_target) {
+            let block_hex = assemble_block_hex(
+                &header,
+                coinbase,
+                &job.transactions,
+                job.has_witness_commitment,
+            );
+            tracing::info!(
+                "🎉 BLOCK FOUND! height={} hash={}",
+                job.height,
+                block_hash_display(&hash)
+            );
+            return Ok(ShareResult::Block {
+                hash_difficulty,
+                block_hex,
+                hash,
+            });
+        }
+        Ok(ShareResult::Valid {
+            assigned_difficulty: session_difficulty,
             hash_difficulty,
-            block_hex,
             hash,
-        });
-    }
-    Ok(ShareResult::Valid {
-        assigned_difficulty: session_difficulty,
-        hash_difficulty,
-        hash,
+        })
     })
 }
 
@@ -303,9 +317,12 @@ fn build_header(
     // version (LE)
     header[..4].copy_from_slice(&version.to_le_bytes());
 
-    // prev_hash: un-stratum it (reverse each 4-byte word back)
-    let prev_bytes = hex::decode(stratum_prev_hash).map_err(|_| PoolError::InvalidHeader)?;
-    let mut prev_internal = prev_bytes.clone();
+    // prev_hash: un-stratum it (reverse each 4-byte word back).
+    // `decode_to_slice` also enforces the 64-char length, which the later
+    // `copy_from_slice` would otherwise turn into a panic.
+    let mut prev_internal = [0u8; 32];
+    hex::decode_to_slice(stratum_prev_hash, &mut prev_internal)
+        .map_err(|_| PoolError::InvalidHeader)?;
     for chunk in prev_internal.chunks_mut(4) {
         chunk.reverse();
     }
@@ -457,6 +474,31 @@ mod tests {
         );
         // The leading zeros of proof-of-work land at the wrong end without it.
         assert_ne!(block_hash_display(&genesis), hex::encode(genesis));
+    }
+
+    /// `prev_hash` is pool-generated and always 64 hex chars, so the old
+    /// `hex::decode` + `copy_from_slice` pair never tripped — but a wrong length
+    /// reached `copy_from_slice` and would have panicked inside the blocking
+    /// validation task. It is an error now.
+    #[test]
+    fn a_wrong_length_prev_hash_is_an_error_not_a_panic() {
+        let merkle = [0u8; 32];
+        for prev in ["", "abcd", &"00".repeat(31), &"00".repeat(33)] {
+            let err = build_header(0x2000_0000, prev, &merkle, 1_700_000_000, "1d00ffff", 0)
+                .expect_err("a prev_hash that is not 32 bytes must be rejected");
+            assert!(matches!(err, PoolError::InvalidHeader), "got {err:?}");
+        }
+
+        // The well-formed case still builds, with the stratum word-reversal applied.
+        assert!(build_header(
+            0x2000_0000,
+            &"00".repeat(32),
+            &merkle,
+            1_700_000_000,
+            "1d00ffff",
+            0
+        )
+        .is_ok());
     }
 
     #[test]
