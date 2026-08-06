@@ -98,6 +98,7 @@ underflow panic). Line references are as of that review and may drift.
   untrusted network (a shrinking niche), and client support for `stratum+ssl` is
   spotty (cgminer/Avalon yes; AxeOS/ESP-Miner version-dependent). Revisit only
   if a real user asks for it.
+- [ ] Cookie to save selected chart options for viewing in browser.
 
   Design notes for when/if that happens, so it doesn't become a support burden:
   - **rustls / `tokio-rustls`, not OpenSSL** — keeps the pure-Rust single-binary
