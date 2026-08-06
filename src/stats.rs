@@ -748,6 +748,14 @@ impl PoolStats {
 
     fn add_share_diff_at(&self, session_id: &str, worker: &str, difficulty: f64, now: Instant) {
         if let Some(mut entry) = self.session_hashrates.get_mut(session_id) {
+            // One connection may re-authorize under a different identity
+            // (`max_authorizations_per_session`) while keeping its session id.
+            // Follow the rename, or every later share keeps landing on the
+            // previous worker name. The decaying tail moves with it: it is the
+            // same physical rig either way.
+            if entry.worker != worker {
+                entry.worker = worker.to_string();
+            }
             entry.decay.add_share(difficulty);
             return;
         }
@@ -1407,6 +1415,33 @@ mod tests {
 
         drop(stats);
         std::fs::remove_file(db_path).ok();
+    }
+
+    /// One connection may re-authorize under a different identity. Shares after
+    /// the switch belong to the new name; before this was fixed they kept
+    /// landing on the old one for the life of the connection.
+    #[test]
+    fn shares_follow_a_session_that_re_authorizes_under_a_new_name() {
+        let stats = PoolStats::new_with_store(None);
+        let start = Instant::now();
+
+        stats.add_share_diff_at("session-1", "old-name", 4_096.0, start);
+        stats.tick_hashrates_at(start + Duration::from_secs(2));
+        assert!(stats.hashrates_by_worker().contains_key("old-name"));
+
+        stats.add_share_diff_at("session-1", "new-name", 4_096.0, start);
+        stats.tick_hashrates_at(start + Duration::from_secs(4));
+
+        let by_worker = stats.hashrates_by_worker();
+        assert!(
+            by_worker.contains_key("new-name"),
+            "shares still credited to the previous identity: {:?}",
+            by_worker.keys().collect::<Vec<_>>()
+        );
+        assert!(!by_worker.contains_key("old-name"));
+        // The decaying tail moved with the session — it is the same rig — so no
+        // hashrate was lost or duplicated by the rename.
+        assert_eq!(stats.session_hashrates.len(), 1);
     }
 
     #[test]
