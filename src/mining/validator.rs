@@ -230,7 +230,12 @@ pub fn validate_share_no_dedup(
 
     // ── 6. Check if hash also meets network target (BLOCK FOUND!) ────────────
     if meets_target(&hash, &job.network_target) {
-        let block_hex = assemble_block_hex(&header, &coinbase, &job.transactions);
+        let block_hex = assemble_block_hex(
+            &header,
+            &coinbase,
+            &job.transactions,
+            job.has_witness_commitment,
+        );
         tracing::info!(
             "🎉 BLOCK FOUND! height={} hash={}",
             job.height,
@@ -323,7 +328,24 @@ fn build_header(
 }
 
 /// Serialise the complete block as hex for submitblock.
-fn assemble_block_hex(header: &[u8; 80], coinbase: &[u8], transactions: &[Vec<u8>]) -> String {
+fn assemble_block_hex(
+    header: &[u8; 80],
+    coinbase: &[u8],
+    transactions: &[Vec<u8>],
+    has_witness_commitment: bool,
+) -> String {
+    let with_witness;
+    let coinbase = match has_witness_commitment
+        .then(|| coinbase_with_witness_reserved_value(coinbase))
+        .flatten()
+    {
+        Some(bytes) => {
+            with_witness = bytes;
+            &with_witness[..]
+        }
+        None => coinbase,
+    };
+
     let mut block = Vec::with_capacity(
         80 + coinbase.len() + transactions.iter().map(|t| t.len()).sum::<usize>() + 16,
     );
@@ -342,6 +364,34 @@ fn assemble_block_hex(header: &[u8; 80], coinbase: &[u8], transactions: &[Vec<u8
     }
 
     hex::encode(block)
+}
+
+/// Re-serialise the coinbase with the BIP141 witness reserved value in its
+/// input's witness, for block submission only.
+///
+/// A block whose coinbase carries the witness-commitment output must also carry
+/// "a single 32-byte array for the witness reserved value" in the coinbase
+/// input's witness, or it is rejected with `bad-witness-nonce-size`. The value
+/// is 32 zero bytes: that is what Core's `getblocktemplate` computed
+/// `default_witness_commitment` against.
+///
+/// Core's `submitblock` RPC repairs a missing one for us today
+/// (`UpdateUncommittedBlockStructures`), which is why the pool has been mining
+/// acceptable blocks without it — but nothing else does. The archived
+/// `found-blocks/*.hex`, a block relayed over P2P, and Core's newer IPC mining
+/// interface all need the witness to be there already.
+///
+/// Only the block encoding changes: `coinbase1`/`coinbase2` and the merkle root
+/// keep using the stripped serialisation, since the txid is computed over that.
+fn coinbase_with_witness_reserved_value(coinbase: &[u8]) -> Option<Vec<u8>> {
+    use bitcoin::{
+        consensus::encode::{deserialize, serialize},
+        Transaction, Witness,
+    };
+
+    let mut tx: Transaction = deserialize(coinbase).ok()?;
+    tx.input.first_mut()?.witness = Witness::from_slice(&[[0u8; 32]]);
+    Some(serialize(&tx))
 }
 
 /// Check `hash < target` (both 32-byte big-endian).
@@ -485,6 +535,71 @@ mod tests {
         // Double-insert of a present key must not grow the FIFO or evict.
         ss.insert(keys[5].clone());
         assert!(ss.contains(&keys[2]));
+    }
+
+    /// BIP141: a block carrying the witness commitment must carry the 32-byte
+    /// witness reserved value in its coinbase input, and adding it must not
+    /// disturb the txid the merkle root commits to.
+    #[test]
+    fn submitted_block_coinbase_carries_the_witness_reserved_value() {
+        use crate::bitcoin::template::{bits_to_target, build_job_for_payout, JobTemplate};
+        use crate::mining::identity::PayoutDescriptor;
+        use bitcoin::{consensus::encode::deserialize, ScriptBuf, Transaction};
+        use std::sync::Arc;
+
+        // Shaped like GBT's default_witness_commitment: OP_RETURN OP_36
+        // aa21a9ed ‖ 32-byte commitment.
+        let mut commitment = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commitment.extend_from_slice(&[0x11; 32]);
+
+        let template = Arc::new(JobTemplate {
+            prev_hash: "00".repeat(32),
+            merkle_branch: Vec::new(),
+            merkle_branch_raw: Vec::new(),
+            version: 0x2000_0000,
+            bits: "1d00ffff".to_string(),
+            cur_time: 1_700_000_000,
+            height: 900_000,
+            network_target: bits_to_target("1d00ffff").unwrap(),
+            transactions: Arc::new(Vec::new()),
+            coinbase_value: 312_500_000,
+            witness_commitment: Some(commitment),
+        });
+        let payout = PayoutDescriptor {
+            address: "address".to_string(),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        };
+        let job = build_job_for_payout(template, &payout, "/test/", 4, 4).unwrap();
+        assert!(job.has_witness_commitment);
+
+        let coinbase = job.assemble_coinbase(&[1, 2, 3, 4], &[5, 6, 7, 8]);
+        let stripped: Transaction = deserialize(&coinbase).unwrap();
+
+        let block = hex::decode(assemble_block_hex(&[0u8; 80], &coinbase, &[], true)).unwrap();
+        // header ‖ tx-count varint (1 byte, value 1) ‖ coinbase
+        assert_eq!(block[80], 1);
+        let submitted: Transaction = deserialize(&block[81..]).unwrap();
+
+        let witness = &submitted.input[0].witness;
+        assert_eq!(witness.len(), 1, "expected exactly one witness item");
+        assert_eq!(witness.iter().next().unwrap(), &[0u8; 32][..]);
+        assert_eq!(
+            submitted.compute_txid(),
+            stripped.compute_txid(),
+            "adding the witness must not change the txid the merkle root commits to"
+        );
+    }
+
+    /// Without a commitment output a witness would be `unexpected-witness`.
+    #[test]
+    fn block_without_a_commitment_keeps_a_bare_coinbase() {
+        let coinbase = hex::decode(
+            "01000000010000000000000000000000000000000000000000000000000000000000000000\
+             ffffffff0403a0bb0dffffffff0100f2052a01000000015100000000",
+        )
+        .unwrap();
+        let block = hex::decode(assemble_block_hex(&[0u8; 80], &coinbase, &[], false)).unwrap();
+        assert_eq!(&block[81..], &coinbase[..]);
     }
 
     #[test]

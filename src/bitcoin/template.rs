@@ -127,6 +127,11 @@ pub struct StratumJob {
 
     /// Network-checked destination encoded in this job's coinbase.
     pub payout_address: String,
+
+    /// Whether this job's coinbase carries the BIP141 witness commitment
+    /// output. When it does, the assembled *block* must also carry the witness
+    /// reserved value in the coinbase input (see `assemble_block_hex`).
+    pub has_witness_commitment: bool,
 }
 
 impl StratumJob {
@@ -251,6 +256,7 @@ pub fn build_job_for_payout(
         transactions: template.transactions.clone(),
         coinbase_value: template.coinbase_value,
         payout_address: payout.address.clone(),
+        has_witness_commitment: template.witness_commitment.is_some(),
     })
 }
 

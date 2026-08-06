@@ -81,6 +81,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             coinbase_value: 0,
             payout_address: "test".to_string(),
+            has_witness_commitment: false,
         })
     }
 

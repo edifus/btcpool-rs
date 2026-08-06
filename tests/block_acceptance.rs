@@ -639,6 +639,32 @@ json = false
         "block-1 coinbase scriptSig should start with OP_1 (0x51): {script_sig}"
     );
 
+    // BIP141: a block carrying the witness commitment must carry the 32-byte
+    // witness reserved value in its coinbase input. `submitblock` inserts a
+    // missing one itself, so this asserts the *pool* produced it — the archived
+    // block hex and any non-submitblock path depend on that.
+    //
+    // Segwit is active from height 0 on regtest, so getblocktemplate always
+    // returns default_witness_commitment and the pool always adds the output;
+    // assert that rather than guarding, or a silent skip would pass forever.
+    assert!(
+        coinbase["vout"].as_array().unwrap().iter().any(|out| {
+            out["scriptPubKey"]["hex"]
+                .as_str()
+                .is_some_and(|hex| hex.starts_with("6a24aa21a9ed"))
+        }),
+        "coinbase is missing the witness commitment output: {coinbase}"
+    );
+    let witness = coinbase["vin"][0]["txinwitness"]
+        .as_array()
+        .expect("coinbase has a witness commitment but no txinwitness");
+    assert_eq!(witness.len(), 1, "expected one witness item: {witness:?}");
+    assert_eq!(
+        witness[0].as_str().unwrap(),
+        "0".repeat(64),
+        "witness reserved value must be 32 zero bytes"
+    );
+
     let archived = std::fs::read_dir(tmp.join("found-blocks"))
         .map(|d| d.count())
         .unwrap_or(0);
