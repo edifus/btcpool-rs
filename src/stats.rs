@@ -137,13 +137,78 @@ struct SessionHashrate {
 // Persistent store for all-time metrics
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A persisted update, applied by the writer thread.
+///
+/// Every write originates on an async task — the share hot path, the snapshot
+/// ticker, the pruner — so none of them may touch the disk directly. They hand
+/// the work to one thread that owns the write connection instead, which also
+/// removes the lock contention that used to put dashboard queries and share
+/// submissions on the same mutex.
+enum StoreWrite {
+    BestShare(u64),
+    BestHashrate(f64),
+    WorkerBestShare {
+        worker: String,
+        difficulty: u64,
+    },
+    Snapshot {
+        history_ts: u64,
+        state_ts: u64,
+        rates: HashrateWindows,
+        worker_rates: HashMap<String, HashrateWindows>,
+    },
+    PruneWorkerBestShares(usize),
+    /// Barrier: acknowledged once every write queued before it has been
+    /// applied. Production flushes by dropping the store instead.
+    #[cfg(test)]
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// Pending writes allowed before new ones are dropped. Each is a few hundred
+/// bytes and the writer drains them in microseconds; a backlog this deep means
+/// the disk is gone, and dropping a best-share update is better than stalling
+/// the share path.
+const WRITE_QUEUE_DEPTH: usize = 256;
+
 struct StatsStore {
-    conn: Mutex<Connection>,
+    /// Read connection. Only touched from `spawn_blocking` (dashboard queries)
+    /// and at boot, so it never blocks a runtime worker thread.
+    read: Mutex<Connection>,
+    /// `None` only while dropping, which is what closes the channel and lets
+    /// the writer thread finish.
+    writes: Option<std::sync::mpsc::SyncSender<StoreWrite>>,
+    writer: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for StatsStore {
+    /// Flush before going away: closing the channel ends `writer_loop` once it
+    /// has drained the queue, and the join waits for that. Without this a
+    /// process that shuts down promptly — or a test that reopens the same file
+    /// — could lose the last few queued updates.
+    fn drop(&mut self) {
+        self.writes.take();
+        if let Some(handle) = self.writer.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl StatsStore {
-    fn open(path: &str) -> Result<Self, rusqlite::Error> {
+    /// Open a connection with the pragmas this workload wants: WAL so the
+    /// dashboard's reads never block the writer (and vice versa), `NORMAL`
+    /// syncing so a 10-second snapshot doesn't fsync twice, and a busy timeout
+    /// so a concurrent `sqlite3` session on the same file cannot make writes
+    /// fail outright.
+    fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
         let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(conn)
+    }
+
+    fn open(path: &str) -> Result<Self, rusqlite::Error> {
+        let conn = Self::connect(path)?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS pool_stats (
              id INTEGER PRIMARY KEY CHECK(id = 1),
@@ -195,34 +260,63 @@ impl StatsStore {
         Self::migrate_hashrate_history(&conn)?;
         Self::migrate_hashrate_algo(&conn)?;
 
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
-        // Enforce the row cap at boot so an attacker-inflated table from a
-        // previous run is trimmed before load_values pulls it into RAM.
-        store.prune_worker_best_shares(MAX_WORKER_BEST_SHARES);
-        Ok(store)
+        // Enforce the row cap at boot, synchronously and before the writer
+        // thread exists, so an attacker-inflated table from a previous run is
+        // trimmed before `load_values` pulls it into RAM.
+        prune_worker_best_shares(&conn, MAX_WORKER_BEST_SHARES);
+
+        let writer_conn = Self::connect(path)?;
+        let (writes, rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_DEPTH);
+        let writer = std::thread::Builder::new()
+            .name("stats-writer".into())
+            .spawn(move || writer_loop(writer_conn, rx))
+            .map_err(|e| {
+                rusqlite::Error::InvalidParameterName(format!("spawn stats writer thread: {e}"))
+            })?;
+
+        Ok(Self {
+            read: Mutex::new(conn),
+            writes: Some(writes),
+            writer: Some(writer),
+        })
     }
 
-    /// Keep only the `keep` highest-difficulty rows in `worker_best_shares`.
-    fn prune_worker_best_shares(&self, keep: usize) {
-        match self.conn.lock().execute(
-            "DELETE FROM worker_best_shares WHERE worker NOT IN (
-               SELECT worker FROM worker_best_shares
-               ORDER BY best_share_difficulty DESC LIMIT ?1
-             )",
-            params![keep as i64],
-        ) {
-            Ok(0) => {}
-            Ok(n) => info!("Pruned {n} stale worker_best_shares rows (cap {keep})"),
-            Err(e) => warn!("Failed to prune worker_best_shares: {e}"),
+    /// Queue a write. Never blocks: persistence is best-effort next to serving
+    /// miners, so a wedged disk costs a stat, not a share.
+    fn enqueue(&self, write: StoreWrite) {
+        use std::sync::mpsc::TrySendError;
+        let Some(writes) = self.writes.as_ref() else {
+            return; // shutting down
+        };
+        match writes.try_send(write) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                warn!("Stats writer queue full — dropping a persisted stats update")
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                static GONE: std::sync::Once = std::sync::Once::new();
+                GONE.call_once(|| {
+                    warn!("Stats writer thread has stopped; stats are no longer persisted")
+                });
+            }
+        }
+    }
+
+    /// Block until every write queued so far has been applied.
+    #[cfg(test)]
+    fn flush(&self) {
+        let (ack, done) = std::sync::mpsc::channel();
+        if let Some(writes) = self.writes.as_ref() {
+            if writes.send(StoreWrite::Flush(ack)).is_ok() {
+                let _ = done.recv();
+            }
         }
     }
 
     fn load_values(
         &self,
     ) -> Result<(u64, f64, std::collections::HashMap<String, u64>), rusqlite::Error> {
-        let conn = self.conn.lock();
+        let conn = self.read.lock();
         let mut stmt = conn.prepare(
             "SELECT best_share_difficulty, best_hashrate_hps FROM pool_stats WHERE id = 1",
         )?;
@@ -249,7 +343,7 @@ impl StatsStore {
     }
 
     fn load_hashrate_state(&self) -> Result<Vec<PersistedWorkerHashrate>, rusqlite::Error> {
-        let conn = self.conn.lock();
+        let conn = self.read.lock();
         let mut stmt = conn.prepare(
             "SELECT worker, updated_ts,
                     hashrate_1m_hps, hashrate_5m_hps, hashrate_10m_hps,
@@ -275,28 +369,38 @@ impl StatsStore {
         rows.collect()
     }
 
-    // The `?1 > ...` guards (matching set_worker_best_share) make the writes
-    // monotonic at the SQL level: two racing writers can call these out of
-    // order, and a stale lower value must not overwrite a higher one already
-    // persisted.
     fn set_best_share_difficulty(&self, difficulty: u64) {
-        if let Err(e) = self.conn.lock().execute(
-            "UPDATE pool_stats SET best_share_difficulty = ?1
-             WHERE id = 1 AND ?1 > best_share_difficulty",
-            params![difficulty],
-        ) {
-            warn!("Failed to persist best_share_difficulty: {e}");
-        }
+        self.enqueue(StoreWrite::BestShare(difficulty));
     }
 
     fn set_best_hashrate_hps(&self, hps: f64) {
-        if let Err(e) = self.conn.lock().execute(
-            "UPDATE pool_stats SET best_hashrate_hps = ?1
-             WHERE id = 1 AND ?1 > best_hashrate_hps",
-            params![hps],
-        ) {
-            warn!("Failed to persist best_hashrate_hps: {e}");
-        }
+        self.enqueue(StoreWrite::BestHashrate(hps));
+    }
+
+    fn set_worker_best_share(&self, worker: &str, difficulty: u64) {
+        self.enqueue(StoreWrite::WorkerBestShare {
+            worker: worker.to_string(),
+            difficulty,
+        });
+    }
+
+    fn prune_worker_best_shares(&self, keep: usize) {
+        self.enqueue(StoreWrite::PruneWorkerBestShares(keep));
+    }
+
+    fn record_hashrate_snapshot(
+        &self,
+        history_ts: u64,
+        state_ts: u64,
+        rates: HashrateWindows,
+        worker_rates: &HashMap<String, HashrateWindows>,
+    ) {
+        self.enqueue(StoreWrite::Snapshot {
+            history_ts,
+            state_ts,
+            rates,
+            worker_rates: worker_rates.clone(),
+        });
     }
 
     fn migrate_hashrate_history(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -377,82 +481,8 @@ impl StatsStore {
         Ok(())
     }
 
-    fn record_hashrate_snapshot(
-        &self,
-        history_ts: u64,
-        state_ts: u64,
-        rates: HashrateWindows,
-        worker_rates: &HashMap<String, HashrateWindows>,
-    ) {
-        let mut conn = self.conn.lock();
-        let result = (|| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
-            tx.execute(
-                "INSERT OR REPLACE INTO hashrate_history (
-                   ts, hashrate_hps, hashrate_1m_hps, hashrate_5m_hps,
-                   hashrate_1h_hps, hashrate_6h_hps, hashrate_24h_hps
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    history_ts,
-                    rates.ten_minutes,
-                    rates.one_minute,
-                    rates.five_minutes,
-                    rates.one_hour,
-                    rates.six_hours,
-                    rates.twenty_four_hours,
-                ],
-            )?;
-
-            // Replace the whole checkpoint atomically so workers whose tails
-            // have fully decayed do not reappear after a later restart.
-            tx.execute("DELETE FROM worker_hashrate_state", [])?;
-            {
-                let mut stmt = tx.prepare(
-                    "INSERT INTO worker_hashrate_state (
-                       worker, updated_ts, hashrate_1m_hps, hashrate_5m_hps,
-                       hashrate_10m_hps, hashrate_1h_hps, hashrate_3h_hps,
-                       hashrate_6h_hps, hashrate_24h_hps
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                )?;
-                for (worker, worker_rate) in worker_rates {
-                    stmt.execute(params![
-                        worker,
-                        state_ts,
-                        worker_rate.one_minute,
-                        worker_rate.five_minutes,
-                        worker_rate.ten_minutes,
-                        worker_rate.one_hour,
-                        worker_rate.three_hours,
-                        worker_rate.six_hours,
-                        worker_rate.twenty_four_hours,
-                    ])?;
-                }
-            }
-            tx.commit()
-        })();
-        if let Err(e) = result {
-            warn!("Failed to record hashrate snapshot: {e}");
-            return;
-        }
-        // Thin samples past the fine-grained retention down to one a minute.
-        // Charts covering more than a couple of days bucket at 5 minutes or
-        // coarser anyway, so the extra resolution buys nothing while the row
-        // count grows by SNAPSHOT_INTERVAL_SECS⁻¹ every second.
-        let fine_cutoff = history_ts.saturating_sub(FINE_HISTORY_RETENTION_SECS);
-        let _ = conn.execute(
-            "DELETE FROM hashrate_history WHERE ts < ?1 AND ts % 60 != 0",
-            params![fine_cutoff],
-        );
-        // Prune entries older than 6 months
-        let cutoff = history_ts.saturating_sub(6 * 30 * 24 * 3600);
-        let _ = conn.execute(
-            "DELETE FROM hashrate_history WHERE ts < ?1",
-            params![cutoff],
-        );
-    }
-
     fn get_hashrate_history(&self, since_ts: u64, bucket_secs: u64) -> Vec<HashrateHistoryPoint> {
-        let conn = self.conn.lock();
+        let conn = self.read.lock();
         let mut stmt = match conn.prepare(
             "SELECT (ts / ?2) * ?2 AS bucket_ts,
                     AVG(hashrate_1m_hps), AVG(hashrate_5m_hps), AVG(hashrate_hps),
@@ -479,16 +509,150 @@ impl StatsStore {
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
     }
+}
 
-    fn set_worker_best_share(&self, worker: &str, difficulty: u64) {
-        if let Err(e) = self.conn.lock().execute(
-            "INSERT INTO worker_best_shares (worker, best_share_difficulty) VALUES (?1, ?2)
-             ON CONFLICT(worker) DO UPDATE SET best_share_difficulty = excluded.best_share_difficulty
-             WHERE excluded.best_share_difficulty > worker_best_shares.best_share_difficulty",
-            params![worker, difficulty],
-        ) {
-            warn!("Failed to persist worker_best_share for {worker}: {e}");
+// ─────────────────────────────────────────────────────────────────────────────
+// Writer thread
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Drain queued writes until the store is dropped. Owns the only write
+/// connection, so SQLite never sees two writers and every statement below runs
+/// off the async runtime.
+fn writer_loop(conn: Connection, rx: std::sync::mpsc::Receiver<StoreWrite>) {
+    while let Ok(write) = rx.recv() {
+        if let Err(e) = apply_write(&conn, write) {
+            warn!("Failed to persist stats update: {e}");
         }
+    }
+}
+
+fn apply_write(conn: &Connection, write: StoreWrite) -> Result<(), rusqlite::Error> {
+    match write {
+        // The `?1 > ...` guards keep the watermarks monotonic at the SQL level:
+        // updates can be queued out of order, and a stale lower value must not
+        // overwrite a higher one already persisted.
+        StoreWrite::BestShare(difficulty) => {
+            conn.execute(
+                "UPDATE pool_stats SET best_share_difficulty = ?1
+                 WHERE id = 1 AND ?1 > best_share_difficulty",
+                params![difficulty],
+            )?;
+        }
+        StoreWrite::BestHashrate(hps) => {
+            conn.execute(
+                "UPDATE pool_stats SET best_hashrate_hps = ?1
+                 WHERE id = 1 AND ?1 > best_hashrate_hps",
+                params![hps],
+            )?;
+        }
+        StoreWrite::WorkerBestShare { worker, difficulty } => {
+            conn.execute(
+                "INSERT INTO worker_best_shares (worker, best_share_difficulty) VALUES (?1, ?2)
+                 ON CONFLICT(worker) DO UPDATE SET best_share_difficulty = excluded.best_share_difficulty
+                 WHERE excluded.best_share_difficulty > worker_best_shares.best_share_difficulty",
+                params![worker, difficulty],
+            )?;
+        }
+        StoreWrite::PruneWorkerBestShares(keep) => {
+            prune_worker_best_shares(conn, keep);
+        }
+        StoreWrite::Snapshot {
+            history_ts,
+            state_ts,
+            rates,
+            worker_rates,
+        } => write_snapshot(conn, history_ts, state_ts, rates, &worker_rates)?,
+        #[cfg(test)]
+        StoreWrite::Flush(ack) => {
+            let _ = ack.send(());
+        }
+    }
+    Ok(())
+}
+
+fn write_snapshot(
+    conn: &Connection,
+    history_ts: u64,
+    state_ts: u64,
+    rates: HashrateWindows,
+    worker_rates: &HashMap<String, HashrateWindows>,
+) -> Result<(), rusqlite::Error> {
+    {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO hashrate_history (
+               ts, hashrate_hps, hashrate_1m_hps, hashrate_5m_hps,
+               hashrate_1h_hps, hashrate_6h_hps, hashrate_24h_hps
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                history_ts,
+                rates.ten_minutes,
+                rates.one_minute,
+                rates.five_minutes,
+                rates.one_hour,
+                rates.six_hours,
+                rates.twenty_four_hours,
+            ],
+        )?;
+
+        // Replace the whole checkpoint atomically so workers whose tails
+        // have fully decayed do not reappear after a later restart.
+        tx.execute("DELETE FROM worker_hashrate_state", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO worker_hashrate_state (
+                   worker, updated_ts, hashrate_1m_hps, hashrate_5m_hps,
+                   hashrate_10m_hps, hashrate_1h_hps, hashrate_3h_hps,
+                   hashrate_6h_hps, hashrate_24h_hps
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for (worker, worker_rate) in worker_rates {
+                stmt.execute(params![
+                    worker,
+                    state_ts,
+                    worker_rate.one_minute,
+                    worker_rate.five_minutes,
+                    worker_rate.ten_minutes,
+                    worker_rate.one_hour,
+                    worker_rate.three_hours,
+                    worker_rate.six_hours,
+                    worker_rate.twenty_four_hours,
+                ])?;
+            }
+        }
+        tx.commit()?;
+    }
+
+    // Thin samples past the fine-grained retention down to one a minute.
+    // Charts covering more than a couple of days bucket at 5 minutes or
+    // coarser anyway, so the extra resolution buys nothing while the row
+    // count grows by SNAPSHOT_INTERVAL_SECS⁻¹ every second.
+    let fine_cutoff = history_ts.saturating_sub(FINE_HISTORY_RETENTION_SECS);
+    conn.execute(
+        "DELETE FROM hashrate_history WHERE ts < ?1 AND ts % 60 != 0",
+        params![fine_cutoff],
+    )?;
+    // Prune entries older than 6 months
+    let cutoff = history_ts.saturating_sub(6 * 30 * 24 * 3600);
+    conn.execute(
+        "DELETE FROM hashrate_history WHERE ts < ?1",
+        params![cutoff],
+    )?;
+    Ok(())
+}
+
+/// Keep only the `keep` highest-difficulty rows in `worker_best_shares`.
+fn prune_worker_best_shares(conn: &Connection, keep: usize) {
+    match conn.execute(
+        "DELETE FROM worker_best_shares WHERE worker NOT IN (
+           SELECT worker FROM worker_best_shares
+           ORDER BY best_share_difficulty DESC LIMIT ?1
+         )",
+        params![keep as i64],
+    ) {
+        Ok(0) => {}
+        Ok(n) => info!("Pruned {n} stale worker_best_shares rows (cap {keep})"),
+        Err(e) => warn!("Failed to prune worker_best_shares: {e}"),
     }
 }
 
@@ -497,26 +661,26 @@ impl StatsStore {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct PoolStats {
-    pub shares_accepted: AtomicU64,
-    pub shares_rejected: AtomicU64,
-    pub blocks_found: AtomicU64,
-    pub connected_miners: AtomicU64,
-    pub current_height: AtomicU64,
-    pub current_coinbase_value: AtomicU64,
-    pub current_block_transaction_count: AtomicU64,
-    pub best_share_difficulty: AtomicU64,
-    pub session_best_share_difficulty: AtomicU64,
-    pub best_hashrate_hps: AtomicU64,
-    pub session_best_hashrate_hps: AtomicU64,
-    pub network_hashrate_hps: AtomicU64,
-    pub network_difficulty: AtomicU64,
+    shares_accepted: AtomicU64,
+    shares_rejected: AtomicU64,
+    blocks_found: AtomicU64,
+    connected_miners: AtomicU64,
+    current_height: AtomicU64,
+    current_coinbase_value: AtomicU64,
+    current_block_transaction_count: AtomicU64,
+    best_share_difficulty: AtomicU64,
+    session_best_share_difficulty: AtomicU64,
+    best_hashrate_hps: AtomicU64,
+    session_best_hashrate_hps: AtomicU64,
+    network_hashrate_hps: AtomicU64,
+    network_difficulty: AtomicU64,
     /// Estimated difficulty change (%) at the next retarget, from epoch timestamps.
     /// Stored as f64::to_bits; NaN until first polled / right after a retarget.
-    pub est_difficulty_change_pct: AtomicU64,
-    pub last_block_worker: Mutex<Option<String>>,
-    pub last_block_payout: Mutex<Option<String>>,
-    pub last_block_hash: Mutex<Option<String>>,
-    pub last_block_ts: AtomicU64,
+    est_difficulty_change_pct: AtomicU64,
+    last_block_worker: Mutex<Option<String>>,
+    last_block_payout: Mutex<Option<String>>,
+    last_block_hash: Mutex<Option<String>>,
+    last_block_ts: AtomicU64,
     /// Per-connection decaying hashrate state, keyed by session id. Shares are
     /// accumulated here as they arrive and folded into the averages by
     /// `tick_hashrates` on a fixed cadence; an entry that stops receiving
@@ -1583,8 +1747,9 @@ mod tests {
                 &worker_rates,
             );
             // Pretend it was written before the estimator changed.
+            store.flush();
             store
-                .conn
+                .read
                 .lock()
                 .execute(
                     "UPDATE pool_stats SET hashrate_algo_version = 0 WHERE id = 1",
@@ -1617,6 +1782,7 @@ mod tests {
         let store = StatsStore::open(&db_path).unwrap();
         store.record_hashrate_snapshot(120, 120, HashrateWindows::uniform(10.0), &HashMap::new());
         store.record_hashrate_snapshot(150, 150, HashrateWindows::uniform(20.0), &HashMap::new());
+        store.flush();
 
         let history = store.get_hashrate_history(0, 60);
         assert_eq!(history.len(), 1);
@@ -1646,6 +1812,7 @@ mod tests {
             let ts = base + i * SNAPSHOT_INTERVAL_SECS;
             store.record_hashrate_snapshot(ts, ts, HashrateWindows::uniform(10.0), &HashMap::new());
         }
+        store.flush();
         assert_eq!(
             store.get_hashrate_history(0, SNAPSHOT_INTERVAL_SECS).len(),
             12
@@ -1654,6 +1821,7 @@ mod tests {
         // A sample far enough ahead pushes them past the horizon.
         let now = base + FINE_HISTORY_RETENTION_SECS + 600;
         store.record_hashrate_snapshot(now, now, HashrateWindows::uniform(20.0), &HashMap::new());
+        store.flush();
 
         let kept: Vec<u64> = store
             .get_hashrate_history(0, SNAPSHOT_INTERVAL_SECS)
