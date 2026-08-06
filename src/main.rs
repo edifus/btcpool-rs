@@ -140,6 +140,35 @@ async fn main() -> Result<()> {
         tokio::spawn(engine.run(new_block_rx));
     }
 
+    // ── Template freshness watchdog ───────────────────────────────────────────
+    // `/health` and Prometheus are both pull-based, so a freeze is invisible to
+    // an operator who only reads logs. This task is also the only one
+    // positioned to notice that `run`'s own task died: a panic there just stops
+    // the freshness atomics advancing, and nothing inside that task can report
+    // on its own death. Edge-triggered — one `error!` per staleness episode,
+    // not one per tick.
+    {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut was_stale = false;
+            loop {
+                ticker.tick().await;
+                let stale = !engine.is_template_fresh();
+                if stale && !was_stale {
+                    tracing::error!(
+                        age_secs = engine.template_age().as_secs(),
+                        "Template has not refreshed recently; pool may be serving a frozen job"
+                    );
+                } else if !stale && was_stale {
+                    tracing::info!("Template refreshes have recovered");
+                }
+                was_stale = stale;
+            }
+        });
+    }
+
     // ── SV2 Noise authority (before the dashboard, which shows the pubkey) ────
     let sv2_authority_pubkey = if config.sv2.enabled {
         let pubkey = protocol::sv2::init_noise_authority(&config.sv2)

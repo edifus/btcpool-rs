@@ -103,7 +103,6 @@ pub fn job_broadcast(miners_count: usize) {
     counter!("pool_job_broadcasts_total").increment(1);
 }
 
-#[allow(dead_code)]
 pub fn zmq_reconnect() {
     counter!("pool_zmq_reconnects_total").increment(1);
 }
@@ -151,4 +150,21 @@ pub fn update_worker_hashrate(worker: &str, windows: [f64; 7]) {
 
 pub fn update_job_height(height: u64) {
     gauge!("pool_job_height").set(height as f64);
+}
+
+/// Raw unix timestamp of the last fully successful template refresh — not an
+/// age, so PromQL derives freshness with
+/// `time() - pool_template_last_refresh_timestamp_seconds`, the same idiom as
+/// `process_start_time_seconds`. Lets operators pick an alerting threshold
+/// independent of `/health`'s fixed `TEMPLATE_STALE_AFTER` cutoff.
+pub fn update_template_last_refresh(unix_secs: u64) {
+    gauge!("pool_template_last_refresh_timestamp_seconds").set(unix_secs as f64);
+}
+
+/// A refresh derived `clean=true` that its caller did not request — the ntime
+/// timer, not the block-notification path, is what noticed the tip moved. One
+/// is a coincidence (the block landed between the notification firing and the
+/// timer tick); a handful in a row is evidence that path stopped delivering.
+pub fn tip_change_discovered_by_timer() {
+    counter!("pool_tip_changes_discovered_by_timer_total").increment(1);
 }

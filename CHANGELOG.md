@@ -10,12 +10,40 @@ everything else bumps the **patch** version.
 ## [Unreleased]
 
 ### Added
+- `GET /health` on the dashboard/metrics port: 200 with
+  `{"status":"ok","template_age_secs":N}` while the template is refreshing, 503
+  with `"status":"stale"` once it has not refreshed for 180 seconds — or before
+  the first refresh has ever landed, so a node that was already unreachable at
+  startup is visible immediately. Deliberately a readiness/alerting probe:
+  pointing a container `HEALTHCHECK` at it that restarts the process fixes
+  nothing when the freeze is upstream in bitcoind, and drops every connected
+  miner for no gain.
+- `pool_template_last_refresh_timestamp_seconds` — the raw unix timestamp of the
+  last successful template refresh, not an age, so freshness is
+  `time() - pool_template_last_refresh_timestamp_seconds` in PromQL and
+  operators can pick a threshold independent of `/health`'s fixed one.
+- `pool_tip_changes_discovered_by_timer_total` — counts tips the 30-second ntime
+  timer noticed before the block-notification path did. One is a coincidence; a
+  run of them is direct evidence that ZMQ has stopped delivering, which no
+  timeout can detect on a socket that connects but never publishes.
+- `pool_zmq_reconnects_total` now has a caller. It was declared and dead since
+  it was written, because nothing ever reconnected.
 - Boot now fails when `[pool] coinbase_tag` plus the extranonce widths would
   push the coinbase scriptSig past the 100-byte consensus limit. All of it is
   operator-configured, so an over-long tag would otherwise only surface as a
   `bad-cb-length` rejection on the one block the pool ever finds.
 
 ### Changed
+- **`[zmq] poll_fallback = true` now polls alongside ZMQ instead of only after
+  it fails.** It was a one-way switch armed by a ZMQ *error*, which meant it
+  never armed for the failure it was most needed for: `zmq_connect` is
+  asynchronous, so a wrong port or a node without `zmqpubhashblock` connects
+  successfully and then simply never publishes. There is no error to react to.
+  The cost is one `getbestblockhash` per `poll_interval_ms` (default 1 s)
+  forever, which is cheap and already runs off the async runtime.
+  `pool_rpc_fallback_used_total` correspondingly shifts meaning from "we had to
+  fall back" to "the backstop is enabled", and still fires exactly once, at
+  startup.
 - Blocks are submitted with the BIP141 witness reserved value (32 zero bytes)
   already in the coinbase input's witness when the template carries a witness
   commitment. Core's `submitblock` RPC inserts a missing one itself, so blocks
@@ -45,6 +73,28 @@ everything else bumps the **patch** version.
   recur.
 
 ### Fixed
+- **The template engine could stop refreshing without anyone noticing.** The ZMQ
+  listener had no reconnect — a single receive error ended it permanently. With
+  `poll_fallback = false` that dropped the only `watch::Sender`, and the
+  template loop `break`ed out on the closed channel, taking the 30-second ntime
+  refresh with it. The pool then served one frozen template until restart, with
+  a single `warn!` as the only evidence. The listener is now supervised and
+  reconnects forever with capped exponential backoff (1 s → 60 s), so the sender
+  is never dropped; the refresh loop additionally survives a closed channel by
+  latching that `select!` branch off and running on the ntime timer alone.
+- **A tip discovered by the ntime timer was broadcast as `clean=false`,** telling
+  miners they could keep grinding a job built on a dead tip. `refresh` trusted
+  its caller's flag; it now derives the flag by comparing `prev_hash` against the
+  outgoing template, so any tip change forces a clean job no matter which path
+  noticed it. `prev_hash` rather than height, because `hashPrevBlock` is the only
+  header field that binds work to a chain — height lives only in the BIP34
+  coinbase push and misses a same-height reorg. Consequences differed sharply by
+  protocol: SV1 miners switched jobs but the stale job stayed live, so a block
+  found on it was assembled with the old `prev_hash` and silently earned nothing;
+  SV2 was worse, since `clean` gates `SetNewPrevHash` and `min_ntime`, so devices
+  were handed an immediate job on a prev-hash they had not been moved to and
+  **every** subsequent share failed the target check until the session was
+  dropped for invalid shares.
 - **`bitcoin_rpc.timeout_secs` was parsed, documented, and then never applied.**
   The client was built with the JSON-RPC transport's hardcoded 15-second
   default, so setting the option did nothing — including on the client rebuilt

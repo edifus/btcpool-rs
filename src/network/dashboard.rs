@@ -7,6 +7,11 @@
 ///   GET /favicon.ico → embedded site icon
 ///   GET /stats       → JSON snapshot of PoolStats
 ///   GET /metrics  → Prometheus text (via PrometheusHandle::render)
+///   GET /health   → 200/503 liveness probe (JSON, template_age_secs). Pull-based
+///                   readiness/alerting signal — do not wire to a container
+///                   HEALTHCHECK that restarts the process: that fixes nothing
+///                   when the freeze is upstream (bitcoind), and drops every
+///                   connected miner for no gain.
 use crate::{
     mining::engine::TemplateEngine,
     settings::RuntimeSettings,
@@ -99,6 +104,7 @@ pub async fn start(
         .route("/chart", get(chart_json))
         .route("/api/info", get(info_get))
         .route("/metrics", get(metrics_text))
+        .route("/health", get(health))
         .with_state(state);
 
     match tokio::net::TcpListener::bind(socket_addr).await {
@@ -196,6 +202,27 @@ async fn info_get(State(state): State<DashState>) -> Json<InfoView> {
         network: state.settings.network().to_string(),
         username_format: "YOUR_BTC_ADDRESS.worker",
     })
+}
+
+/// Liveness/readiness probe. Pull-based rather than pushed from `run`'s own
+/// task deliberately: if that task panics, the freshness atomics simply stop
+/// advancing and this independent request still reports unhealthy correctly,
+/// where a self-reported "I'm fine" from the dying task could not.
+async fn health(State(state): State<DashState>) -> Response {
+    let template_age_secs = state.engine.template_age().as_secs();
+    if state.engine.is_template_fresh() {
+        (
+            StatusCode::OK,
+            Json(json!({ "status": "ok", "template_age_secs": template_age_secs })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "stale", "template_age_secs": template_age_secs })),
+        )
+            .into_response()
+    }
 }
 
 async fn metrics_text(State(state): State<DashState>) -> Response {

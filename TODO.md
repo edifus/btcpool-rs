@@ -37,14 +37,42 @@ underflow panic). Line references are as of that review and may drift.
   then dropped on the floor) — it is what bounds how long a wedged node can hold
   a blocking-pool thread, since a `spawn_blocking` task cannot be cancelled.
 
-- [ ] **The template engine can stop refreshing without anyone noticing.** If
-  the ZMQ/poll task exits, `TemplateEngine::run` breaks out of its loop
-  (`engine.rs:119-122`) and the pool serves a frozen template forever — miners
-  keep hashing on a dead tip and any block they find is orphaned. The
-  `JoinHandle` from `tokio::spawn(engine.run(new_block_rx))` (`main.rs:139`) is
-  dropped, so nothing observes or restarts it. At minimum the exit should be
-  loud; better would be keeping the ntime loop alive on channel close, or
-  supervising the ZMQ task so it restarts.
+- [x] **The template engine can stop refreshing without anyone noticing.**
+  Fixed 2026-08-06, all three suggested directions plus the observability the
+  title asks for. The ZMQ listener is supervised and reconnects forever with
+  capped exponential backoff (1 s → 60 s, resetting only after a connection
+  survives 60 s), so its `watch::Sender` is never dropped; `run` additionally
+  survives a closed channel by latching that `select!` branch off rather than
+  breaking, degrading to a 30 s-latency polling pool instead of freezing. The
+  poll fallback became a permanent concurrent backstop, because the worst case
+  turned out to be a socket that connects and never publishes — `zmq_connect` is
+  asynchronous, so a wrong port or a node in IBD produces no error for a
+  supervisor to react to. Freshness is exposed via `GET /health` (503 past 180 s,
+  and before the first refresh ever lands),
+  `pool_template_last_refresh_timestamp_seconds`,
+  `pool_tip_changes_discovered_by_timer_total` and an edge-triggered `error!`.
+
+  Two corrections to this entry's original framing, found while fixing it.
+  A block mined on a frozen template is not orphaned — it is consensus-valid
+  (the frozen template is internally consistent), so the node stores it on a
+  side branch and `submitblock` returns `"inconclusive"`. The real cost is
+  wasted hashrate with a low-probability catastrophic tail:
+  `(h/H) × (D/600)` expected blocks forfeited over a freeze of `D` seconds.
+  And the damage was not limited to the frozen case — the ntime timer
+  broadcast newly-discovered tips as `clean=false`, which on SV2 meant an
+  immediate job on a prev-hash the device had not been moved to, rejecting
+  100% of its shares until the session was dropped. `refresh` now derives
+  `clean` by comparing `prev_hash`.
+
+- [ ] **Stale-tip blocks are reported as wins.** `submit_block` maps
+  `"inconclusive"` to `Ok(())` (`rpc.rs:230-234`), and both call sites
+  (`session.rs:860-871`, `sv2/mod.rs:791-801`) treat `Ok` as a find: they fire
+  `metrics::block_found()`, `block_submission_success()`, `stats.block_found()`
+  and log `🏆 Block submitted!`. So a valid-but-superseded block that earned
+  nothing shows up on the dashboard and in `pool_blocks_found_total` as a block
+  found. Thread a three-way outcome out of `submit_block` and count
+  `Inconclusive` separately. Split out of the item above, where it was noted as
+  optional.
 - [x] **Harden the duplicate-share set** (shipped in v0.6.0, 2026-07-02):
   shares are recorded for dedup only after validation passes, and the
   per-session set clears on every clean-job broadcast (live-jobs scoping); the
