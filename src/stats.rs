@@ -837,36 +837,18 @@ impl PoolStats {
     pub fn share_accepted(&self, difficulty: u64) {
         self.shares_accepted.fetch_add(1, Ordering::Relaxed);
 
-        // CAS loop to track all-time best share
-        let mut prev = self.best_share_difficulty.load(Ordering::Relaxed);
-        while difficulty > prev {
-            match self.best_share_difficulty.compare_exchange_weak(
-                prev,
-                difficulty,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.persist_best_share_difficulty(difficulty);
-                    break;
-                }
-                Err(x) => prev = x,
-            }
+        // All-time best share. `fetch_max` is the whole CAS loop: it only ever
+        // raises the watermark, so two racing writers cannot lose the higher
+        // value. Persist only when this call is the one that raised it.
+        if self
+            .best_share_difficulty
+            .fetch_max(difficulty, Ordering::Relaxed)
+            < difficulty
+        {
+            self.persist_best_share_difficulty(difficulty);
         }
-
-        // Session best share
-        let mut prev_session_best = self.session_best_share_difficulty.load(Ordering::Relaxed);
-        while difficulty > prev_session_best {
-            match self.session_best_share_difficulty.compare_exchange_weak(
-                prev_session_best,
-                difficulty,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(x) => prev_session_best = x,
-            }
-        }
+        self.session_best_share_difficulty
+            .fetch_max(difficulty, Ordering::Relaxed);
     }
 
     pub fn share_rejected(&self) {
@@ -974,42 +956,23 @@ impl PoolStats {
     }
 
     /// Track all-time best (persistent) and session-best (since boot).
-    /// CAS loops (like share_accepted's best-share tracking) so two racing
-    /// updaters cannot let a lower value overwrite a higher one that landed
-    /// between the load and the store.
+    ///
+    /// `fetch_max` works directly on the bit patterns: for non-negative finite
+    /// f64 the IEEE-754 encoding is monotonic, so comparing the bits as `u64`
+    /// orders the values identically. The `is_finite` guard keeps NaN (whose
+    /// bits exceed every real value) out of the watermark; a hashrate is never
+    /// negative.
     fn record_best_hashrate(&self, total_10m: f64) {
-        if !total_10m.is_finite() {
+        if !total_10m.is_finite() || total_10m < 0.0 {
             return;
         }
+        let bits = total_10m.to_bits();
 
-        let mut prev = self.best_hashrate_hps.load(Ordering::Relaxed);
-        while total_10m > f64::from_bits(prev) {
-            match self.best_hashrate_hps.compare_exchange_weak(
-                prev,
-                total_10m.to_bits(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.persist_best_hashrate_hps(total_10m);
-                    break;
-                }
-                Err(x) => prev = x,
-            }
+        if self.best_hashrate_hps.fetch_max(bits, Ordering::Relaxed) < bits {
+            self.persist_best_hashrate_hps(total_10m);
         }
-
-        let mut prev_session = self.session_best_hashrate_hps.load(Ordering::Relaxed);
-        while total_10m > f64::from_bits(prev_session) {
-            match self.session_best_hashrate_hps.compare_exchange_weak(
-                prev_session,
-                total_10m.to_bits(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(x) => prev_session = x,
-            }
-        }
+        self.session_best_hashrate_hps
+            .fetch_max(bits, Ordering::Relaxed);
     }
 
     fn now_secs() -> u64 {
