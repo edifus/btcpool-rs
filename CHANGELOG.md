@@ -9,6 +9,11 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-06
+
+Block accounting that survives reorgs and restarts, a `/health` probe, and the
+blocking work moved off the async runtime.
+
 ### Added
 - `GET /health` on the dashboard/metrics port: 200 with
   `{"status":"ok","template_age_secs":N}` while the template is refreshing, 503
@@ -100,6 +105,17 @@ everything else bumps the **patch** version.
   `RpcClient` now exposes only `async` methods, which run the call on the
   blocking pool; the synchronous bodies are private, so the mistake cannot
   recur.
+- Share validation no longer allocates per submitted share. The coinbase is
+  spliced into a scratch buffer held per blocking-pool thread instead of cloning
+  `coinbase_template` each time; the hex/format strings above the "Validating
+  submitted share" `debug!` moved inside the macro, so `tracing` skips them at
+  the default `info` level; and the never-read `worker` field, three throwaway
+  strings in `mining.submit` parsing, and a redundant `prev_hash` copy are gone.
+  No behaviour or log output changes — this is the last of the hot-path cleanup
+  tracked in TODO. As a side effect the prev-hash decode now returns
+  `InvalidHeader` for a wrong-length value rather than reaching a
+  `copy_from_slice` that would panic inside the validation task; the value is
+  pool-generated, so that path was unreachable.
 
 ### Fixed
 - **A block that won its height and was then reorged out kept counting as a
@@ -309,7 +325,17 @@ First release under the new name.
   client could not distinguish from a network fault. Malformed payloads still
   disconnect immediately.
 
-## [0.6.2] - 2026-07-10
+---
+
+# Pre-rename history (solo-pool-rs)
+
+Everything below predates the rename to `btcpool-rs` and the version reset to
+`0.1.0` described in the entry above. It used a separate numbering line that
+reached 0.6.2 in the [cbyam/solo-pool-rs](https://github.com/cbyam/solo-pool-rs)
+repository, so these version numbers overlap the current ones and are kept
+unlinked to avoid any ambiguity with a release of the same number here.
+
+## 0.6.2 — 2026-07-10
 
 ### Added
 - Market card: 24-hour price change shown as a green/red percentage under the
@@ -350,7 +376,7 @@ First release under the new name.
   `idle_timeout_secs` (default 300). If your vardiff floor puts a miner's
   expected share pace above that, raise `idle_timeout_secs`.
 
-## [0.6.1] - 2026-07-05
+## 0.6.1 — 2026-07-05
 
 ### Added
 - **Per-reason reject breakdown on the dashboard.** Each worker's rejected
@@ -374,7 +400,7 @@ First release under the new name.
   recorded them. All reject paths now increment the worker counter, matching
   the Prometheus `pool_shares_rejected_total` metric.
 
-## [0.6.0] - 2026-07-02
+## 0.6.0 — 2026-07-02
 
 ### Added
 - **SV2 pool identity (authority key pinning).** The Noise authority key now
@@ -426,7 +452,7 @@ First release under the new name.
   failed, e.g. while bitcoind restarts) now updates the dashboard block count
   and last-block panel, not just the Prometheus counters.
 
-## [0.5.1] - 2026-06-15
+## 0.5.1 — 2026-06-15
 
 ### Added
 - Dashboard: **Connect** modal (rail nav) — shows the exact
@@ -455,7 +481,7 @@ First release under the new name.
   `min_difficulty` floor, that share difficulty has no payout effect in solo,
   and how to tune for small or large hardware.
 
-## [0.5.0] - 2026-06-14
+## 0.5.0 — 2026-06-14
 
 ### Added
 - Dashboard: **Settings page** — the payout address can now be changed at
@@ -508,7 +534,7 @@ First release under the new name.
 - Stratum: blank / whitespace-only lines (a common firmware keepalive) are now
   ignored instead of being parsed as empty JSON and dropping the connection.
 
-## [0.4.2] - 2026-06-12
+## 0.4.2 — 2026-06-12
 
 ### Fixed
 - **Critical: every found block was rejected by the node with
@@ -534,7 +560,7 @@ First release under the new name.
   `bad-cb-height`; post-BIP34 mainnet heights are all >16 and were unaffected.
   Found while rehearsing the block-submission path on regtest.
 
-## [0.4.1] - 2026-06-11
+## 0.4.1 — 2026-06-11
 
 ### Added
 - Config: every value can now be overridden by an environment variable named
@@ -573,7 +599,7 @@ First release under the new name.
     difficulty (pruned at boot and periodically); an inflated table from an
     earlier run is trimmed before being loaded into RAM.
 
-## [0.4.0] - 2026-06-11
+## 0.4.0 — 2026-06-11
 
 ### Changed
 - **Packaging (Docker): the runtime image now runs as a non-root user
@@ -612,7 +638,7 @@ First release under the new name.
   text carries node-influenced strings (RPC messages, rejection reasons) that
   would otherwise mint unbounded Prometheus label series.
 
-## [0.3.2] - 2026-06-10
+## 0.3.2 — 2026-06-10
 
 ### Added
 - Config: `pool.found_block_dir` (default `found-blocks`) — directory where the
@@ -634,7 +660,7 @@ First release under the new name.
   this could kill the background pruner task (leaving the per-IP window map
   growing forever) or crash the accept loop on an incoming connection.
 
-## [0.3.1] - 2026-06-09
+## 0.3.1 — 2026-06-09
 
 ### Added
 - Config: `security.max_worker_name_len` (default 128) caps the accepted worker
@@ -678,7 +704,7 @@ First release under the new name.
   the idle timeout, preventing slowloris connection-holding before the session
   loop's idle timeout engages.
 
-## [0.3.0] - 2026-06-06
+## 0.3.0 — 2026-06-06
 
 ### Added
 - Packaging: CI workflow, Docker image, and a systemd service unit.
@@ -693,7 +719,7 @@ First release under the new name.
 - Added a real security policy (supported versions, private reporting, scope).
 - Clarified the crate description: Stratum V2 is implemented, not just planned.
 
-## [0.2.0] - 2026-05-31
+## 0.2.0 — 2026-05-31
 
 ### Added
 - Stratum V2 (Noise-encrypted) support via dual-stack SV1 + SV2 auto-detection
@@ -705,20 +731,9 @@ First release under the new name.
 - Dashboard rework: worker rendering and stats mapping fixes; reject rate moved
   into the rejected card; best share keyed by vardiff difficulty.
 
-[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/edifus/btcpool-rs/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/edifus/btcpool-rs/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/edifus/btcpool-rs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/edifus/btcpool-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/edifus/btcpool-rs/releases/tag/v0.1.0
-[0.6.2]: https://github.com/cbyam/solo-pool-rs/compare/v0.6.1...v0.6.2
-[0.6.1]: https://github.com/cbyam/solo-pool-rs/compare/v0.6.0...v0.6.1
-[0.6.0]: https://github.com/cbyam/solo-pool-rs/compare/v0.5.1...v0.6.0
-[0.5.1]: https://github.com/cbyam/solo-pool-rs/compare/v0.5.0...v0.5.1
-[0.5.0]: https://github.com/cbyam/solo-pool-rs/compare/v0.4.2...v0.5.0
-[0.4.2]: https://github.com/cbyam/solo-pool-rs/compare/v0.4.1...v0.4.2
-[0.4.1]: https://github.com/cbyam/solo-pool-rs/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/cbyam/solo-pool-rs/compare/v0.3.2...v0.4.0
-[0.3.2]: https://github.com/cbyam/solo-pool-rs/compare/v0.3.1...v0.3.2
-[0.3.1]: https://github.com/cbyam/solo-pool-rs/compare/v0.3.0...v0.3.1
-[0.3.0]: https://github.com/cbyam/solo-pool-rs/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/cbyam/solo-pool-rs/releases/tag/v0.2.0
