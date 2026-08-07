@@ -253,17 +253,26 @@ pub fn unsupported_gbt_rules(gbt: &GbtResult) -> Vec<String> {
 
 /// Build the address-independent portion of a mining job once per GBT refresh.
 pub fn build_job_template(gbt: &GbtResult) -> Result<JobTemplate, PoolError> {
-    let tx_txids: Vec<[u8; 32]> = gbt
+    // Each txid must be exactly 32 bytes: it is a merkle leaf, and a truncated
+    // or garbled one would produce a merkle root that is wrong but internally
+    // consistent — the exact class of error share validation cannot see,
+    // because it recomputes the same root. `decode_to_slice` enforces the
+    // width, where the previous `hex::decode(..).unwrap_or_default()` followed
+    // by `copy_from_slice` panicked instead, taking the refresh task with it and
+    // freezing the template.
+    let tx_txids = gbt
         .transactions
         .iter()
         .map(|tx| {
-            let mut b = hex::decode(&tx.txid).unwrap_or_default();
-            b.reverse();
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b[..32.min(b.len())]);
-            arr
+            let mut txid = [0u8; 32];
+            hex::decode_to_slice(&tx.txid, &mut txid).map_err(|e| {
+                PoolError::Other(anyhow::anyhow!("template txid {:?}: {e}", tx.txid))
+            })?;
+            txid.reverse();
+            Ok(txid)
         })
-        .collect();
+        .collect::<Result<Vec<[u8; 32]>, PoolError>>()?;
+
     let merkle_branch_raw = compute_merkle_branch_raw(&tx_txids);
     let merkle_branch = merkle_branch_raw.iter().map(hex::encode).collect();
     let witness_commitment = gbt
@@ -991,7 +1000,17 @@ mod tests {
     // Template rules
     // ─────────────────────────────────────────────────────────────────────────
 
-    use crate::bitcoin::rpc::GbtResult;
+    use crate::bitcoin::rpc::{GbtResult, GbtTransaction};
+
+    fn sample_tx(txid: &str, fee: u64, weight: u64) -> GbtTransaction {
+        GbtTransaction {
+            data: vec![0xde, 0xad],
+            txid: txid.to_string(),
+            hash: txid.to_string(),
+            fee,
+            weight,
+        }
+    }
 
     fn sample_gbt() -> GbtResult {
         GbtResult {
@@ -1075,5 +1094,29 @@ mod tests {
             ..sample_gbt()
         };
         assert!(unsupported_gbt_rules(&outside).is_empty());
+    }
+
+    /// A txid is a merkle leaf. Truncating a short one would produce a root that
+    /// is wrong but self-consistent, which share validation cannot see; the
+    /// previous code instead panicked inside the refresh task and froze the
+    /// template. Neither is acceptable — it has to be an error.
+    #[test]
+    fn a_malformed_txid_is_an_error_not_a_panic() {
+        for bad in ["", "abcd", &"ab".repeat(31), "zz".repeat(32).as_str()] {
+            let gbt = GbtResult {
+                transactions: vec![sample_tx(bad, 0, 400)],
+                ..sample_gbt()
+            };
+            assert!(
+                build_job_template(&gbt).is_err(),
+                "txid {bad:?} should be rejected"
+            );
+        }
+
+        let good = GbtResult {
+            transactions: vec![sample_tx(&"ab".repeat(32), 0, 400)],
+            ..sample_gbt()
+        };
+        assert!(build_job_template(&good).is_ok());
     }
 }
