@@ -1727,6 +1727,8 @@ impl PoolStats {
                 .unwrap_or_else(|| "—".to_string()),
             last_block_ts: self.last_block_ts.load(Ordering::Relaxed),
             last_block_status: (*self.last_block_status.lock()).to_string(),
+            unsupported_rules: Vec::new(),
+            rules_block_work: false,
         }
     }
 }
@@ -1780,6 +1782,15 @@ pub struct StatsSnapshot {
     /// Where the last block stands with the confirmation pass: `pending` until
     /// it is decided, then a `BlockResolution` label.
     pub last_block_status: String,
+    /// `!`-prefixed `getblocktemplate` rules this build does not implement.
+    /// Filled by the dashboard from the TemplateEngine, like `template_version`;
+    /// other snapshot consumers receive an empty list.
+    #[serde(default)]
+    pub unsupported_rules: Vec<String>,
+    /// Whether those rules have stopped the pool issuing work
+    /// (`strict_gbt_rules`), as opposed to only being reported.
+    #[serde(default)]
+    pub rules_block_work: bool,
 }
 
 #[derive(Serialize)]

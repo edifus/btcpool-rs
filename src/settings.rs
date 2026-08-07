@@ -69,6 +69,7 @@ mod tests {
             found_block_dir: "found-blocks".into(),
             confirmation_depth: 6,
             network: network_assert.map(str::to_string),
+            strict_gbt_rules: true,
         }
     }
 

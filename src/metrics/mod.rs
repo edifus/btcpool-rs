@@ -208,3 +208,17 @@ pub fn update_template_last_refresh(unix_secs: u64) {
 pub fn tip_change_discovered_by_timer() {
     counter!("pool_tip_changes_discovered_by_timer_total").increment(1);
 }
+
+/// How many `!`-prefixed template rules this build does not implement. Nonzero
+/// means a soft fork activated that this binary predates, and — under
+/// `strict_gbt_rules` — that the pool has stopped issuing work rather than mine
+/// blocks whose coinbase it can no longer vouch for. Alert on `> 0`.
+pub fn update_unsupported_gbt_rules(count: usize) {
+    gauge!("pool_unsupported_gbt_rules").set(count as f64);
+}
+
+/// `coinbasevalue` disagreed with the subsidy plus the template's own fees.
+/// Never expected; a block built from such a template risks `bad-cb-amount`.
+pub fn coinbase_value_mismatch() {
+    counter!("pool_coinbase_value_mismatch_total").increment(1);
+}

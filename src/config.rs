@@ -63,6 +63,24 @@ pub struct PoolConfig {
     /// different chain — catching a config pointed at the wrong node.
     #[serde(default)]
     pub network: Option<String>,
+    /// Stop issuing work when `getblocktemplate` announces a `!`-prefixed rule
+    /// this build does not implement.
+    ///
+    /// The pool does not mine the node's block — it discards Core's coinbase and
+    /// builds its own. BIP22/23 marks a rule with `!` precisely to say that a
+    /// client which does that must understand the rule, and Core reports such a
+    /// rule without erroring, leaving the call to the client. So at a soft-fork
+    /// activation this binary predates, the choice is: stop, or keep building
+    /// coinbases against rules it has never heard of.
+    ///
+    /// Default `true` — stop. For a solo pool a silently-invalid block is the
+    /// worst available outcome: it costs the whole reward and looks exactly like
+    /// bad luck. Set `false` to keep mining and rely on the
+    /// `pool_unsupported_gbt_rules` metric and the dashboard banner instead,
+    /// which is the right call once you have read the new rule and satisfied
+    /// yourself the coinbase this pool builds still complies.
+    #[serde(default = "default_strict_gbt_rules")]
+    pub strict_gbt_rules: bool,
 }
 
 fn default_found_block_dir() -> String {
@@ -71,6 +89,10 @@ fn default_found_block_dir() -> String {
 
 fn default_confirmation_depth() -> u32 {
     6
+}
+
+fn default_strict_gbt_rules() -> bool {
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

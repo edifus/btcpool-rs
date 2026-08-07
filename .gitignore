@@ -32,3 +32,4 @@
 !/src/**/*.rs
 !/src/network/favicon.ico
 !/tests/**/*.rs
+!/tests/fixtures/*.json

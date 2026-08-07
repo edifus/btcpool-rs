@@ -114,6 +114,16 @@ pub struct TemplateEngine {
     /// `pool_template_last_refresh_timestamp_seconds` gauge only — never
     /// branched on internally, so an NTP step can't affect a health decision.
     last_refresh_unix_secs: AtomicU64,
+
+    /// The `!`-prefixed template rules this build does not implement, as of the
+    /// last refresh. Empty is the healthy case. Retained by name, not as a
+    /// count, so `/health` and the dashboard can say *which* rule rather than
+    /// just report unhealthy.
+    ///
+    /// Populated regardless of `strict_gbt_rules`, because the operator wants to
+    /// see it either way; only the strict flag decides whether it also stops
+    /// work (see [`Self::is_blocked_on_rules`]).
+    unsupported_rules: RwLock<Vec<String>>,
 }
 
 impl TemplateEngine {
@@ -133,7 +143,23 @@ impl TemplateEngine {
             last_refresh_offset_secs: AtomicU64::new(0),
             last_refresh_unix_secs: AtomicU64::new(0),
             has_refreshed: AtomicBool::new(false),
+            unsupported_rules: RwLock::new(Vec::new()),
         })
+    }
+
+    /// `!`-prefixed template rules this build does not implement, as of the last
+    /// refresh. Empty is the healthy case. Reported whether or not
+    /// `strict_gbt_rules` is on.
+    pub async fn unsupported_rules(&self) -> Vec<String> {
+        self.unsupported_rules.read().await.clone()
+    }
+
+    /// Whether those rules are actually stopping work — that is, whether the
+    /// operator left `strict_gbt_rules` on. With it off the pool keeps mining
+    /// by explicit instruction, so this stays false and `/health` stays 200:
+    /// a probe that failed anyway would just restart the pool in a loop.
+    pub async fn is_blocked_on_rules(&self) -> bool {
+        self.pool_cfg.strict_gbt_rules && !self.unsupported_rules.read().await.is_empty()
     }
 
     /// Subscribe to new-job broadcasts. Call this when a miner session connects.
@@ -193,6 +219,9 @@ impl TemplateEngine {
     async fn refresh(&self, clean_jobs: bool) {
         match self.rpc.get_block_template().await {
             Ok(gbt) => {
+                if !self.check_template_rules(&gbt).await {
+                    return;
+                }
                 match template::build_job_template(&gbt) {
                     Ok(template) => {
                         let template = Arc::new(template);
@@ -263,6 +292,64 @@ impl TemplateEngine {
             }
             Err(e) => error!("getblocktemplate failed: {e}"),
         }
+    }
+
+    /// Gate a fresh template on the `!`-prefixed rules it announces.
+    ///
+    /// Returns whether the caller may go on to build a job. Under
+    /// `strict_gbt_rules` an unimplemented rule also *withdraws* the previous
+    /// template: leaving it in place would keep every connected miner grinding
+    /// a prev-hash that has since moved on, which does not orphan the resulting
+    /// block so much as make it worthless — the node stores it on a side branch
+    /// and `submitblock` says `inconclusive`. Better to serve nothing and say
+    /// so loudly than to burn hashrate producing blocks that cannot win.
+    async fn check_template_rules(&self, gbt: &crate::bitcoin::rpc::GbtResult) -> bool {
+        let unsupported = template::unsupported_gbt_rules(gbt);
+        metrics::update_unsupported_gbt_rules(unsupported.len());
+
+        // Edge-triggered: this runs on every tip change and every 30 s tick, and
+        // an activation does not resolve itself. One line per transition, not
+        // one per refresh.
+        let changed = {
+            let mut current = self.unsupported_rules.write().await;
+            let changed = *current != unsupported;
+            if changed {
+                current.clone_from(&unsupported);
+            }
+            changed
+        };
+
+        if unsupported.is_empty() {
+            if changed {
+                info!("template rules are supported again; resuming work");
+            }
+            return true;
+        }
+
+        if !self.pool_cfg.strict_gbt_rules {
+            if changed {
+                error!(
+                    rules = %unsupported.join(", "),
+                    "getblocktemplate announces rules this build does not implement. \
+                     strict_gbt_rules is off, so the pool keeps mining — verify by hand \
+                     that the coinbase it builds still satisfies them"
+                );
+            }
+            return true;
+        }
+
+        if changed {
+            error!(
+                rules = %unsupported.join(", "),
+                "getblocktemplate announces rules this build does not implement; \
+                 refusing to issue work because the coinbase this pool builds may no \
+                 longer be consensus-valid. Upgrade btcpool-rs, or set \
+                 strict_gbt_rules = false once you have verified the new rules by hand"
+            );
+        }
+        // Withdraw the stale template so sessions stop being handed work.
+        *self.current_template.write().await = None;
+        false
     }
 
     /// Submit a found block, guaranteeing it cannot be silently lost: the raw
@@ -634,5 +721,136 @@ mod tests {
             dirty >= 3,
             "expected at least 3 ntime refreshes after the channel closed, got {dirty}"
         );
+    }
+
+    // ── check_template_rules ────────────────────────────────────────────────
+
+    /// A real engine, which needs no live backend: `RpcClient::new` only builds
+    /// a lazy JSON-RPC client, and `PoolStats` runs storeless. That lets these
+    /// exercise the actual method — including withdrawing the template — rather
+    /// than a restatement of its control flow.
+    fn test_engine(strict_gbt_rules: bool) -> Arc<TemplateEngine> {
+        let rpc = Arc::new(
+            crate::bitcoin::rpc::RpcClient::new(&crate::config::RpcConfig {
+                url: "http://127.0.0.1:1".into(),
+                cookie_path: None,
+                user: Some("u".into()),
+                password: Some("p".into()),
+                timeout_secs: 1,
+            })
+            .expect("building a lazy RPC client cannot fail"),
+        );
+        let pool_cfg = PoolConfig {
+            listen_addr: "127.0.0.1:0".into(),
+            coinbase_address: None,
+            coinbase_tag: "/test/".into(),
+            initial_difficulty: 1,
+            extranonce1_size: 4,
+            extranonce2_size: 4,
+            max_connections: 8,
+            idle_timeout_secs: 300,
+            found_block_dir: "found-blocks".into(),
+            confirmation_depth: 6,
+            network: None,
+            strict_gbt_rules,
+        };
+        TemplateEngine::new(rpc, pool_cfg, crate::stats::PoolStats::new_with_store(None))
+    }
+
+    fn gbt_with_rules(rules: &[&str]) -> crate::bitcoin::rpc::GbtResult {
+        crate::bitcoin::rpc::GbtResult {
+            version: 0x2000_0000,
+            prev_hash: "00".repeat(32),
+            bits: "1d00ffff".into(),
+            cur_time: 1_700_000_000,
+            height: 900_000,
+            coinbase_value: 312_500_000,
+            transactions: Vec::new(),
+            longpoll_id: None,
+            default_witness_commitment: Some("6a24aa21a9ed".to_string() + &"11".repeat(32)),
+            rules: rules.iter().map(|r| r.to_string()).collect(),
+            vbrequired: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn supported_rules_leave_the_engine_working() {
+        let engine = test_engine(true);
+        assert!(
+            engine
+                .check_template_rules(&gbt_with_rules(&["csv", "!segwit", "taproot"]))
+                .await
+        );
+        assert!(engine.unsupported_rules().await.is_empty());
+        assert!(!engine.is_blocked_on_rules().await);
+    }
+
+    /// The point of the whole gate: an activation this build predates must stop
+    /// work *and* withdraw the template already in hand. Leaving the old one up
+    /// would keep every miner grinding a prev-hash the chain has moved past, so
+    /// the blocks it produced could not win even if they were valid.
+    #[tokio::test]
+    async fn an_unimplemented_rule_stops_work_and_withdraws_the_template() {
+        let engine = test_engine(true);
+
+        // Seed a template, as a successful refresh would have.
+        *engine.current_template.write().await = Some(Arc::new(
+            template::build_job_template(&gbt_with_rules(&["!segwit"])).unwrap(),
+        ));
+        assert!(engine.current_template().await.is_some());
+
+        let proceed = engine
+            .check_template_rules(&gbt_with_rules(&["!segwit", "!greatfork"]))
+            .await;
+
+        assert!(!proceed, "the caller must not go on to build a job");
+        assert!(
+            engine.current_template().await.is_none(),
+            "the stale template must be withdrawn, not left serving work"
+        );
+        assert_eq!(
+            engine.unsupported_rules().await,
+            vec!["greatfork".to_string()]
+        );
+        assert!(engine.is_blocked_on_rules().await);
+    }
+
+    /// With the escape hatch open the operator has said to keep mining, so the
+    /// pool reports the rule but does not stop — and `/health` stays 200, since
+    /// a probe failing here would just restart the pool in a loop.
+    #[tokio::test]
+    async fn strict_gbt_rules_off_reports_but_keeps_mining() {
+        let engine = test_engine(false);
+        let proceed = engine
+            .check_template_rules(&gbt_with_rules(&["!segwit", "!greatfork"]))
+            .await;
+
+        assert!(proceed);
+        assert_eq!(
+            engine.unsupported_rules().await,
+            vec!["greatfork".to_string()]
+        );
+        assert!(!engine.is_blocked_on_rules().await);
+    }
+
+    /// The condition clears on its own once the operator upgrades, so the gate
+    /// has to lift without a restart.
+    #[tokio::test]
+    async fn work_resumes_once_the_rule_becomes_supported() {
+        let engine = test_engine(true);
+        assert!(
+            !engine
+                .check_template_rules(&gbt_with_rules(&["!greatfork"]))
+                .await
+        );
+        assert!(engine.is_blocked_on_rules().await);
+
+        assert!(
+            engine
+                .check_template_rules(&gbt_with_rules(&["!segwit"]))
+                .await
+        );
+        assert!(engine.unsupported_rules().await.is_empty());
+        assert!(!engine.is_blocked_on_rules().await);
     }
 }

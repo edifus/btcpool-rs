@@ -37,6 +37,39 @@ thread_local! {
 pub const VERSION_ROLLING_MASK: u32 = 0x1FFF_E000;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ntime bounds
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Consensus `MAX_FUTURE_BLOCK_TIME`: a block whose time exceeds the validating
+/// node's clock by more than this is rejected `time-too-new`. Doubles as the
+/// pool's forward ntime-rolling allowance.
+const MAX_NTIME_DRIFT_SECS: u32 = 7200;
+
+/// Wall-clock unix seconds, for the ntime ceiling only.
+///
+/// A clock that predates the epoch reads as `u32::MAX`, which makes the absolute
+/// bound saturate out of the way and leaves the template-relative one in force.
+/// That is the pre-existing behaviour: a broken clock should cost the extra
+/// guard, not reject every share the pool receives.
+fn now_unix_secs() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs().min(u32::MAX as u64) as u32)
+        .unwrap_or(u32::MAX)
+}
+
+/// The highest ntime a share may carry: the tighter of the pool's drift policy
+/// (measured from the template) and consensus `time-too-new` (measured from the
+/// clock). See the call site in `validate_share_no_dedup` for why both are
+/// needed.
+fn ntime_ceiling(cur_time: u32, now: u32) -> u32 {
+    cur_time
+        .saturating_add(MAX_NTIME_DRIFT_SECS)
+        .min(now.saturating_add(MAX_NTIME_DRIFT_SECS))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Share duplicate tracker
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -183,15 +216,27 @@ pub fn validate_share_no_dedup(
         return Err(PoolError::StaleJob(params.job_id.clone()));
     }
 
-    // ── 2. ntime validation — pool acceptance policy, not consensus ──────────
-    // Bitcoin consensus allows any ntime ≥ median-time-past. This window
-    // (cur_time..cur_time+7200) is a tighter pool-side drift limit.
-    if params.ntime < job.cur_time || params.ntime > job.cur_time.saturating_add(7200) {
+    // ── 2. ntime validation ───────────────────────────────────────────────────
+    //
+    // The floor is pool policy that happens to subsume consensus: consensus
+    // wants ntime > median-time-past, and Core sets `curtime = max(MTP+1, now)`,
+    // so refusing anything below `curtime` can never produce `time-too-old`.
+    //
+    // The ceiling is consensus, and it is measured against the *validating
+    // node's* clock (`time-too-new` at now + MAX_FUTURE_BLOCK_TIME), not against
+    // the template. Those coincide while `curtime ≈ now`, but `curtime` is
+    // `MTP+1` whenever that exceeds the node's clock — a host running more than
+    // ~an hour slow, or regtest under `setmocktime` — and then a share at the
+    // top of a template-relative window becomes a block the node rejects
+    // outright. So both bounds are applied: the template-relative one as the
+    // drift policy, and an absolute one against our own clock.
+    let ceiling = ntime_ceiling(job.cur_time, now_unix_secs());
+    if params.ntime < job.cur_time || params.ntime > ceiling {
         return Err(PoolError::InvalidParams {
             method: "mining.submit",
             detail: format!(
-                "ntime out of range: submitted={} template_curtime={}",
-                params.ntime, job.cur_time
+                "ntime out of range: submitted={} template_curtime={} ceiling={}",
+                params.ntime, job.cur_time, ceiling
             ),
         });
     }
@@ -360,7 +405,22 @@ fn assemble_block_hex(
             with_witness = bytes;
             &with_witness[..]
         }
-        None => coinbase,
+        None => {
+            if has_witness_commitment {
+                // The commitment output is present but the reserved value could
+                // not be attached, so this hex is `bad-witness-nonce-size` to
+                // anything that does not repair it. `submitblock` does, which is
+                // why the block is still worth sending — but the archived hex
+                // and any P2P relay of it are not valid, and that is worth
+                // knowing before someone replays the archive by hand.
+                tracing::error!(
+                    "could not attach the BIP141 witness reserved value to the \
+                     coinbase; submitting without it (Core's submitblock repairs \
+                     this, the archived hex will not be relayable as-is)"
+                );
+            }
+            coinbase
+        }
     };
 
     let mut block = Vec::with_capacity(
@@ -662,6 +722,36 @@ mod tests {
             stripped.compute_txid(),
             "adding the witness must not change the txid the merkle root commits to"
         );
+    }
+
+    /// Consensus measures `time-too-new` against the *validating node's* clock,
+    /// not against the template. The two agree while `curtime ≈ now`, but Core
+    /// sets `curtime = max(MTP+1, now)`, so a host running more than about an
+    /// hour slow produces a template whose own +2h window reaches past what the
+    /// node will accept — and a share at the top of it becomes a rejected block.
+    #[test]
+    fn the_ntime_ceiling_is_the_tighter_of_the_template_and_the_clock() {
+        const DRIFT: u32 = MAX_NTIME_DRIFT_SECS;
+        let curtime = 1_700_000_000;
+
+        // Normal case: the template was built roughly now, so the two bounds
+        // coincide and the full drift window is available.
+        assert_eq!(ntime_ceiling(curtime, curtime), curtime + DRIFT);
+
+        // Stale template — the clock has moved on. The template-relative bound
+        // is tighter and stays in force, unchanged from previous behaviour.
+        assert_eq!(ntime_ceiling(curtime, curtime + 600), curtime + DRIFT);
+
+        // The failure this guards: curtime is an hour ahead of the clock because
+        // MTP+1 exceeded it. The consensus bound is what applies, and it is
+        // 3600s below what the template alone would have allowed.
+        let now = curtime - 3600;
+        assert_eq!(ntime_ceiling(curtime, now), now + DRIFT);
+        assert!(ntime_ceiling(curtime, now) < curtime + DRIFT);
+
+        // A clock that cannot be read at all reads as u32::MAX, which saturates
+        // the absolute bound away rather than rejecting every share.
+        assert_eq!(ntime_ceiling(curtime, u32::MAX), curtime + DRIFT);
     }
 
     /// Without a commitment output a witness would be `unexpected-witness`.

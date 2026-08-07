@@ -93,6 +93,28 @@ found_block_dir = "found-blocks"
 # our favour. Range 1–100.
 confirmation_depth = 6
 
+# Stop issuing work when getblocktemplate announces a "!"-prefixed rule this
+# build does not implement.
+#
+# The pool does not mine your node's block — it discards Core's coinbase and
+# builds its own, with the BIP34 height, your miner's payout output and the
+# segwit commitment. BIP22/23 marks a rule with "!" precisely to say that a
+# client doing that must understand the rule, and your node reports such a rule
+# without erroring, leaving the call to the client. So at a soft-fork
+# activation this binary predates, the choice is: stop, or keep building
+# coinbases against rules it has never heard of.
+#
+# true (default) stops, because for a solo pool a silently-invalid block is the
+# worst available outcome — it costs the whole reward and looks exactly like bad
+# luck. You will see it as a 503 from /health naming the rule, a dashboard
+# banner, and pool_unsupported_gbt_rules > 0.
+#
+# false keeps mining and only reports. The right setting once you have read the
+# new rule and satisfied yourself the coinbase this pool builds still complies —
+# or if you would rather take the chance than stop. Upgrading btcpool-rs is the
+# real fix either way.
+strict_gbt_rules = true
+
 [sv2]
 # Accept Stratum V2 (Extended Channel, Noise-encrypted) connections on the SAME
 # listen_addr as SV1. The protocol is auto-detected from the first byte of each
