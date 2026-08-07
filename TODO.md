@@ -171,7 +171,6 @@ underflow panic). Line references are as of that review and may drift.
   untrusted network (a shrinking niche), and client support for `stratum+ssl` is
   spotty (cgminer/Avalon yes; AxeOS/ESP-Miner version-dependent). Revisit only
   if a real user asks for it.
-- [ ] Cookie to save selected chart options for viewing in browser.
 
   Design notes for when/if that happens, so it doesn't become a support burden:
   - **rustls / `tokio-rustls`, not OpenSSL** — keeps the pure-Rust single-binary
@@ -194,6 +193,16 @@ underflow panic). Line references are as of that review and may drift.
     domain + inbound reachability — impractical behind home NAT). Ship opt-in,
     off by default; document as "encryption for SV1 miners over untrusted
     networks, not needed on a trusted LAN."
+- [x] **Save selected chart options for viewing in browser** (2026-08-07): the
+  chart range and the legend's series toggles now persist, joining the theme,
+  chart-collapse and quote-currency preferences. Both readers validate against
+  an allowlist and fall back to the server default. Each list is duplicated by
+  hand with nothing enforcing agreement — a range is written three times (button
+  `data-window`, the JS allowlist, `chart_window`'s match arms) and a series
+  twice (the JS allowlist, `legend.data`) — so a test pins each set. Drift is
+  silent otherwise: a range missing from the match arms plots 1h data under its
+  own label, and one missing from a JS allowlist toggles fine and forgets on
+  reload.
 - [ ] **Multi-node Bitcoin RPC failover.** Today a single `bitcoin_rpc.url`; if
   that node restarts (see the near-daily needrestart sweep) or crashes, template
   refresh stalls until it returns. Accept a list of node endpoints and fail over

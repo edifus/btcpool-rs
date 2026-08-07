@@ -1028,8 +1028,21 @@ function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+// ── Chart range ──────────────────────────────────────────────────────────────
+// Persisted like the theme choice, so a reload keeps the range you were looking
+// at instead of snapping back to 1h. Validated against the allowlist on read:
+// the server already falls back to 1h for an unknown `window=`, but the button
+// highlight is driven off this value and would have nothing to light up.
 const DEFAULT_WINDOW = '1h';
-let selectedWindow = DEFAULT_WINDOW;
+const WINDOW_KEY = 'btcpool-chart-window';
+const WINDOWS = ['1h', '6h', '24h', '1w', '30d', '180d', 'all'];
+function storedWindow() {
+  try {
+    const w = localStorage.getItem(WINDOW_KEY);
+    return WINDOWS.includes(w) ? w : DEFAULT_WINDOW;
+  } catch (_) { return DEFAULT_WINDOW; }
+}
+let selectedWindow = storedWindow();
 let lastBlockHeight = 0;
 // Degraded detection is *relative to each worker's own baseline*, not an absolute
 // timeout — so low-hashrate / never-submitted / just-connected miners (whose
@@ -1084,7 +1097,33 @@ function updateConnLed() {
   }
 }
 
+// ── Chart legend ─────────────────────────────────────────────────────────────
+// The server sends a default show/hide map with every poll; this is what makes a
+// user's toggles outlive a reload. Returns null when nothing usable is stored,
+// matching chartLegendSelected()'s contract, so callers fall through to that
+// server default. Unknown keys are dropped: a renamed series must not resurrect
+// a stale entry that no longer maps to a line.
+const LEGEND_KEY = 'btcpool-chart-legend';
+const LEGEND_SERIES = ['1m', '5m', '10m', '1h', '6h', '24h'];
+function storedLegend() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LEGEND_KEY));
+    if (!raw || typeof raw !== 'object') return null;
+    const out = {};
+    LEGEND_SERIES.forEach(name => { if (typeof raw[name] === 'boolean') out[name] = raw[name]; });
+    return Object.keys(out).length ? out : null;
+  } catch (_) { return null; }
+}
+
 const myChart = echarts.init(document.getElementById('hashrate-chart'), null, { renderer: 'canvas' });
+
+// Remember which series the user toggled. Registered once — instance listeners
+// survive the notMerge setOption each poll performs — and safe against a loop,
+// because this event fires on user interaction only, never on the programmatic
+// `legend.selected` that loadChart re-applies.
+myChart.on('legendselectchanged', event => {
+  try { localStorage.setItem(LEGEND_KEY, JSON.stringify(event.selected)); } catch (_) {}
+});
 
 // Last option object handed to the chart, kept so a resize can recompute the
 // width-dependent bits without refetching.
@@ -1311,8 +1350,10 @@ async function loadChart(window) {
     if (options.legend) {
       options.legend.textStyle = { color: muted, fontSize: 11 };
       // The server sends a default show/hide map on every poll. Without this
-      // the chart would undo the user's legend clicks once per refresh.
-      const shown = chartLegendSelected();
+      // the chart would undo the user's legend clicks once per refresh. The
+      // live chart wins where it exists; on the first load it has not been
+      // drawn yet, so the persisted map from a previous visit applies instead.
+      const shown = chartLegendSelected() || storedLegend();
       if (shown) options.legend.selected = shown;
     }
     if (options.tooltip) {
@@ -1579,15 +1620,22 @@ function updateProbability(ourHps, netHps) {
 
 function attachTimeframeSelector() {
   const group = document.getElementById('chart-window-label');
+  const highlight = () => group.querySelectorAll('.timeframe-btn').forEach(item => {
+    item.classList.toggle('active', item.dataset.window === selectedWindow);
+  });
   group.addEventListener('click', event => {
     const button = event.target.closest('.timeframe-btn');
     if (!button) return;
     selectedWindow = button.dataset.window;
-    group.querySelectorAll('.timeframe-btn').forEach(item => {
-      item.classList.toggle('active', item === button);
-    });
+    try { localStorage.setItem(WINDOW_KEY, selectedWindow); } catch (_) {}
+    highlight();
     loadChart(selectedWindow);
   });
+  // The markup hardcodes `active` on 1h so a no-JS load still reads sensibly.
+  // Correct it here — unconditionally, not just when the chart is visible, or
+  // expanding a collapsed panel would show a highlight that disagrees with the
+  // range actually plotted.
+  highlight();
 }
 
 function escHtml(s) {
@@ -1727,7 +1775,7 @@ attachTimeframeSelector();
 if (chartCollapsed()) {
   applyChartCollapsed(true);
 } else {
-  loadChart(DEFAULT_WINDOW);
+  loadChart(selectedWindow);
 }
 updateConnLed();
 refresh();
@@ -1796,6 +1844,77 @@ mod tests {
         // name. They must fall through to the default now.
         assert_eq!(chart_window(Some("1m")), chart_window(None));
         assert_eq!(chart_window(Some("6m")), chart_window(None));
+    }
+
+    /// Pull a `const NAME = ['a', 'b'];` string array out of the embedded JS.
+    fn js_string_array(name: &str) -> Vec<String> {
+        let decl = format!("const {name} = [");
+        let start = DASHBOARD_HTML
+            .find(&decl)
+            .unwrap_or_else(|| panic!("{name} declaration not found in the embedded JS"))
+            + decl.len();
+        let rest = &DASHBOARD_HTML[start..];
+        let end = rest.find(']').expect("unterminated array literal");
+        rest[..end]
+            .split(',')
+            .map(|item| item.trim().trim_matches('\'').to_string())
+            .filter(|item| !item.is_empty())
+            .collect()
+    }
+
+    /// The range buttons, the JS allowlist that gates what gets persisted, and
+    /// the server's range table are three hand-maintained lists of the same
+    /// thing. Adding a range to one and not the others fails quietly: the new
+    /// button silently serves 1h data, or works but never survives a reload.
+    #[test]
+    fn chart_ranges_agree_between_markup_js_and_server() {
+        let buttons: Vec<String> = DASHBOARD_HTML
+            .match_indices("data-window=\"")
+            .filter_map(|(idx, pat)| {
+                let rest = &DASHBOARD_HTML[idx + pat.len()..];
+                rest.find('"').map(|end| rest[..end].to_string())
+            })
+            .collect();
+        assert!(
+            buttons.len() > 3,
+            "data-window scrape found too few: {buttons:?}"
+        );
+        assert_eq!(
+            buttons,
+            js_string_array("WINDOWS"),
+            "range buttons and the JS persistence allowlist have drifted apart"
+        );
+
+        // Every button must reach a distinct server-side range. A typo'd or
+        // unregistered value falls through `chart_window`'s `_` arm to 1h,
+        // which renders as a working button that plots the wrong data.
+        let mut seen: Vec<(&str, ChartWindow)> = Vec::new();
+        for name in &buttons {
+            let window = chart_window(Some(name));
+            if let Some((other, _)) = seen.iter().find(|(_, w)| *w == window) {
+                panic!("range '{name}' resolves to the same window as '{other}'");
+            }
+            seen.push((name, window));
+        }
+    }
+
+    /// The legend's persistence allowlist drops keys it does not recognise, so
+    /// a series the server draws but the JS list omits would toggle fine and
+    /// then forget the toggle on reload.
+    #[test]
+    fn legend_series_agree_between_js_and_server() {
+        let option = build_chart_option(&[]);
+        let served: Vec<String> = option["legend"]["data"]
+            .as_array()
+            .expect("legend.data")
+            .iter()
+            .map(|name| name.as_str().expect("series name").to_string())
+            .collect();
+        assert_eq!(
+            served,
+            js_string_array("LEGEND_SERIES"),
+            "legend series and the JS persistence allowlist have drifted apart"
+        );
     }
 
     /// The legend lists the windows shortest-first while the series are drawn

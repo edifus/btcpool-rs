@@ -9,6 +9,14 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+### Added
+- **The hashrate chart's selected range and legend survive a page reload**,
+  joining the theme, chart-collapse and quote-currency preferences. Picking
+  `30d` and refreshing snapped back to `1h`, and the legend reverted to the
+  default series set: the client defended legend clicks only within a session,
+  against its own 10-second poll, and had nothing to restore them from on a
+  fresh load.
+
 ## [0.3.0] - 2026-08-07
 
 A consensus audit of the block-construction path — everything the pool has to
