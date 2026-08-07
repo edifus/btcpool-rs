@@ -432,15 +432,23 @@ fn build_coinbase(
     //   4       sequence
     //   …       outputs, locktime
     //
-    // so the offset is arithmetic. The debug assertion pins that against a
-    // search for the actual bytes.
+    // so the offset is arithmetic. The search below pins that against where the
+    // bytes actually landed.
+    //
+    // This is checked in release too, not just under `debug_assert`. If the
+    // offset is ever wrong, the extranonce overwrites the wrong field and the
+    // pool and the miner agree on the *same* corrupt coinbase — so the share
+    // validates, the block is invalid, and nothing between here and a rejected
+    // `submitblock` can tell. That is worth one byte search per template per
+    // payout identity, which is not the share path.
     const SCRIPT_SIG_OFFSET: usize = 4 + 1 + 36 + 1;
+    if find_bytes(&serialized, &script_sig_content) != Some(SCRIPT_SIG_OFFSET) {
+        return Err(PoolError::Other(anyhow::anyhow!(
+            "coinbase scriptSig is not at offset {SCRIPT_SIG_OFFSET}; the \
+             serialization layout the extranonce splice depends on has changed"
+        )));
+    }
     let offset = SCRIPT_SIG_OFFSET + height_script.len() + tag_bytes.len();
-    debug_assert_eq!(
-        find_bytes(&serialized, &script_sig_content),
-        Some(SCRIPT_SIG_OFFSET),
-        "coinbase scriptSig is not where the layout says it is"
-    );
 
     Ok((serialized, offset))
 }
