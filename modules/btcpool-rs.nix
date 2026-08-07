@@ -27,6 +27,7 @@ let
           idle_timeout_secs = 300;
           found_block_dir = "found-blocks";
           confirmation_depth = 6;
+          strict_gbt_rules = true;
         };
 
         sv2 = {
@@ -344,6 +345,7 @@ in
             grep -F 'timeout_secs = 10' "$generatedConfig"
             grep -F '[security]' "$generatedConfig"
             grep -F '[sv2]' "$generatedConfig"
+            grep -F 'strict_gbt_rules = true' "$generatedConfig"
             touch "$out"
           '';
     in

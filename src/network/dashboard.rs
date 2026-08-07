@@ -176,6 +176,8 @@ async fn stats_json(State(state): State<DashState>) -> Json<crate::stats::StatsS
     if let Some(template) = state.engine.current_template().await {
         snapshot.template_version = template.version;
     }
+    snapshot.unsupported_rules = state.engine.unsupported_rules().await;
+    snapshot.rules_block_work = state.engine.is_blocked_on_rules().await;
     Json(snapshot)
 }
 
@@ -210,6 +212,23 @@ async fn info_get(State(state): State<DashState>) -> Json<InfoView> {
 /// where a self-reported "I'm fine" from the dying task could not.
 async fn health(State(state): State<DashState>) -> Response {
     let template_age_secs = state.engine.template_age().as_secs();
+
+    // Checked before freshness: an unimplemented template rule is reported the
+    // moment it appears, rather than waiting out `TEMPLATE_STALE_AFTER` for the
+    // withdrawn template to age into a generic "stale". The two are the same
+    // outage but not the same fix, and the probe should say which.
+    if state.engine.is_blocked_on_rules().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unsupported_rules",
+                "unsupported_rules": state.engine.unsupported_rules().await,
+                "template_age_secs": template_age_secs,
+            })),
+        )
+            .into_response();
+    }
+
     if state.engine.is_template_fresh() {
         (
             StatusCode::OK,
@@ -510,6 +529,14 @@ const DASHBOARD_HTML: &str = concat!(
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html { scroll-behavior: smooth; }
+#rules-banner {
+  margin-bottom: 1.25rem; padding: 0.85rem 1.1rem; border-radius: 10px;
+  border: 1px solid var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent);
+  font-size: 0.92rem; line-height: 1.5;
+}
+#rules-banner.blocking { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+#rules-banner strong { display: block; margin-bottom: 0.2rem; }
+#rules-banner code { font-family: ui-monospace, monospace; }
 body {
   background: var(--bg); color: var(--text); min-height: 100vh;
   font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
@@ -786,6 +813,8 @@ tr:last-child td { border-bottom: none; }
 </aside>
 
 <main>
+
+<div id="rules-banner" role="alert" hidden></div>
 
 <section id="overview">
   <div class="hero">
@@ -1387,6 +1416,26 @@ async function refresh() {
     } else {
       bipEl.textContent = '—';
       bipEl.style.color = '';
+    }
+    // Unimplemented `!` template rules: a soft fork activated that this build
+    // predates, so the coinbase it constructs may no longer be consensus-valid.
+    const rulesEl = document.getElementById('rules-banner');
+    const unsupported = Array.isArray(d.unsupported_rules) ? d.unsupported_rules : [];
+    if (unsupported.length) {
+      const names = unsupported.map(r => '<code>' + escHtml(String(r)) + '</code>').join(', ');
+      rulesEl.classList.toggle('blocking', !!d.rules_block_work);
+      rulesEl.innerHTML = d.rules_block_work
+        ? '<strong>Work stopped &mdash; unsupported consensus rules: ' + names + '</strong>'
+          + 'Your node is enforcing rules this version of btcpool-rs does not implement, '
+          + 'so the coinbase it builds may no longer be valid. Upgrade btcpool-rs, or set '
+          + '<code>strict_gbt_rules = false</code> once you have checked the new rules by hand.'
+        : '<strong>Unsupported consensus rules: ' + names + '</strong>'
+          + 'Your node is enforcing rules this version of btcpool-rs does not implement. '
+          + '<code>strict_gbt_rules</code> is off, so the pool is still mining &mdash; any block '
+          + 'it finds may be rejected.';
+      rulesEl.hidden = false;
+    } else {
+      rulesEl.hidden = true;
     }
     document.getElementById('v-session-best-hashrate').textContent = fmtHr(d.session_best_hashrate_hps, false);
     document.getElementById('v-best-hashrate').textContent = fmtHr(d.best_hashrate_hps, false);

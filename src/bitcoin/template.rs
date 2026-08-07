@@ -183,6 +183,53 @@ impl StratumJob {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Template rules
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `getblocktemplate` rules this pool knows how to build a block for.
+///
+/// GBT returns one entry per soft fork the node is enforcing. A `!` prefix
+/// (Core's `gbt_force`) carries BIP22/23's requirement that a client which
+/// *mutates* the template must understand the rule — and this pool mutates it
+/// about as far as a client can: it discards Core's coinbase and builds its own,
+/// so every rule that constrains coinbase shape is the pool's to satisfy.
+///
+/// Core does not error on a `!` rule the client failed to declare; it lists the
+/// rule and leaves the decision to the client. Declining to make that decision
+/// is how a pool ends up mining invalid blocks for a whole activation.
+///
+/// Observed on Bitcoin Core 31.1, 2026-08-07 — captured in
+/// `tests/fixtures/gbt-mainnet.json` and `tests/fixtures/gbt-regtest.json`:
+///
+/// ```text
+/// mainnet, height 961441 → ["csv", "!segwit", "taproot"]
+/// regtest, height 1      → ["csv", "!segwit", "taproot"]
+/// ```
+///
+/// Of these only segwit changes block *construction*, via the witness
+/// commitment output, and that is implemented. `csv` and `taproot` constrain
+/// transactions the node selected for us. Anything else is a rule this binary
+/// predates, so it cannot know whether its coinbase still satisfies consensus.
+pub const SUPPORTED_GBT_RULES: &[&str] = &["csv", "segwit", "taproot"];
+
+/// Template rules carrying the `!` prefix that this build does not implement.
+///
+/// Empty is the healthy case. Rules without the prefix are advisory and are
+/// ignored: the node is telling us it enforces them, not that we must act.
+pub fn unsupported_gbt_rules(rules: &[String]) -> Vec<String> {
+    rules
+        .iter()
+        .filter_map(|rule| rule.strip_prefix('!'))
+        .filter(|name| {
+            !SUPPORTED_GBT_RULES
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(name))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Job builder
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -920,5 +967,72 @@ mod tests {
         buf[..32].copy_from_slice(&tx2);
         buf[32..].copy_from_slice(&tx2);
         assert_eq!(branch[1], hex::encode(double_sha256(&buf)));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Template rules
+    // ─────────────────────────────────────────────────────────────────────────
+
+    use crate::bitcoin::rpc::GbtResult;
+
+    fn sample_gbt() -> GbtResult {
+        GbtResult {
+            version: 0x2000_0000,
+            prev_hash: "00".repeat(32),
+            bits: "1d00ffff".to_string(),
+            cur_time: 1_700_000_000,
+            height: 900_000,
+            coinbase_value: 312_500_000,
+            transactions: Vec::new(),
+            longpoll_id: None,
+            // Shaped like the real thing: OP_RETURN OP_36 aa21a9ed ‖ 32 bytes.
+            default_witness_commitment: Some("6a24aa21a9ed".to_string() + &"11".repeat(32)),
+            rules: vec!["csv".into(), "!segwit".into(), "taproot".into()],
+        }
+    }
+
+    /// The fail-closed default is only safe if the rules a real node actually
+    /// sends are on the allow-list. Both arrays are what Core 31.1 returned on
+    /// 2026-08-07 (`tests/fixtures/gbt-*.json`); a future Core that adds a rule
+    /// should fail here, in CI, rather than by refusing to mine in production.
+    #[test]
+    fn rules_from_a_real_node_are_all_supported() {
+        // Identical on both chains today, kept apart because they need not stay
+        // that way — a rule buried on mainnet can still be live on regtest.
+        let mainnet_961441 = ["csv", "!segwit", "taproot"];
+        let regtest_1 = ["csv", "!segwit", "taproot"];
+
+        for (chain, rules) in [("mainnet", mainnet_961441), ("regtest", regtest_1)] {
+            let rules: Vec<String> = rules.iter().map(|r| r.to_string()).collect();
+            assert!(
+                unsupported_gbt_rules(&rules).is_empty(),
+                "{chain} sends a rule that is not on SUPPORTED_GBT_RULES"
+            );
+        }
+    }
+
+    /// The `!` prefix is the whole signal: it means a client that rewrites the
+    /// coinbase — which this pool does — must understand the rule.
+    #[test]
+    fn a_forced_rule_this_build_does_not_implement_is_reported() {
+        let gbt = GbtResult {
+            rules: vec!["!segwit".into(), "!greatfork".into()],
+            ..sample_gbt()
+        };
+        assert_eq!(
+            unsupported_gbt_rules(&gbt.rules),
+            vec!["greatfork".to_string()]
+        );
+    }
+
+    /// Without the prefix the node is reporting what it enforces, not demanding
+    /// that we act. Stopping the pool over one would be a self-inflicted outage.
+    #[test]
+    fn an_unforced_rule_this_build_does_not_know_is_ignored() {
+        let gbt = GbtResult {
+            rules: vec!["csv".into(), "quietfork".into()],
+            ..sample_gbt()
+        };
+        assert!(unsupported_gbt_rules(&gbt.rules).is_empty());
     }
 }
