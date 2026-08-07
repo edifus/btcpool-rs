@@ -183,7 +183,7 @@ impl StratumJob {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Template rules
+// Template rules and consensus tripwires
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The `getblocktemplate` rules this pool knows how to build a block for.
@@ -247,6 +247,88 @@ pub fn unsupported_gbt_rules(gbt: &GbtResult) -> Vec<String> {
     unsupported
 }
 
+/// Whether the template announces segwit, with or without the `!` prefix.
+fn announces_segwit(rules: &[String]) -> bool {
+    rules.iter().any(|rule| {
+        rule.strip_prefix('!')
+            .unwrap_or(rule)
+            .eq_ignore_ascii_case("segwit")
+    })
+}
+
+/// Consensus block weight limit (BIP141).
+pub const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+
+/// Weight Core's block assembler holds back for the coinbase it expected to
+/// build. Our coinbase is far smaller (a ~200-byte non-witness transaction, so
+/// ~800 WU), which is why the pool can replace it without recomputing the
+/// packing — this checks that the assumption still holds.
+const COINBASE_WEIGHT_RESERVE: u64 = 4_000;
+
+/// The block subsidy at `height`, in satoshis: 50 BTC halving every 210 000
+/// blocks, reaching zero after 64 halvings.
+pub fn block_subsidy(height: u64) -> u64 {
+    const HALVING_INTERVAL: u64 = 210_000;
+    const INITIAL_SUBSIDY: u64 = 50 * 100_000_000;
+
+    let halvings = height / HALVING_INTERVAL;
+    if halvings >= 64 {
+        return 0;
+    }
+    INITIAL_SUBSIDY >> halvings
+}
+
+/// Tripwire: the node's transaction selection must leave room for our coinbase.
+///
+/// Core assembles against `MAX_BLOCK_WEIGHT` minus its own coinbase reserve, so
+/// this can only fire if that contract changes or the template is corrupt.
+/// It is a hard error because the alternative is knowingly mining a block over
+/// the weight limit, which is rejected for certain.
+fn check_block_weight(gbt: &GbtResult) -> Result<(), PoolError> {
+    // The 80-byte header and the transaction-count varint are base bytes, so
+    // they weigh 4× each. Three bytes covers any count Core can return.
+    const BLOCK_OVERHEAD_WEIGHT: u64 = (80 + 3) * 4;
+
+    let tx_weight: u64 = gbt.transactions.iter().map(|tx| tx.weight).sum();
+    let total = BLOCK_OVERHEAD_WEIGHT + tx_weight + COINBASE_WEIGHT_RESERVE;
+    if total > MAX_BLOCK_WEIGHT {
+        return Err(PoolError::Other(anyhow::anyhow!(
+            "template transactions weigh {tx_weight} WU; with block overhead and \
+             the {COINBASE_WEIGHT_RESERVE} WU coinbase reserve that is {total} WU, \
+             over the {MAX_BLOCK_WEIGHT} WU consensus limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Tripwire: `coinbasevalue` must equal the subsidy plus every fee in the
+/// template, which is what Core computed it from.
+///
+/// The pool pays `coinbasevalue` out in full and mines every transaction the
+/// template listed. If those two ever drift apart — a truncated transaction
+/// list, a changed fee semantic — the block is `bad-cb-amount`.
+///
+/// Loud rather than fatal, deliberately. `coinbasevalue` comes from the node and
+/// is authoritative; if our sum disagrees, our sum is the more likely suspect,
+/// and refusing to mine over it would turn a reporting bug into an outage.
+fn check_coinbase_value(gbt: &GbtResult) {
+    let fees: u64 = gbt.transactions.iter().map(|tx| tx.fee).sum();
+    let expected = block_subsidy(gbt.height).saturating_add(fees);
+    if expected != gbt.coinbase_value {
+        tracing::error!(
+            height = gbt.height,
+            coinbase_value = gbt.coinbase_value,
+            expected,
+            subsidy = block_subsidy(gbt.height),
+            fees,
+            transactions = gbt.transactions.len(),
+            "coinbasevalue does not match subsidy + template fees; a block built \
+             from this template may be rejected as bad-cb-amount"
+        );
+        crate::metrics::coinbase_value_mismatch();
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Job builder
 // ─────────────────────────────────────────────────────────────────────────────
@@ -281,6 +363,21 @@ pub fn build_job_template(gbt: &GbtResult) -> Result<JobTemplate, PoolError> {
         .map(hex::decode)
         .transpose()
         .map_err(|e| PoolError::Other(anyhow::anyhow!("witness commitment hex: {e}")))?;
+
+    // A segwit template without a commitment would mine `bad-witness-merkle-match`
+    // blocks. Core has always sent one, so this is a tripwire on an assumption
+    // rather than a known case — but it is the assumption that decides whether
+    // the coinbase gets its OP_RETURN output at all.
+    if announces_segwit(&gbt.rules) && witness_commitment.is_none() {
+        return Err(PoolError::Other(anyhow::anyhow!(
+            "template announces the segwit rule but carries no \
+             default_witness_commitment; a block built from it would be rejected \
+             as bad-witness-merkle-match"
+        )));
+    }
+
+    check_block_weight(gbt)?;
+    check_coinbase_value(gbt);
 
     Ok(JobTemplate {
         prev_hash: stratum_prev_hash(&gbt.prev_hash)?,
@@ -449,6 +546,18 @@ fn build_coinbase(
         )));
     }
     let offset = SCRIPT_SIG_OFFSET + height_script.len() + tag_bytes.len();
+
+    // The coinbase has to fit in the room Core's assembler held back for it, or
+    // the block exceeds the weight limit. It is witness-free here, so weight is
+    // simply four times the size; the witness reserved value added at submit
+    // time is 32 bytes of witness data, one weight unit each.
+    let coinbase_weight = serialized.len() as u64 * 4 + 36;
+    if coinbase_weight > COINBASE_WEIGHT_RESERVE {
+        return Err(PoolError::Other(anyhow::anyhow!(
+            "coinbase weighs {coinbase_weight} WU, over the \
+             {COINBASE_WEIGHT_RESERVE} WU the block template reserved for it"
+        )));
+    }
 
     Ok((serialized, offset))
 }
@@ -1005,20 +1114,10 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Template rules
+    // Template rules and consensus tripwires
     // ─────────────────────────────────────────────────────────────────────────
 
     use crate::bitcoin::rpc::{GbtResult, GbtTransaction};
-
-    fn sample_tx(txid: &str, fee: u64, weight: u64) -> GbtTransaction {
-        GbtTransaction {
-            data: vec![0xde, 0xad],
-            txid: txid.to_string(),
-            hash: txid.to_string(),
-            fee,
-            weight,
-        }
-    }
 
     fn sample_gbt() -> GbtResult {
         GbtResult {
@@ -1027,13 +1126,25 @@ mod tests {
             bits: "1d00ffff".to_string(),
             cur_time: 1_700_000_000,
             height: 900_000,
-            coinbase_value: 312_500_000,
+            coinbase_value: block_subsidy(900_000),
             transactions: Vec::new(),
             longpoll_id: None,
             // Shaped like the real thing: OP_RETURN OP_36 aa21a9ed ‖ 32 bytes.
+            // Every segwit-active node sends one, so its presence is the default
+            // and its absence is what a test has to opt into.
             default_witness_commitment: Some("6a24aa21a9ed".to_string() + &"11".repeat(32)),
             rules: vec!["csv".into(), "!segwit".into(), "taproot".into()],
             vbrequired: 0,
+        }
+    }
+
+    fn sample_tx(txid: &str, fee: u64, weight: u64) -> GbtTransaction {
+        GbtTransaction {
+            data: vec![0xde, 0xad],
+            txid: txid.to_string(),
+            hash: txid.to_string(),
+            fee,
+            weight,
         }
     }
 
@@ -1126,5 +1237,68 @@ mod tests {
             ..sample_gbt()
         };
         assert!(build_job_template(&good).is_ok());
+    }
+
+    /// Building a segwit block without the commitment output is
+    /// `bad-witness-merkle-match`. The commitment is the one thing in the
+    /// coinbase the pool copies rather than derives, so its absence has to stop
+    /// the template rather than quietly change the coinbase's shape.
+    #[test]
+    fn a_segwit_template_without_a_commitment_is_rejected() {
+        assert!(build_job_template(&sample_gbt()).is_ok());
+
+        let missing = GbtResult {
+            default_witness_commitment: None,
+            ..sample_gbt()
+        };
+        assert!(build_job_template(&missing).is_err());
+
+        // No segwit rule announced: the pre-segwit shape is legitimate.
+        let no_segwit = GbtResult {
+            rules: vec!["csv".into()],
+            default_witness_commitment: None,
+            ..sample_gbt()
+        };
+        assert!(build_job_template(&no_segwit).is_ok());
+    }
+
+    #[test]
+    fn block_subsidy_halves_every_210_000_blocks() {
+        assert_eq!(block_subsidy(0), 50 * 100_000_000);
+        assert_eq!(block_subsidy(209_999), 50 * 100_000_000);
+        assert_eq!(block_subsidy(210_000), 25 * 100_000_000);
+        assert_eq!(block_subsidy(630_000), 625_000_000);
+        // The height in tests/fixtures/gbt-mainnet.json, whose coinbasevalue of
+        // 313_883_546 was exactly this plus 1_383_546 in template fees.
+        assert_eq!(block_subsidy(961_441), 312_500_000);
+        assert_eq!(block_subsidy(210_000 * 64), 0);
+        assert_eq!(block_subsidy(u64::MAX), 0);
+    }
+
+    /// Core assembles against the weight limit minus a coinbase reserve, so a
+    /// template that leaves us no room means that contract has broken.
+    #[test]
+    fn a_template_that_leaves_no_room_for_the_coinbase_is_rejected() {
+        let fits = GbtResult {
+            transactions: vec![sample_tx(&"ab".repeat(32), 0, 3_990_000)],
+            ..sample_gbt()
+        };
+        assert!(build_job_template(&fits).is_ok());
+
+        let overflows = GbtResult {
+            transactions: vec![sample_tx(&"ab".repeat(32), 0, 3_999_000)],
+            ..sample_gbt()
+        };
+        assert!(build_job_template(&overflows).is_err());
+    }
+
+    /// The coinbase has to fit the room Core held back for it. Reachable here
+    /// only through an absurd payout script, which is the point: the check is a
+    /// tripwire on the reserve assumption, not on any real address.
+    #[test]
+    fn a_coinbase_over_the_reserved_weight_is_rejected() {
+        let template = sample_template();
+        let huge = payout("address", vec![0x51; 1_000]);
+        assert!(build_job_for_payout(template, &huge, "/test/", 4, 4).is_err());
     }
 }

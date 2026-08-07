@@ -360,7 +360,22 @@ fn assemble_block_hex(
             with_witness = bytes;
             &with_witness[..]
         }
-        None => coinbase,
+        None => {
+            if has_witness_commitment {
+                // The commitment output is present but the reserved value could
+                // not be attached, so this hex is `bad-witness-nonce-size` to
+                // anything that does not repair it. `submitblock` does, which is
+                // why the block is still worth sending — but the archived hex
+                // and any P2P relay of it are not valid, and that is worth
+                // knowing before someone replays the archive by hand.
+                tracing::error!(
+                    "could not attach the BIP141 witness reserved value to the \
+                     coinbase; submitting without it (Core's submitblock repairs \
+                     this, the archived hex will not be relayable as-is)"
+                );
+            }
+            coinbase
+        }
     };
 
     let mut block = Vec::with_capacity(

@@ -216,3 +216,9 @@ pub fn tip_change_discovered_by_timer() {
 pub fn update_unsupported_gbt_rules(count: usize) {
     gauge!("pool_unsupported_gbt_rules").set(count as f64);
 }
+
+/// `coinbasevalue` disagreed with the subsidy plus the template's own fees.
+/// Never expected; a block built from such a template risks `bad-cb-amount`.
+pub fn coinbase_value_mismatch() {
+    counter!("pool_coinbase_value_mismatch_total").increment(1);
+}
