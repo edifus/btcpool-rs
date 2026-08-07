@@ -1847,7 +1847,8 @@ mod tests {
     }
 
     /// Pull a `const NAME = ['a', 'b'];` string array out of the embedded JS.
-    fn js_string_array(name: &str) -> Vec<String> {
+    /// Borrows from `DASHBOARD_HTML`, which is a `const &str` and so `'static`.
+    fn js_string_array(name: &str) -> Vec<&'static str> {
         let decl = format!("const {name} = [");
         let start = DASHBOARD_HTML
             .find(&decl)
@@ -1857,7 +1858,7 @@ mod tests {
         let end = rest.find(']').expect("unterminated array literal");
         rest[..end]
             .split(',')
-            .map(|item| item.trim().trim_matches('\'').to_string())
+            .map(|item| item.trim().trim_matches('\''))
             .filter(|item| !item.is_empty())
             .collect()
     }
@@ -1868,11 +1869,11 @@ mod tests {
     /// button silently serves 1h data, or works but never survives a reload.
     #[test]
     fn chart_ranges_agree_between_markup_js_and_server() {
-        let buttons: Vec<String> = DASHBOARD_HTML
+        let buttons: Vec<&str> = DASHBOARD_HTML
             .match_indices("data-window=\"")
             .filter_map(|(idx, pat)| {
                 let rest = &DASHBOARD_HTML[idx + pat.len()..];
-                rest.find('"').map(|end| rest[..end].to_string())
+                rest.find('"').map(|end| &rest[..end])
             })
             .collect();
         assert!(
@@ -1889,7 +1890,7 @@ mod tests {
         // unregistered value falls through `chart_window`'s `_` arm to 1h,
         // which renders as a working button that plots the wrong data.
         let mut seen: Vec<(&str, ChartWindow)> = Vec::new();
-        for name in &buttons {
+        for &name in &buttons {
             let window = chart_window(Some(name));
             if let Some((other, _)) = seen.iter().find(|(_, w)| *w == window) {
                 panic!("range '{name}' resolves to the same window as '{other}'");
@@ -1904,11 +1905,11 @@ mod tests {
     #[test]
     fn legend_series_agree_between_js_and_server() {
         let option = build_chart_option(&[]);
-        let served: Vec<String> = option["legend"]["data"]
+        let served: Vec<&str> = option["legend"]["data"]
             .as_array()
             .expect("legend.data")
             .iter()
-            .map(|name| name.as_str().expect("series name").to_string())
+            .map(|name| name.as_str().expect("series name"))
             .collect();
         assert_eq!(
             served,
