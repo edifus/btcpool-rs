@@ -34,6 +34,15 @@ pub struct GbtResult {
     pub longpoll_id: Option<String>,
     pub default_witness_commitment: Option<String>,
     pub rules: Vec<String>,
+    /// BIP23 `vbrequired`: version bits the server requires set in submissions.
+    ///
+    /// Core hardcodes this to 0 and has never implemented it, so in practice it
+    /// only carries information from a non-Core template source. It matters
+    /// because BIP320 version rolling lets miners rewrite bits 13..28, and a
+    /// required bit inside that window would be cleared by the miner rather
+    /// than by anything the pool could fix after the fact — the version is in
+    /// the header the miner already hashed.
+    pub vbrequired: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +263,13 @@ impl RpcClient {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // Absent or unparseable reads as 0, which is both Core's value and
+            // the permissive one. A template source that means to require a bit
+            // has to say so.
+            vbrequired: result
+                .get("vbrequired")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
         })
     }
 

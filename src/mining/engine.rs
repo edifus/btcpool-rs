@@ -304,7 +304,7 @@ impl TemplateEngine {
     /// and `submitblock` says `inconclusive`. Better to serve nothing and say
     /// so loudly than to burn hashrate producing blocks that cannot win.
     async fn check_template_rules(&self, gbt: &crate::bitcoin::rpc::GbtResult) -> bool {
-        let unsupported = template::unsupported_gbt_rules(&gbt.rules);
+        let unsupported = template::unsupported_gbt_rules(gbt);
         metrics::update_unsupported_gbt_rules(unsupported.len());
 
         // Edge-triggered: this runs on every tip change and every 30 s tick, and
@@ -769,6 +769,7 @@ mod tests {
             longpoll_id: None,
             default_witness_commitment: Some("6a24aa21a9ed".to_string() + &"11".repeat(32)),
             rules: rules.iter().map(|r| r.to_string()).collect(),
+            vbrequired: 0,
         }
     }
 

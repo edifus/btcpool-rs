@@ -212,12 +212,23 @@ impl StratumJob {
 /// predates, so it cannot know whether its coinbase still satisfies consensus.
 pub const SUPPORTED_GBT_RULES: &[&str] = &["csv", "segwit", "taproot"];
 
-/// Template rules carrying the `!` prefix that this build does not implement.
+/// What in this template the pool cannot honour: `!`-prefixed rules it does not
+/// implement, plus any `vbrequired` bit that BIP320 version rolling would let a
+/// miner clear.
 ///
-/// Empty is the healthy case. Rules without the prefix are advisory and are
+/// Empty is the healthy case. Rules without the `!` prefix are advisory and are
 /// ignored: the node is telling us it enforces them, not that we must act.
-pub fn unsupported_gbt_rules(rules: &[String]) -> Vec<String> {
-    rules
+///
+/// `vbrequired` is folded in here rather than narrowing the rolling mask because
+/// the pool cannot repair it downstream. The version is part of the header the
+/// miner hashed, so forcing a required bit back on at validation time would
+/// invalidate their proof of work; the only real fix is to never advertise the
+/// bit as rollable, and `mining.configure` is negotiated once per session,
+/// before any template is in hand. Reporting it and stopping is the honest
+/// behaviour, and it costs nothing while Core hardcodes the field to 0.
+pub fn unsupported_gbt_rules(gbt: &GbtResult) -> Vec<String> {
+    let mut unsupported: Vec<String> = gbt
+        .rules
         .iter()
         .filter_map(|rule| rule.strip_prefix('!'))
         .filter(|name| {
@@ -226,7 +237,14 @@ pub fn unsupported_gbt_rules(rules: &[String]) -> Vec<String> {
                 .any(|known| known.eq_ignore_ascii_case(name))
         })
         .map(str::to_owned)
-        .collect()
+        .collect();
+
+    let rollable_required = gbt.vbrequired & crate::mining::validator::VERSION_ROLLING_MASK;
+    if rollable_required != 0 {
+        unsupported.push(format!("vbrequired:{rollable_required:#010x}"));
+    }
+
+    unsupported
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -988,6 +1006,7 @@ mod tests {
             // Shaped like the real thing: OP_RETURN OP_36 aa21a9ed ‖ 32 bytes.
             default_witness_commitment: Some("6a24aa21a9ed".to_string() + &"11".repeat(32)),
             rules: vec!["csv".into(), "!segwit".into(), "taproot".into()],
+            vbrequired: 0,
         }
     }
 
@@ -1003,9 +1022,12 @@ mod tests {
         let regtest_1 = ["csv", "!segwit", "taproot"];
 
         for (chain, rules) in [("mainnet", mainnet_961441), ("regtest", regtest_1)] {
-            let rules: Vec<String> = rules.iter().map(|r| r.to_string()).collect();
+            let gbt = GbtResult {
+                rules: rules.iter().map(|r| r.to_string()).collect(),
+                ..sample_gbt()
+            };
             assert!(
-                unsupported_gbt_rules(&rules).is_empty(),
+                unsupported_gbt_rules(&gbt).is_empty(),
                 "{chain} sends a rule that is not on SUPPORTED_GBT_RULES"
             );
         }
@@ -1019,10 +1041,7 @@ mod tests {
             rules: vec!["!segwit".into(), "!greatfork".into()],
             ..sample_gbt()
         };
-        assert_eq!(
-            unsupported_gbt_rules(&gbt.rules),
-            vec!["greatfork".to_string()]
-        );
+        assert_eq!(unsupported_gbt_rules(&gbt), vec!["greatfork".to_string()]);
     }
 
     /// Without the prefix the node is reporting what it enforces, not demanding
@@ -1033,6 +1052,28 @@ mod tests {
             rules: vec!["csv".into(), "quietfork".into()],
             ..sample_gbt()
         };
-        assert!(unsupported_gbt_rules(&gbt.rules).is_empty());
+        assert!(unsupported_gbt_rules(&gbt).is_empty());
+    }
+
+    /// A required version bit that BIP320 rolling would let a miner clear cannot
+    /// be honoured after the fact — the version is in the header they hashed —
+    /// so it is reported alongside the rules rather than silently dropped. A
+    /// required bit *outside* the mask is fine: nothing can rewrite it.
+    #[test]
+    fn a_required_version_bit_is_reported_only_when_miners_could_clear_it() {
+        let inside = GbtResult {
+            vbrequired: 1 << 20,
+            ..sample_gbt()
+        };
+        assert_eq!(
+            unsupported_gbt_rules(&inside),
+            vec!["vbrequired:0x00100000".to_string()]
+        );
+
+        let outside = GbtResult {
+            vbrequired: 1 << 4,
+            ..sample_gbt()
+        };
+        assert!(unsupported_gbt_rules(&outside).is_empty());
     }
 }
