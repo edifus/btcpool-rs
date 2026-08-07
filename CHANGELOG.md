@@ -9,6 +9,96 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-07
+
+A consensus audit of the block-construction path — everything the pool has to
+get right once it discards the node's coinbase and builds its own. This class of
+bug is invisible until it costs a block: share validation reconstructs the same
+header and coinbase the block path will, so a construction error validates
+perfectly and only the `submitblock` fails, on the one day it matters.
+
+### Added
+- **`[pool] strict_gbt_rules` (default `true`) — the pool stops issuing work when
+  `getblocktemplate` announces a `!`-prefixed rule this build does not
+  implement.** The `rules` field was parsed and never read. Its `!` prefix is
+  BIP22/23's statement that a client which *mutates* the template must
+  understand the rule, and this pool mutates it about as far as a client can: it
+  throws away Core's coinbase and rebuilds it, so every rule constraining
+  coinbase shape is the pool's to satisfy. Core does not error on a `!` rule the
+  client failed to declare — it lists the rule and leaves the decision to the
+  client, and the pool was declining to make it. At the next soft-fork
+  activation this binary predates, it would have kept building coinbases against
+  rules it had never heard of, and found out by having a block rejected. The
+  supported set is `csv`, `segwit`, `taproot`, which is what Core 31.1 returns on
+  mainnet and regtest today. Set `false` to keep mining and rely on the metric
+  and banner instead — the right call once you have read the new rule and
+  satisfied yourself the coinbase still complies.
+- `pool_unsupported_gbt_rules` gauge, a `"status":"unsupported_rules"` 503 from
+  `GET /health` naming the blocking rule, and a dashboard banner. `/health`
+  reports it ahead of staleness so the cause is named immediately instead of
+  surfacing as a generic `"stale"` 180 seconds later; with `strict_gbt_rules =
+  false` the probe stays 200, since failing it would only restart a pool the
+  operator deliberately left mining.
+- `GET /stats` gains `unsupported_rules` and `rules_block_work`.
+- Consensus tripwires on every template, all once-per-refresh and all
+  previously unguarded: the transaction set must leave Core's 4000 WU coinbase
+  reserve free of the 4 MWU limit; the coinbase must fit that reserve;
+  `coinbasevalue` must equal the subsidy plus the template's own fees (loud
+  rather than fatal — the node's figure is authoritative, so a disagreement
+  implicates our sum, and refusing to mine over it would turn a reporting bug
+  into an outage), with `pool_coinbase_value_mismatch_total` to alert on; and a
+  template announcing segwit must carry a `default_witness_commitment`, since
+  its absence silently changes the coinbase's shape into
+  `bad-witness-merkle-match`.
+- `tests/fixtures/gbt-{mainnet,regtest}.json` — the non-transaction fields of
+  real `getblocktemplate` responses, as provenance for the supported-rule set. A
+  guessed allow-list behind a fail-closed default is a pool that will not start.
+
+### Changed
+- **The extranonce-offset cross-check now runs in release builds.** It was a
+  `debug_assert`, so it was compiled out of the binary that actually mines. The
+  offset is derived arithmetically from the serialization layout; if it were
+  ever wrong — a `bitcoin` crate change, since the 100-byte scriptSig cap pins
+  the varint width — the extranonce would overwrite the wrong field, and the
+  pool and the miner would agree on the *same* corrupt coinbase. The share
+  validates, the block is invalid, and nothing between here and a rejected
+  `submitblock` can tell. It costs one byte search per template per payout
+  identity, which is not the share path.
+- GBT's `vbrequired` is parsed. A required version bit inside BIP320's rolling
+  window (bits 13–28) cannot be honoured after the fact — the version is in the
+  header the miner already hashed, so forcing it back on at validation time
+  would invalidate their proof of work — so it is reported through the same gate
+  as an unsupported rule rather than silently cleared. Core hardcodes the field
+  to 0, so this only carries information from another template source.
+- Failing to attach the BIP141 witness reserved value is now logged instead of
+  silently falling back to a witness-free coinbase. The block is still worth
+  submitting, because Core's `submitblock` repairs it — but the archived hex is
+  not relayable, and that is worth knowing before someone replays it by hand.
+
+### Fixed
+- **A malformed transaction id from the node panicked the template refresh
+  task.** `build_job_template` decoded each txid with
+  `hex::decode(..).unwrap_or_default()` and then `copy_from_slice` into a
+  `[u8; 32]`, which panics whenever the lengths differ — so any txid that was
+  not exactly 64 valid hex characters, including the empty vector the decode
+  failure produced, killed the task. Only that task: the pool kept accepting
+  miners and serving the last template forever, which is the same freeze the
+  v0.2.0 ZMQ supervision work closed, reached through a different door.
+  `/health` would have caught it after 180 seconds, which is the safety net
+  working, not a reason to keep the panic. Silently truncating instead would
+  have been worse — a wrong merkle leaf produces a root that is wrong but
+  self-consistent — so it is now an error carried by the existing `Result`.
+- **The accepted ntime window could reach past what consensus allows.** Shares
+  were bounded to `curtime ..= curtime + 7200`, but `time-too-new` is measured
+  against the *validating node's* clock, not against the template. The two agree
+  while `curtime ≈ now`, and Core sets `curtime = max(MTP+1, now)` — so on a host
+  running more than about an hour slow, or on regtest under `setmocktime`,
+  `curtime` is `MTP+1` and the template's own window reaches past what the node
+  will accept. A share at the top of it became a block rejected outright. The
+  ceiling is now the tighter of the template-relative drift policy and an
+  absolute bound against the pool's own clock; the floor is unchanged and still
+  subsumes `time-too-old`.
+
 ## [0.2.0] - 2026-08-06
 
 Block accounting that survives reorgs and restarts, a `/health` probe, and the
@@ -731,7 +821,8 @@ unlinked to avoid any ambiguity with a release of the same number here.
 - Dashboard rework: worker rendering and stats mapping fixes; reject rate moved
   into the rejected card; best share keyed by vardiff difficulty.
 
-[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/edifus/btcpool-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/edifus/btcpool-rs/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/edifus/btcpool-rs/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/edifus/btcpool-rs/compare/v0.1.1...v0.1.2
