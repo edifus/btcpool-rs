@@ -836,14 +836,19 @@ tr:last-child td { border-bottom: none; }
     <div class="kpi">
       <div class="label">Miners</div>
       <div class="val" id="v-miners">&mdash;</div>
-      <div class="sub"><span id="v-workers-online">Online: &mdash;</span> &middot; <span id="v-workers-degraded">Degraded: &mdash;</span></div>
-      <div class="sub" id="v-workers-offline">Offline: &mdash;</div>
+      <div class="sub"><span id="v-workers-online">online: &mdash;</span> &middot; <span id="v-workers-degraded">degraded: &mdash;</span></div>
+      <div class="sub" id="v-workers-offline">offline: &mdash;</div>
     </div>
     <div class="kpi">
-      <div class="label">Rejects</div>
+      <div class="label">Accepted</div>
+      <div class="val" id="v-accepted">&mdash;</div>
+      <div class="sub">session: <span id="v-session-accepted">&mdash;</span></div>
+    </div>
+    <div class="kpi">
+      <div class="label">Rejected</div>
       <div class="val" id="v-reject-rate">&mdash;</div>
-      <div class="sub" id="v-stale-rate">Stale: &mdash;</div>
-      <div class="sub" id="v-lifetime-shares">All-time: &mdash;</div>
+      <div class="sub">session: <span id="v-session-rejects">&mdash;</span></div>
+      <div class="sub" id="v-stale-rate">stale: &mdash;</div>
     </div>
     <div class="kpi">
       <div class="label">Best share</div>
@@ -1500,17 +1505,18 @@ async function refresh() {
       .map(([r, n]) => `${rejectLabel(r)}: ${n.toLocaleString()}`)
       .join(' · ');
 
-    document.getElementById('v-reject-rate').textContent = `${d.shares_rejected.toLocaleString()} (${rejectPct}%)`;
-    document.getElementById('v-stale-rate').textContent =
-      `Stale: ${staleTotal.toLocaleString()} (${stalePct}%)` + (otherReasons ? ` · ${otherReasons}` : '');
-
+    // Pool lifetime totals lead, this process's counts trail — the same
+    // all-time/session split as the best-share and best-hashrate cards.
     const lifeAcc = d.lifetime_shares_accepted || 0;
     const lifeRej = d.lifetime_shares_rejected || 0;
     const lifeTotal = lifeAcc + lifeRej;
     const lifePct = lifeTotal > 0 ? (lifeRej / lifeTotal * 100).toFixed(1) : '0.0';
-    const since = d.stats_since_ts ? new Date(d.stats_since_ts * 1000).toLocaleDateString() : '—';
-    document.getElementById('v-lifetime-shares').textContent =
-      `All-time: ${lifeAcc.toLocaleString()} acc · ${lifeRej.toLocaleString()} rej (${lifePct}%) · since ${since}`;
+    document.getElementById('v-accepted').textContent = lifeAcc.toLocaleString();
+    document.getElementById('v-session-accepted').textContent = d.shares_accepted.toLocaleString();
+    document.getElementById('v-reject-rate').textContent = `${lifeRej.toLocaleString()} (${lifePct}%)`;
+    document.getElementById('v-session-rejects').textContent = `${d.shares_rejected.toLocaleString()} (${rejectPct}%)`;
+    document.getElementById('v-stale-rate').textContent =
+      `Stale: ${staleTotal.toLocaleString()} (${stalePct}%)` + (otherReasons ? ` · ${otherReasons}` : '');
 
     const workers = Array.isArray(d.worker_states) ? d.worker_states : [];
     const onlineCount = workers.filter(w => w.online).length;
