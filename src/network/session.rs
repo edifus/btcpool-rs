@@ -434,7 +434,7 @@ async fn handle_line(
     // subscribe floods are as cheap to send as shares and feed the same
     // per-message stats work, so they share the same bucket.
     if !session.guard.share_rate.try_consume() {
-        metrics::share_rejected("rate_limited", session.worker.as_deref().unwrap_or("?"));
+        accounting::record_rate_limited(&session.stats, session.worker.as_deref());
         ban_list.ban(session.peer.ip(), "message rate exceeded");
         return HandleResult::Disconnect("rate limited".into());
     }

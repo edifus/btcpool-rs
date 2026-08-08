@@ -843,6 +843,7 @@ tr:last-child td { border-bottom: none; }
       <div class="label">Rejects</div>
       <div class="val" id="v-reject-rate">&mdash;</div>
       <div class="sub" id="v-stale-rate">Stale: &mdash;</div>
+      <div class="sub" id="v-lifetime-shares">All-time: &mdash;</div>
     </div>
     <div class="kpi">
       <div class="label">Best share</div>
@@ -1503,6 +1504,14 @@ async function refresh() {
     document.getElementById('v-stale-rate').textContent =
       `Stale: ${staleTotal.toLocaleString()} (${stalePct}%)` + (otherReasons ? ` · ${otherReasons}` : '');
 
+    const lifeAcc = d.lifetime_shares_accepted || 0;
+    const lifeRej = d.lifetime_shares_rejected || 0;
+    const lifeTotal = lifeAcc + lifeRej;
+    const lifePct = lifeTotal > 0 ? (lifeRej / lifeTotal * 100).toFixed(1) : '0.0';
+    const since = d.stats_since_ts ? new Date(d.stats_since_ts * 1000).toLocaleDateString() : '—';
+    document.getElementById('v-lifetime-shares').textContent =
+      `All-time: ${lifeAcc.toLocaleString()} acc · ${lifeRej.toLocaleString()} rej (${lifePct}%) · since ${since}`;
+
     const workers = Array.isArray(d.worker_states) ? d.worker_states : [];
     const onlineCount = workers.filter(w => w.online).length;
     const offlineCount = workers.filter(w => !w.online).length;
@@ -1563,6 +1572,7 @@ const REJECT_LABELS = {
   job_not_found: 'Unknown job',
   bad_extranonce: 'Bad extranonce',
   invalid: 'Invalid',
+  rate_limited: 'Rate limited',
 };
 
 function rejectLabel(reason) {

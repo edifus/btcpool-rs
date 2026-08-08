@@ -108,6 +108,22 @@ pub fn record_rejected(
     reason.counts_as_invalid() && guard.invalid_shares.record_invalid()
 }
 
+/// Record a message dropped by the per-connection rate limiter.
+///
+/// Deliberately not `record_rejected`: rate limiting is a pool-side defence,
+/// not a validator verdict, so `"rate_limited"` is not a `RejectReason` and
+/// this takes no `SessionGuard` — it cannot feed the invalid-share ban budget.
+/// The limiter fires on any inbound message, not just submits; the Prometheus
+/// counter has always counted it that way, and `PoolStats` — which the
+/// persisted lifetime totals are built from — must agree with it.
+pub fn record_rate_limited(stats: &PoolStats, worker: Option<&str>) {
+    stats.share_rejected();
+    if let Some(worker) = worker {
+        stats.worker_share_rejected(worker, "rate_limited");
+    }
+    metrics::share_rejected("rate_limited", worker.unwrap_or("?"));
+}
+
 /// Record what the node did with a block we submitted.
 ///
 /// Shared by the SV1 and SV2 session loops *and* the engine's background
@@ -383,5 +399,25 @@ mod tests {
         assert_eq!(snap.blocks_found, 1);
         assert_eq!(snap.blocks_orphaned, 0);
         assert_eq!(snap.blocks_pending_confirmation, 0);
+    }
+
+    /// Rate-limited messages must show up in the pool and worker reject
+    /// counts (matching the Prometheus counter), without needing a
+    /// `SessionGuard` — the fn taking none is what keeps them out of the
+    /// invalid-share ban budget.
+    #[test]
+    fn rate_limited_rejects_count_into_pool_and_worker_stats() {
+        let stats = PoolStats::new_with_store(None);
+        stats.mark_worker_online("w", 1_000);
+
+        record_rate_limited(&stats, Some("w"));
+        // Pre-auth sessions have no worker yet; only the pool counter moves.
+        record_rate_limited(&stats, None);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.shares_rejected, 2);
+        let worker = snap.worker_states.iter().find(|w| w.worker == "w").unwrap();
+        assert_eq!(worker.shares_rejected, 1);
+        assert_eq!(worker.reject_reasons.get("rate_limited"), Some(&1));
     }
 }

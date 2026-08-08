@@ -213,16 +213,52 @@ async fn main() -> Result<()> {
     let ban_list = BanList::new(config.security.ban_duration_secs);
 
     // ── TCP server ────────────────────────────────────────────────────────────
-    network::server::run(
-        config,
-        engine,
-        ban_list,
-        stats,
-        runtime_settings.bitcoin_network(),
-    )
-    .await?;
+    // The accept loop runs until a shutdown signal wins the select. The final
+    // persist is what makes the lifetime share totals exact across a clean
+    // restart; without it they would be up to one snapshot interval stale.
+    tokio::select! {
+        res = network::server::run(
+            config,
+            engine,
+            ban_list,
+            stats.clone(),
+            runtime_settings.bitcoin_network(),
+        ) => res?,
+        _ = shutdown_signal() => {
+            info!("Shutdown signal received; persisting lifetime stats");
+            let stats = stats.clone();
+            tokio::task::spawn_blocking(move || stats.shutdown_persist())
+                .await
+                .ok();
+            info!("Stats persisted; exiting");
+        }
+    }
 
     Ok(())
+}
+
+/// Resolves on the first SIGINT (ctrl-c) or, on unix, SIGTERM — what systemd
+/// and `docker stop` send.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
