@@ -102,7 +102,7 @@ pub fn record_rejected(
     reason: RejectReason,
 ) -> bool {
     let label = reason.label();
-    stats.share_rejected();
+    stats.share_rejected(label);
     stats.worker_share_rejected(worker, label);
     metrics::share_rejected(label, worker);
     reason.counts_as_invalid() && guard.invalid_shares.record_invalid()
@@ -117,7 +117,7 @@ pub fn record_rejected(
 /// counter has always counted it that way, and `PoolStats` — which the
 /// persisted lifetime totals are built from — must agree with it.
 pub fn record_rate_limited(stats: &PoolStats, worker: Option<&str>) {
-    stats.share_rejected();
+    stats.share_rejected("rate_limited");
     if let Some(worker) = worker {
         stats.worker_share_rejected(worker, "rate_limited");
     }
@@ -416,6 +416,9 @@ mod tests {
 
         let snap = stats.snapshot();
         assert_eq!(snap.shares_rejected, 2);
+        // The pool-wide breakdown counts both, including the pre-auth one the
+        // worker-scoped map cannot see.
+        assert_eq!(snap.reject_reasons.get("rate_limited"), Some(&2));
         let worker = snap.worker_states.iter().find(|w| w.worker == "w").unwrap();
         assert_eq!(worker.shares_rejected, 1);
         assert_eq!(worker.reject_reasons.get("rate_limited"), Some(&1));

@@ -846,9 +846,8 @@ tr:last-child td { border-bottom: none; }
     </div>
     <div class="kpi">
       <div class="label">Rejected</div>
-      <div class="val" id="v-reject-rate">&mdash;</div>
-      <div class="sub">session: <span id="v-session-rejects">&mdash;</span></div>
-      <div class="sub" id="v-stale-rate" style="cursor:help;">stale: &mdash;</div>
+      <div class="val" id="v-reject-rate" style="cursor:help;">&mdash;</div>
+      <div class="sub">session: <span id="v-session-rejects" style="cursor:help;">&mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Best share</div>
@@ -1485,33 +1484,22 @@ async function refresh() {
 
     const total = d.shares_accepted + d.shares_rejected;
     const rejectPct = total > 0 ? (d.shares_rejected / total * 100).toFixed(1) : '0.0';
-    const staleTotal = Array.isArray(d.worker_states) ? d.worker_states.reduce((sum, w) => sum + (w.shares_stale || 0), 0) : 0;
-    const stalePct = total > 0 ? (staleTotal / total * 100).toFixed(1) : '0.0';
-    const reasonTotals = {};
-    (Array.isArray(d.worker_states) ? d.worker_states : []).forEach(w => {
-      Object.entries(w.reject_reasons || {}).forEach(([r, n]) => {
-        reasonTotals[r] = (reasonTotals[r] || 0) + n;
-      });
-    });
-    const reasonBreakdown = Object.entries(reasonTotals)
-      .filter(([, n]) => n > 0)
-      .sort((a, b) => b[1] - a[1])
-      .map(([r, n]) => `${rejectLabel(r)}: ${n.toLocaleString()}`)
-      .join('\n');
 
     // Pool lifetime totals lead, this process's counts trail — the same
-    // all-time/session split as the best-share and best-hashrate cards.
+    // all-time/session split as the best-share and best-hashrate cards. Each
+    // reject figure carries its own scope's per-reason breakdown as a tooltip.
     const lifeAcc = d.lifetime_shares_accepted || 0;
     const lifeRej = d.lifetime_shares_rejected || 0;
     const lifeTotal = lifeAcc + lifeRej;
     const lifePct = lifeTotal > 0 ? (lifeRej / lifeTotal * 100).toFixed(1) : '0.0';
     document.getElementById('v-accepted').textContent = lifeAcc.toLocaleString();
     document.getElementById('v-session-accepted').textContent = d.shares_accepted.toLocaleString();
-    document.getElementById('v-reject-rate').textContent = `${lifeRej.toLocaleString()} (${lifePct}%)`;
-    document.getElementById('v-session-rejects').textContent = `${d.shares_rejected.toLocaleString()} (${rejectPct}%)`;
-    const staleEl = document.getElementById('v-stale-rate');
-    staleEl.textContent = `stale: ${staleTotal.toLocaleString()} (${stalePct}%)`;
-    staleEl.title = reasonBreakdown || 'no rejects this session';
+    const rejectEl = document.getElementById('v-reject-rate');
+    rejectEl.textContent = `${lifeRej.toLocaleString()} (${lifePct}%)`;
+    rejectEl.title = reasonTooltip(d.lifetime_reject_reasons);
+    const sessionRejectEl = document.getElementById('v-session-rejects');
+    sessionRejectEl.textContent = `${d.shares_rejected.toLocaleString()} (${rejectPct}%)`;
+    sessionRejectEl.title = reasonTooltip(d.reject_reasons);
 
     const workers = Array.isArray(d.worker_states) ? d.worker_states : [];
     const onlineCount = workers.filter(w => w.online).length;
@@ -1579,6 +1567,14 @@ const REJECT_LABELS = {
 
 function rejectLabel(reason) {
   return REJECT_LABELS[reason] || reason;
+}
+
+function reasonTooltip(reasons) {
+  const parts = Object.entries(reasons || {})
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([r, n]) => `${rejectLabel(r)}: ${n.toLocaleString()}`);
+  return parts.length ? parts.join('\n') : 'no rejects';
 }
 
 function rejectBreakdown(w) {

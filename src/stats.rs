@@ -211,6 +211,7 @@ enum StoreWrite {
         rates: HashrateWindows,
         worker_rates: HashMap<String, HashrateWindows>,
         share_totals: ShareTotals,
+        lifetime_reject_reasons: BTreeMap<String, u64>,
     },
     PruneWorkerBestShares(usize),
     /// Enrol a found block in the confirmation ledger. Unlike everything else
@@ -351,6 +352,17 @@ impl StatsStore {
              ts INTEGER PRIMARY KEY,
              shares_accepted INTEGER NOT NULL,
              shares_rejected INTEGER NOT NULL
+             )",
+            [],
+        )?;
+
+        // Lifetime rejects broken down by reason. Keys come from the closed
+        // `RejectReason` label set (plus "rate_limited"), so the table is
+        // bounded at a handful of rows and never needs pruning.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pool_reject_reasons (
+             reason TEXT PRIMARY KEY,
+             count INTEGER NOT NULL
              )",
             [],
         )?;
@@ -565,6 +577,7 @@ impl StatsStore {
         rates: HashrateWindows,
         worker_rates: &HashMap<String, HashrateWindows>,
         share_totals: ShareTotals,
+        lifetime_reject_reasons: BTreeMap<String, u64>,
     ) {
         self.enqueue(StoreWrite::Snapshot {
             history_ts,
@@ -572,6 +585,7 @@ impl StatsStore {
             rates,
             worker_rates: worker_rates.clone(),
             share_totals,
+            lifetime_reject_reasons,
         });
     }
 
@@ -705,6 +719,17 @@ impl StatsStore {
         )
     }
 
+    fn load_reject_reasons(&self) -> Result<BTreeMap<String, u64>, rusqlite::Error> {
+        let conn = self.read.lock();
+        let mut stmt = conn.prepare("SELECT reason, count FROM pool_reject_reasons")?;
+        let mut rows = stmt.query([])?;
+        let mut reasons = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            reasons.insert(row.get::<_, String>(0)?, row.get::<_, u64>(1)?);
+        }
+        Ok(reasons)
+    }
+
     fn get_hashrate_history(&self, since_ts: u64, bucket_secs: u64) -> Vec<HashrateHistoryPoint> {
         let conn = self.read.lock();
         let mut stmt = match conn.prepare(
@@ -819,6 +844,7 @@ fn apply_write(conn: &Connection, write: StoreWrite) -> Result<(), rusqlite::Err
             rates,
             worker_rates,
             share_totals,
+            lifetime_reject_reasons,
         } => write_snapshot(
             conn,
             history_ts,
@@ -826,6 +852,7 @@ fn apply_write(conn: &Connection, write: StoreWrite) -> Result<(), rusqlite::Err
             rates,
             &worker_rates,
             share_totals,
+            &lifetime_reject_reasons,
         )?,
         StoreWrite::Flush(ack) => {
             let _ = ack.send(());
@@ -841,6 +868,7 @@ fn write_snapshot(
     rates: HashrateWindows,
     worker_rates: &HashMap<String, HashrateWindows>,
     share_totals: ShareTotals,
+    lifetime_reject_reasons: &BTreeMap<String, u64>,
 ) -> Result<(), rusqlite::Error> {
     {
         let tx = conn.unchecked_transaction()?;
@@ -902,6 +930,16 @@ fn write_snapshot(
             params![share_totals.accepted, share_totals.rejected],
         )?;
 
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO pool_reject_reasons (reason, count) VALUES (?1, ?2)
+                 ON CONFLICT(reason) DO UPDATE SET count = MAX(count, excluded.count)",
+            )?;
+            for (reason, count) in lifetime_reject_reasons {
+                stmt.execute(params![reason, count])?;
+            }
+        }
+
         tx.commit()?;
     }
 
@@ -962,6 +1000,13 @@ pub struct PoolStats {
     /// Unix time lifetime accounting began. Boot time when no stats DB is
     /// configured, so the pair above still reads coherently.
     stats_since_ts: u64,
+    /// This boot's rejects by reason, pool-wide. Keys are the closed reject
+    /// label set, so cardinality is bounded; a mutex is fine because rejects
+    /// are the exception on the share path.
+    reject_reasons: Mutex<BTreeMap<&'static str, u64>>,
+    /// Rejects by reason carried over from previous runs; same baseline
+    /// arrangement as the share totals above. Immutable after construction.
+    lifetime_reject_reasons_base: BTreeMap<String, u64>,
     blocks_found: AtomicU64,
     /// Blocks we mined that were consensus-valid but lost a same-height race,
     /// so they sit on a side branch and earned nothing. Tracked apart from
@@ -1055,6 +1100,7 @@ struct Persisted {
     blocks_inconclusive: u64,
     lifetime_share_totals: ShareTotals,
     stats_since_ts: u64,
+    lifetime_reject_reasons: BTreeMap<String, u64>,
 }
 
 impl Persisted {
@@ -1092,6 +1138,10 @@ impl Persisted {
                 warn!("Failed to restore lifetime share totals from DB {path}: {e}");
                 (ShareTotals::default(), 0)
             });
+        let lifetime_reject_reasons = store.load_reject_reasons().unwrap_or_else(|e| {
+            warn!("Failed to restore reject reasons from DB {path}: {e}");
+            BTreeMap::new()
+        });
         if !pending_blocks.is_empty() {
             info!(
                 "Restored {} block(s) awaiting confirmation from {path}",
@@ -1110,6 +1160,7 @@ impl Persisted {
             blocks_inconclusive,
             lifetime_share_totals,
             stats_since_ts,
+            lifetime_reject_reasons,
         }
     }
 }
@@ -1136,6 +1187,7 @@ impl PoolStats {
             blocks_inconclusive,
             lifetime_share_totals,
             stats_since_ts,
+            lifetime_reject_reasons,
         } = stats_db_path
             .filter(|p| !p.is_empty())
             .map(|path| Persisted::load(&path))
@@ -1182,6 +1234,8 @@ impl PoolStats {
             } else {
                 stats_since_ts
             },
+            reject_reasons: Mutex::new(BTreeMap::new()),
+            lifetime_reject_reasons_base: lifetime_reject_reasons,
             blocks_found: AtomicU64::new(blocks_found),
             blocks_inconclusive: AtomicU64::new(blocks_inconclusive),
             blocks_orphaned: AtomicU64::new(blocks_orphaned),
@@ -1249,8 +1303,12 @@ impl PoolStats {
             .fetch_max(difficulty, Ordering::Relaxed);
     }
 
-    pub fn share_rejected(&self) {
+    /// `reason` must come from the closed reject label set
+    /// (`RejectReason::label()` or `"rate_limited"`) — it becomes a persisted
+    /// map key, so it must not be mintable from miner input.
+    pub fn share_rejected(&self, reason: &'static str) {
         self.shares_rejected.fetch_add(1, Ordering::Relaxed);
+        *self.reject_reasons.lock().entry(reason).or_insert(0) += 1;
     }
 
     fn lifetime_shares_accepted(&self) -> u64 {
@@ -1261,6 +1319,24 @@ impl PoolStats {
     fn lifetime_shares_rejected(&self) -> u64 {
         self.lifetime_rejected_base
             .saturating_add(self.shares_rejected.load(Ordering::Relaxed))
+    }
+
+    /// This boot's pool-wide rejects by reason.
+    fn session_reject_reasons(&self) -> BTreeMap<String, u64> {
+        self.reject_reasons
+            .lock()
+            .iter()
+            .map(|(reason, count)| ((*reason).to_string(), *count))
+            .collect()
+    }
+
+    /// Lifetime rejects by reason: the persisted baseline plus this boot.
+    fn lifetime_reject_reasons(&self) -> BTreeMap<String, u64> {
+        let mut merged = self.lifetime_reject_reasons_base.clone();
+        for (reason, count) in self.reject_reasons.lock().iter() {
+            *merged.entry((*reason).to_string()).or_insert(0) += count;
+        }
+        merged
     }
 
     pub fn block_found(&self, worker: &str, payout: &str, hash: &str) {
@@ -1697,7 +1773,14 @@ impl PoolStats {
                 accepted: self.lifetime_shares_accepted(),
                 rejected: self.lifetime_shares_rejected(),
             };
-            store.record_hashrate_snapshot(history_ts, state_ts, total, &by_worker, share_totals);
+            store.record_hashrate_snapshot(
+                history_ts,
+                state_ts,
+                total,
+                &by_worker,
+                share_totals,
+                self.lifetime_reject_reasons(),
+            );
         }
     }
 
@@ -1856,6 +1939,8 @@ impl PoolStats {
             lifetime_shares_accepted: self.lifetime_shares_accepted(),
             lifetime_shares_rejected: self.lifetime_shares_rejected(),
             stats_since_ts: self.stats_since_ts,
+            reject_reasons: self.session_reject_reasons(),
+            lifetime_reject_reasons: self.lifetime_reject_reasons(),
             blocks_found: self.blocks_found.load(Ordering::Relaxed),
             blocks_inconclusive: self.blocks_inconclusive.load(Ordering::Relaxed),
             blocks_orphaned: self.blocks_orphaned.load(Ordering::Relaxed),
@@ -1928,6 +2013,15 @@ pub struct StatsSnapshot {
     pub lifetime_shares_rejected: u64,
     /// Unix time lifetime accounting began.
     pub stats_since_ts: u64,
+    /// This process's pool-wide rejects by reason. Unlike the per-worker
+    /// breakdowns in `worker_states`, this also counts rejects that never
+    /// attached to a known worker (pre-auth rate limiting) and survives
+    /// worker eviction.
+    pub reject_reasons: BTreeMap<String, u64>,
+    /// Rejects by reason across the pool's whole recorded life. Reasons were
+    /// introduced after the lifetime totals, so their sum can trail
+    /// `lifetime_shares_rejected` on pools with older history.
+    pub lifetime_reject_reasons: BTreeMap<String, u64>,
     /// Wins that have survived so far: decremented when the confirmation pass
     /// finds one was reorged out. The Prometheus counter of the same name
     /// cannot go down, so the two differ by `blocks_orphaned`.
@@ -2258,6 +2352,7 @@ mod tests {
                 HashrateWindows::uniform(949.0e15),
                 &worker_rates,
                 ShareTotals::default(),
+                BTreeMap::new(),
             );
             // Pretend it was written before the estimator changed.
             store.flush();
@@ -2299,6 +2394,7 @@ mod tests {
             HashrateWindows::uniform(10.0),
             &HashMap::new(),
             ShareTotals::default(),
+            BTreeMap::new(),
         );
         store.record_hashrate_snapshot(
             150,
@@ -2306,6 +2402,7 @@ mod tests {
             HashrateWindows::uniform(20.0),
             &HashMap::new(),
             ShareTotals::default(),
+            BTreeMap::new(),
         );
         store.flush();
 
@@ -2341,6 +2438,7 @@ mod tests {
                 HashrateWindows::uniform(10.0),
                 &HashMap::new(),
                 ShareTotals::default(),
+                BTreeMap::new(),
             );
         }
         store.flush();
@@ -2357,6 +2455,7 @@ mod tests {
             HashrateWindows::uniform(20.0),
             &HashMap::new(),
             ShareTotals::default(),
+            BTreeMap::new(),
         );
         store.flush();
 
@@ -2380,8 +2479,8 @@ mod tests {
             for _ in 0..3 {
                 stats.share_accepted(1_000);
             }
-            stats.share_rejected();
-            stats.share_rejected();
+            stats.share_rejected("stale");
+            stats.share_rejected("duplicate");
             stats.record_hashrate_snapshot_at(120);
             // StatsStore::Drop drains the queue.
         }
@@ -2405,6 +2504,11 @@ mod tests {
             assert_eq!(snap.lifetime_shares_accepted, 3);
             assert_eq!(snap.lifetime_shares_rejected, 2);
             assert_eq!(snap.stats_since_ts, 111);
+            // The reason breakdown restores alongside the totals; this boot
+            // has rejected nothing yet.
+            assert!(snap.reject_reasons.is_empty());
+            assert_eq!(snap.lifetime_reject_reasons.get("stale"), Some(&1));
+            assert_eq!(snap.lifetime_reject_reasons.get("duplicate"), Some(&1));
 
             stats.share_accepted(1_000);
             stats.record_hashrate_snapshot_at(130);
@@ -2473,7 +2577,7 @@ mod tests {
 
         stats.share_accepted(1_000);
         stats.share_accepted(1_000);
-        stats.share_rejected();
+        stats.share_rejected("stale");
         // 125 snaps to the 120 grid line, like the recorder's drifting ticks.
         stats.record_hashrate_snapshot_at(125);
 
@@ -2533,6 +2637,7 @@ mod tests {
                     accepted: i,
                     rejected: 0,
                 },
+                BTreeMap::new(),
             );
         }
         store.flush();
@@ -2551,6 +2656,7 @@ mod tests {
                 accepted: 12,
                 rejected: 0,
             },
+            BTreeMap::new(),
         );
         store.flush();
         assert_eq!(share_history_ts(&store), vec![base, base + 60, now]);
@@ -2568,7 +2674,7 @@ mod tests {
         {
             let stats = PoolStats::new_with_store(Some(db_path.clone()));
             stats.share_accepted(1_000);
-            stats.share_rejected();
+            stats.share_rejected("stale");
             stats.record_hashrate_snapshot_at(120);
             let store = stats.store.as_ref().unwrap();
             store.flush();
@@ -2609,7 +2715,7 @@ mod tests {
         let stats = PoolStats::new_with_store(Some(db_path.clone()));
         stats.share_accepted(1_000);
         stats.share_accepted(1_000);
-        stats.share_rejected();
+        stats.share_rejected("stale");
 
         stats.shutdown_persist();
 
