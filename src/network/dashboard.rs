@@ -861,11 +861,6 @@ tr:last-child td { border-bottom: none; }
       <div class="sub">session: <span id="v-session-best-hashrate">&mdash;</span></div>
     </div>
     <div class="kpi">
-      <div class="label">Pool uptime</div>
-      <div class="val" id="v-uptime">&mdash;</div>
-      <div class="sub">found blocks survive restarts</div>
-    </div>
-    <div class="kpi">
       <div class="label">Last block found</div>
       <div class="val" id="v-last-block-worker">&mdash;</div>
       <div class="sub trunc" id="v-last-block-payout" title="Payout address encoded in the found block">&mdash;</div>
@@ -1486,7 +1481,6 @@ async function refresh() {
     }
     document.getElementById('v-session-best-hashrate').textContent = fmtHr(d.session_best_hashrate_hps, false);
     document.getElementById('v-best-hashrate').textContent = fmtHr(d.best_hashrate_hps, false);
-    document.getElementById('v-uptime').textContent = fmtUptime(d.uptime_secs);
     document.getElementById('server-uptime').textContent = 'Uptime ' + fmtUptime(d.uptime_secs);
 
     const total = d.shares_accepted + d.shares_rejected;
@@ -1516,7 +1510,7 @@ async function refresh() {
     document.getElementById('v-reject-rate').textContent = `${lifeRej.toLocaleString()} (${lifePct}%)`;
     document.getElementById('v-session-rejects').textContent = `${d.shares_rejected.toLocaleString()} (${rejectPct}%)`;
     document.getElementById('v-stale-rate').textContent =
-      `Stale: ${staleTotal.toLocaleString()} (${stalePct}%)` + (otherReasons ? ` · ${otherReasons}` : '');
+      `stale: ${staleTotal.toLocaleString()} (${stalePct}%)` + (otherReasons ? ` · ${otherReasons}` : '');
 
     const workers = Array.isArray(d.worker_states) ? d.worker_states : [];
     const onlineCount = workers.filter(w => w.online).length;
@@ -1524,9 +1518,9 @@ async function refresh() {
     const nowSecKpi = Math.floor(Date.now() / 1000);
     const degradedCount = workers.filter(w => isDegraded(w, nowSecKpi)).length;
 
-    document.getElementById('v-workers-online').textContent = 'Online: ' + onlineCount;
-    document.getElementById('v-workers-offline').textContent = 'Offline: ' + offlineCount;
-    document.getElementById('v-workers-degraded').textContent = 'Degraded: ' + degradedCount;
+    document.getElementById('v-workers-online').textContent = 'online: ' + onlineCount;
+    document.getElementById('v-workers-offline').textContent = 'offline: ' + offlineCount;
+    document.getElementById('v-workers-degraded').textContent = 'degraded: ' + degradedCount;
 
     // Workers table
     const tbody = document.getElementById('workers-tbody');
@@ -1572,13 +1566,13 @@ async function refresh() {
 }
 
 const REJECT_LABELS = {
-  stale: 'Stale',
-  duplicate: 'Duplicate',
-  low_difficulty: 'Low diff',
-  job_not_found: 'Unknown job',
-  bad_extranonce: 'Bad extranonce',
-  invalid: 'Invalid',
-  rate_limited: 'Rate limited',
+  stale: 'stale',
+  duplicate: 'duplicate',
+  low_difficulty: 'low diff',
+  job_not_found: 'unknown job',
+  bad_extranonce: 'bad extranonce',
+  invalid: 'invalid',
+  rate_limited: 'rate limited',
 };
 
 function rejectLabel(reason) {
