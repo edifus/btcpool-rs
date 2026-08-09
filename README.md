@@ -301,7 +301,7 @@ All settings live in `config.toml`. The essentials:
 ```toml
 [pool]
 listen_addr = "0.0.0.0:3333"
-initial_difficulty = 4096                  # ~1 TH/s at 15s/share; vardiff ramps from here
+initial_difficulty = 2048                  # ~1.8 TH/s at 5s/share; vardiff ramps from here
 
 [sv2]
 enabled = true                             # accept SV2 on the same port (false = SV1 only)
@@ -319,20 +319,33 @@ See [`config.toml.example`](config.toml.example) for the fully annotated referen
 
 ### Difficulty and small / large miners
 
-`[vardiff]` automatically tracks each miner's hashrate, but it works within a
-configured floor and ceiling (`min_difficulty` / `max_difficulty`). The default
-floor of **4096** suits roughly **1 TH/s and up** (a Bitaxe, Avalon Nano, or
-larger) at the 15 s target share time. Two cases to know about:
+`[vardiff]` aims for **one share every 5 seconds** from each miner, and adjusts
+each session's difficulty to hold that. It estimates a miner's hashrate from
+decaying averages of the difficulty it has submitted — the same estimator ckpool
+uses — and only changes the assigned difficulty when the measured optimum leaves
+a **deadzone** around it (`deadzone_low` / `deadzone_high`). In practice a
+session converges within the first minute and then holds the same difficulty for
+hours; a stream of `Sending vardiff update` lines means the miner's hashrate is
+genuinely unstable, not that the pool is hunting.
 
-- **Low-hashrate devices** (USB sticks, NerdMiner-class lottery miners, ~sub-0.3 TH/s)
-  will be pinned at the floor and submit shares slowly, or for very tiny
-  devices almost never. This is purely cosmetic: **share difficulty has no
-  payout effect in solo mining** (you're paid on blocks, 100%, regardless), so
+The floor and ceiling (`min_difficulty` / `max_difficulty`) bound the result. The
+default floor of **256** corresponds to **~220 GH/s** at the 5 s target, so every
+Bitaxe — Max, Ultra, Supra, Gamma, Gamma Turbo, Hex — is adjusted normally rather
+than pinned to it. The ceiling of **4,000,000** covers ~3.4 PH/s, and vardiff
+additionally never assigns a target harder than the current network difficulty.
+Two cases to know about:
+
+- **Low-hashrate devices** (USB sticks, NerdMiner-class lottery miners,
+  ~sub-0.2 TH/s) will be pinned at the floor and submit shares slowly, or for
+  very tiny devices almost never. This is purely cosmetic: **share difficulty has
+  no payout effect in solo mining** (you're paid on blocks, 100%, regardless), so
   such a device still finds and submits a real block normally; it just shows
   little or no hashrate on the dashboard. If you want better telemetry for small
-  hardware, lower `min_difficulty`.
-- **Large miners / farms** can raise `max_difficulty` so vardiff can settle them
-  at a higher target instead of submitting shares faster than the 15 s goal.
+  hardware, lower `min_difficulty` — note it is also the threshold every share is
+  validated against.
+- **Large miners / farms** beyond the ceiling can raise `max_difficulty` so
+  vardiff can settle them at a higher target instead of submitting shares faster
+  than the 5 s goal.
 
 Miners that send `mining.suggest_difficulty` (e.g. AxeOS's "pool difficulty"
 field) are honored as a **starting** difficulty, clamped to this floor/ceiling;

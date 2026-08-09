@@ -20,7 +20,7 @@ let
         pool = {
           listen_addr = "0.0.0.0:3333";
           coinbase_tag = "/btcpool-rs/";
-          initial_difficulty = 4096;
+          initial_difficulty = 2048;
           extranonce1_size = 4;
           extranonce2_size = 4;
           max_connections = 256;
@@ -50,11 +50,13 @@ let
         };
 
         vardiff = {
-          target_share_time_secs = 15;
-          retarget_interval_secs = 60;
-          min_difficulty = 4096;
-          max_difficulty = 65536;
-          max_retarget_factor = 4.0;
+          target_share_time_secs = 5;
+          retarget_interval_secs = 100;
+          deadzone_low = 0.667;
+          deadzone_high = 1.5;
+          min_difficulty = 256;
+          max_difficulty = 4000000;
+          max_retarget_factor = 10.0;
         };
 
         security = {

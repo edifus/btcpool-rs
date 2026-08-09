@@ -12,7 +12,7 @@
 ///   - Submit latency tracking
 ///   - Security guards (rate limiting, invalid share counting, message size)
 use crate::{
-    bitcoin::template::{build_job_for_payout, JobTemplate, StratumJob},
+    bitcoin::template::{bits_to_difficulty, build_job_for_payout, JobTemplate, StratumJob},
     config::{Config, VardiffConfig},
     error::PoolError,
     metrics,
@@ -125,7 +125,7 @@ impl Session {
             coinbase_tag: cfg.pool.coinbase_tag.clone(),
             network,
             difficulty: initial_diff,
-            vardiff: Vardiff::new(cfg.vardiff.clone(), initial_diff),
+            vardiff: Vardiff::new(cfg.vardiff.clone(), initial_diff, Instant::now()),
             vardiff_cfg: cfg.vardiff.clone(),
             credit: ShareCredit::new(cfg.vardiff.min_difficulty, Instant::now()),
             share_set: ShareSet::new(),
@@ -135,6 +135,15 @@ impl Session {
             connect_time: Instant::now(),
             stats,
         }
+    }
+
+    /// Difficulty of the block currently being worked on, when a template is
+    /// held. Vardiff clamps to it so a miner is never asked for a share harder
+    /// to find than a block.
+    fn network_difficulty(&self) -> Option<u64> {
+        let template = self.current_template.as_ref()?;
+        let difficulty = bits_to_difficulty(&template.bits).ok()?;
+        (difficulty.is_finite() && difficulty >= 1.0).then_some(difficulty as u64)
     }
 }
 
@@ -245,21 +254,8 @@ pub async fn run(
                             }
                         }
 
-                        if let Some(new_diff) = session.vardiff.check_retarget() {
-                            let old_diff = session.difficulty;
-                            session.difficulty = new_diff;
-                            if let Some(worker) = &session.worker {
-                                metrics::vardiff_retarget(worker, old_diff, new_diff);                                session.stats.update_worker_vardiff(worker, new_diff);                            }
-                            let msg = ResponseBuilder::set_difficulty(new_diff);
-                            info!(
-                                peer = %session.peer,
-                                worker = ?session.worker,
-                                difficulty = new_diff,
-                                "Sending vardiff update"
-                            );
-                            if !send_messages(&writer, peer, vec![msg]).await {
-                                break;
-                            }
+                        if !apply_retarget(&mut session, &writer).await {
+                            break;
                         }
                     }
                 }
@@ -313,6 +309,13 @@ pub async fn run(
                     }
                     Err(_) => break,
                 }
+
+                // Job pushes are the only thing that reaches a miner submitting
+                // nothing, so they are also what lets vardiff ease the target of
+                // one that has stopped.
+                if !apply_retarget(&mut session, &writer).await {
+                    break;
+                }
             }
         }
     }
@@ -335,6 +338,36 @@ pub async fn run(
         honors_set_difficulty = session.credit.honors_assigned(),
         "Miner session ended"
     );
+}
+
+/// Run a vardiff check and push `mining.set_difficulty` if the target moved.
+/// Returns false when the write failed and the session should end.
+async fn apply_retarget(
+    session: &mut Session,
+    writer: &tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
+) -> bool {
+    let network_difficulty = session.network_difficulty();
+    let Some(new_diff) = session
+        .vardiff
+        .check_retarget(Instant::now(), network_difficulty)
+    else {
+        return true;
+    };
+
+    let old_diff = session.difficulty;
+    session.difficulty = new_diff;
+    if let Some(worker) = &session.worker {
+        metrics::vardiff_retarget(worker, old_diff, new_diff);
+        session.stats.update_worker_vardiff(worker, new_diff);
+    }
+    info!(
+        peer = %session.peer,
+        worker = ?session.worker,
+        difficulty = new_diff,
+        "Sending vardiff update"
+    );
+    let msg = ResponseBuilder::set_difficulty(new_diff);
+    send_messages(writer, session.peer, vec![msg]).await
 }
 
 async fn send_messages(
@@ -548,7 +581,7 @@ fn handle_suggest_difficulty(
     // Seed vardiff from the hint, clamped to the configured floor/ceiling so a
     // (buggy or hostile) suggestion can never drop a miner below the share-rate
     // floor. Vardiff owns the difficulty from here.
-    let applied = session.vardiff.suggest(params.difficulty);
+    let applied = session.vardiff.suggest(params.difficulty, Instant::now());
     session.difficulty = applied;
     info!(
         peer = %session.peer,
@@ -925,10 +958,11 @@ async fn handle_submit(
 /// and metrics. Returns the difficulty credited to the hashrate estimator.
 fn accept_share(session: &mut Session, worker: &str, hash_difficulty: u64) -> u64 {
     session.shares_accepted += 1;
-    session.vardiff.record_share();
+    let now = Instant::now();
     let credit = session
         .credit
-        .credit(session.difficulty, hash_difficulty, Instant::now());
+        .credit(session.difficulty, hash_difficulty, now);
+    session.vardiff.record_share(credit, now);
     accounting::record_accepted(
         &session.stats,
         &session.session_id,

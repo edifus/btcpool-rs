@@ -537,11 +537,11 @@ poll_fallback = true
 poll_interval_ms = 500
 
 [vardiff]
-target_share_time_secs = 15
-retarget_interval_secs = 60
+target_share_time_secs = 5
+retarget_interval_secs = 100
 min_difficulty = 1
-max_difficulty = 65536
-max_retarget_factor = 4.0
+max_difficulty = 4000000
+max_retarget_factor = 10.0
 
 [security]
 max_connections_per_ip = 64

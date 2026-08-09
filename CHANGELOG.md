@@ -53,6 +53,36 @@ everything else bumps the **patch** version.
   fresh load.
 
 ### Changed
+- **Vardiff now settles instead of oscillating.** The old controller counted
+  shares in a single 60 s window and jumped straight to the implied difficulty.
+  At the previous 15 s target that window held four shares, whose Poisson
+  counting noise is ±50%, so a miner was handed a new difficulty roughly every
+  minute spanning an order of magnitude — in one observed session, 83 changes
+  between 5,710 and 65,595 around a correct mean of 22,680. Rebuilt on ckpool's
+  approach: two difficulty-weighted decaying averages (time constants derived
+  from the target share time, so they always hold enough shares to be quiet), a
+  warm-up correction so a fresh session is accurate within seconds of its first
+  share, and a multiplicative deadzone that leaves the assigned difficulty alone
+  until the measured optimum is a *factor* away rather than a few percent. A
+  settled miner now converges inside the first minute and then changes
+  difficulty on the order of once every few hours. Three side effects of the old
+  design are gone with it: a paused miner is no longer halved once per window
+  (it decays and is protected by a returning-from-absence guard), a silent
+  session is now retargeted at all — the check ran only on inbound messages and
+  is now also driven by job pushes — and firmware that ignores
+  `set_difficulty` no longer ratchets to `max_difficulty`, because the estimate
+  is built from what each share is credited rather than from how many arrived.
+  Vardiff also never assigns a target harder than the current network
+  difficulty. `[vardiff]` gains `deadzone_low` / `deadzone_high` (both
+  defaulted, so existing configs keep loading) and is now validated at boot.
+- **Difficulty defaults retuned for the hardware people actually run.** The
+  target share time drops from 15 s to **5 s**, `pool.initial_difficulty` from
+  4096 to **2048**, `vardiff.min_difficulty` from 4096 to **256** — ~220 GH/s at
+  the new target, so every Bitaxe model is adjusted by vardiff rather than
+  pinned to the floor — and `vardiff.max_difficulty` from 65,536 to
+  **4,000,000**, which covers ~3.4 PH/s instead of capping a session at 18.8
+  TH/s. `retarget_interval_secs` moves to 100 and `max_retarget_factor` to 10.0,
+  the latter now only a safety clamp on a pathological jump.
 - **Every cumulative KPI now measures since the pool's last found block rather
   than pool lifetime** — identical for a solo pool until the first win.
   Finding a block starts a new round: accepted and rejected totals (and their

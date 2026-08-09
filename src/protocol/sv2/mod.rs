@@ -22,7 +22,7 @@ mod noise;
 pub use noise::init as init_noise_authority;
 
 use crate::{
-    bitcoin::template::{build_job_for_payout, JobTemplate},
+    bitcoin::template::{bits_to_difficulty, build_job_for_payout, JobTemplate},
     config::{Config, VardiffConfig},
     metrics,
     mining::{
@@ -134,7 +134,7 @@ impl Sv2Session {
             extranonce_size: cfg.pool.extranonce2_size,
             extranonce_total: cfg.pool.extranonce1_size + cfg.pool.extranonce2_size,
             difficulty: initial_diff,
-            vardiff: Vardiff::new(cfg.vardiff.clone(), initial_diff),
+            vardiff: Vardiff::new(cfg.vardiff.clone(), initial_diff, Instant::now()),
             vardiff_cfg: cfg.vardiff.clone(),
             credit: ShareCredit::new(cfg.vardiff.min_difficulty, Instant::now()),
             share_set: ShareSet::new(),
@@ -150,6 +150,15 @@ impl Sv2Session {
             connect_time: Instant::now(),
             stats,
         }
+    }
+
+    /// Difficulty of the block currently being worked on, when a template is
+    /// held. Vardiff clamps to it so a miner is never asked for a share harder
+    /// to find than a block.
+    fn network_difficulty(&self) -> Option<u64> {
+        let template = self.pending_template.as_ref()?;
+        let difficulty = bits_to_difficulty(&template.bits).ok()?;
+        (difficulty.is_finite() && difficulty >= 1.0).then_some(difficulty as u64)
     }
 
     /// Allocate an SV2 job_id and remember its engine job-id mapping.
@@ -301,22 +310,8 @@ pub async fn run(
                     }
                 }
 
-                // Vardiff retarget → SetTarget
-                if session.channel_open {
-                    if let Some(new_diff) = session.vardiff.check_retarget() {
-                        let old_diff = session.difficulty;
-                        session.difficulty = new_diff;
-                        if let Some(worker) = &session.worker {
-                            metrics::vardiff_retarget(worker, old_diff, new_diff);
-                            session.stats.update_worker_vardiff(worker, new_diff);
-                        }
-                        let target = job::difficulty_to_sv2_target(new_diff);
-                        info!(peer = %peer, worker = ?session.worker, difficulty = new_diff, "Sending SV2 set_target");
-                        match messages::set_target(session.channel_id, target) {
-                            Ok(p) => if !writer.send(MESSAGE_TYPE_SET_TARGET, true, &p).await { break; },
-                            Err(e) => { error!("encode set_target: {e}"); break; }
-                        }
-                    }
+                if !apply_retarget(&mut session, &mut writer).await {
+                    break;
                 }
             }
 
@@ -342,6 +337,13 @@ pub async fn run(
                     Err(broadcast::error::RecvError::Lagged(n)) => warn!("SV2 {peer} missed {n} job broadcasts"),
                     Err(_) => break,
                 }
+
+                // Job pushes are the only thing that reaches a miner submitting
+                // nothing, so they are also what lets vardiff ease the target of
+                // one that has stopped.
+                if !apply_retarget(&mut session, &mut writer).await {
+                    break;
+                }
             }
         }
     }
@@ -363,6 +365,42 @@ pub async fn run(
         honors_set_difficulty = session.credit.honors_assigned(),
         "SV2 miner session ended"
     );
+}
+
+/// Run a vardiff check and push `SetTarget` if the target moved. Returns false
+/// when the write failed and the session should end.
+async fn apply_retarget(session: &mut Sv2Session, writer: &mut NoiseWriter) -> bool {
+    if !session.channel_open {
+        return true;
+    }
+    let network_difficulty = session.network_difficulty();
+    let Some(new_diff) = session
+        .vardiff
+        .check_retarget(Instant::now(), network_difficulty)
+    else {
+        return true;
+    };
+
+    let old_diff = session.difficulty;
+    session.difficulty = new_diff;
+    if let Some(worker) = &session.worker {
+        metrics::vardiff_retarget(worker, old_diff, new_diff);
+        session.stats.update_worker_vardiff(worker, new_diff);
+    }
+    info!(
+        peer = %session.peer,
+        worker = ?session.worker,
+        difficulty = new_diff,
+        "Sending SV2 set_target"
+    );
+    let target = job::difficulty_to_sv2_target(new_diff);
+    match messages::set_target(session.channel_id, target) {
+        Ok(p) => writer.send(MESSAGE_TYPE_SET_TARGET, true, &p).await,
+        Err(e) => {
+            error!("encode set_target: {e}");
+            false
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -844,10 +882,11 @@ async fn handle_submit(
 /// Book an accepted share. Returns the difficulty credited to the estimator.
 fn accept_share(session: &mut Sv2Session, worker: &str, hash_difficulty: u64) -> u64 {
     session.shares_accepted += 1;
-    session.vardiff.record_share();
+    let now = Instant::now();
     let credit = session
         .credit
-        .credit(session.difficulty, hash_difficulty, Instant::now());
+        .credit(session.difficulty, hash_difficulty, now);
+    session.vardiff.record_share(credit, now);
     accounting::record_accepted(
         &session.stats,
         &session.session_id,

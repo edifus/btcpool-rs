@@ -226,6 +226,22 @@ pub struct VardiffConfig {
     pub min_difficulty: u64,
     pub max_difficulty: u64,
     pub max_retarget_factor: f64,
+    /// Lower edge of the deadzone, as a multiple of the assigned difficulty:
+    /// nothing is sent until the computed optimum falls to or below it.
+    #[serde(default = "default_deadzone_low")]
+    pub deadzone_low: f64,
+    /// Upper edge of the deadzone. Widening the band leaves difficulty still
+    /// for longer at the cost of sitting further from the target share time.
+    #[serde(default = "default_deadzone_high")]
+    pub deadzone_high: f64,
+}
+
+fn default_deadzone_low() -> f64 {
+    0.667
+}
+
+fn default_deadzone_high() -> f64 {
+    1.5
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -348,6 +364,50 @@ impl Config {
                 "[pool] confirmation_depth must be between 1 and 100 (got {}); \
                  6 is the conventional finality threshold",
                 self.pool.confirmation_depth
+            );
+        }
+
+        // Vardiff divides by the target and clamps between reciprocals of the
+        // retarget factor, so these are the values that would panic or drive
+        // every session to the floor rather than merely tune it badly.
+        let vardiff = &self.vardiff;
+        if vardiff.target_share_time_secs == 0 {
+            anyhow::bail!("[vardiff] target_share_time_secs must be >= 1 (got 0)");
+        }
+        if vardiff.min_difficulty == 0 {
+            anyhow::bail!("[vardiff] min_difficulty must be >= 1 (got 0)");
+        }
+        if vardiff.min_difficulty > vardiff.max_difficulty {
+            anyhow::bail!(
+                "[vardiff] min_difficulty ({}) must not exceed max_difficulty ({})",
+                vardiff.min_difficulty,
+                vardiff.max_difficulty
+            );
+        }
+        if !vardiff.max_retarget_factor.is_finite() || vardiff.max_retarget_factor <= 1.0 {
+            anyhow::bail!(
+                "[vardiff] max_retarget_factor must be > 1.0 (got {}); \
+                 it bounds a difficulty change to that ratio in either direction",
+                vardiff.max_retarget_factor
+            );
+        }
+        if !vardiff.deadzone_low.is_finite()
+            || vardiff.deadzone_low <= 0.0
+            || vardiff.deadzone_low >= 1.0
+        {
+            anyhow::bail!(
+                "[vardiff] deadzone_low must be between 0.0 and 1.0 (got {}); \
+                 it is the fraction of the assigned difficulty the optimum has to \
+                 fall to before the difficulty is lowered",
+                vardiff.deadzone_low
+            );
+        }
+        if !vardiff.deadzone_high.is_finite() || vardiff.deadzone_high <= 1.0 {
+            anyhow::bail!(
+                "[vardiff] deadzone_high must be > 1.0 (got {}); \
+                 it is the multiple of the assigned difficulty the optimum has to \
+                 reach before the difficulty is raised",
+                vardiff.deadzone_high
             );
         }
 
@@ -486,7 +546,7 @@ mod tests {
 [pool]
 listen_addr = "127.0.0.1:3333"
 coinbase_tag = "{coinbase_tag}"
-initial_difficulty = 4096
+initial_difficulty = 2048
 extranonce1_size = {extranonce1}
 extranonce2_size = {extranonce2}
 max_connections = 16
@@ -502,11 +562,11 @@ poll_fallback = true
 poll_interval_ms = 1000
 
 [vardiff]
-target_share_time_secs = 15
-retarget_interval_secs = 60
-min_difficulty = 4096
-max_difficulty = 65536
-max_retarget_factor = 4.0
+target_share_time_secs = 5
+retarget_interval_secs = 100
+min_difficulty = 256
+max_difficulty = 4000000
+max_retarget_factor = 10.0
 
 [security]
 max_connections_per_ip = 5

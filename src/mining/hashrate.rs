@@ -56,7 +56,7 @@ pub const TICK_SECS: u64 = 2;
 /// Create an exponentially decaying average over `interval`.
 ///
 /// Ported from ckpool's `decay_time()` in `src/libckpool.c`.
-fn decay_time(f: &mut f64, fadd: f64, fsecs: f64, interval: f64) {
+pub(crate) fn decay_time(f: &mut f64, fadd: f64, fsecs: f64, interval: f64) {
     if fsecs <= 0.0 {
         return;
     }
@@ -76,10 +76,21 @@ fn decay_time(f: &mut f64, fadd: f64, fsecs: f64, interval: f64) {
 /// Seconds between two instants, floored so a clock that barely moved (or a
 /// pair of events in the same microsecond) cannot become a denominator.
 /// Ported from ckpool's `sane_tdiff()`.
-fn sane_tdiff(end: Instant, start: Instant) -> f64 {
+pub(crate) fn sane_tdiff(end: Instant, start: Instant) -> f64 {
     end.saturating_duration_since(start)
         .as_secs_f64()
         .max(0.001)
+}
+
+/// Warm-up correction for an average that started at zero.
+///
+/// A [`decay_time`] average fed a constant rate for `age_secs` reads low by
+/// exactly this factor, so dividing by it recovers the true rate long before
+/// the window has filled. Ported from ckpool's `time_bias()` in
+/// `src/stratifier.c`, which uses it to make vardiff usable on a session that
+/// has only been submitting for a few seconds.
+pub(crate) fn time_bias(age_secs: f64, interval: f64) -> f64 {
+    1.0 - 1.0 / (age_secs / interval).min(36.0).exp()
 }
 
 /// Decayed difficulty-share rates over [`WINDOW_SECS`].
