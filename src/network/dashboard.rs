@@ -704,11 +704,11 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
 #sharerate-panel { margin-top: 1.1rem; }
 table { width: 100%; border-collapse: collapse; font-size: 0.84rem; font-variant-numeric: tabular-nums; }
 th {
-  text-align: left; color: var(--muted); font-weight: 500; padding: 0.34rem 0.55rem;
+  text-align: center; color: var(--muted); font-weight: 500; padding: 0.34rem 0.55rem;
   border-bottom: 1px solid var(--border); font-size: 0.66rem;
   text-transform: uppercase; letter-spacing: 0.09em; white-space: nowrap;
 }
-td { padding: 0.5rem 0.55rem; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+td { text-align: left; padding: 0.5rem 0.55rem; border-bottom: 1px solid var(--grid); white-space: nowrap; }
 tr:last-child td { border-bottom: none; }
 .empty-row { color: var(--muted); text-align: center; padding: 1.2rem; font-size: 0.84rem; }
 /* Worker status LED — green when online, grey when offline. */
@@ -718,7 +718,7 @@ tr:last-child td { border-bottom: none; }
 .led-off { background: var(--muted); opacity: 0.45; }
 .col-led { text-align: center; }
 #workers .col-rate, #workers .col-count {
-  padding-left: 0.35rem; padding-right: 0.35rem; text-align: right;
+  padding-left: 0.35rem; padding-right: 0.35rem;
 }
 /* New chain tip: pulse the number itself in the accent color (two beats),
    matching the other highlighted values instead of flashing the background. */
@@ -963,7 +963,7 @@ tr:last-child td { border-bottom: none; }
         <th>Worker</th>
         <th class="col-led">Status</th>
         <th>Mode</th>
-        <th>Vardiff</th>
+        <th>Diff</th>
         <th class="col-rate" title="1-minute average hashrate" aria-label="1-minute average hashrate">Avg 1m</th>
         <th class="col-rate" title="5-minute average hashrate" aria-label="5-minute average hashrate">Avg 5m</th>
         <th class="col-rate" title="10-minute average hashrate" aria-label="10-minute average hashrate">Avg 10m</th>
