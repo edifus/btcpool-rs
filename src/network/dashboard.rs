@@ -449,12 +449,12 @@ async fn share_chart_json(
         |stats, since, bucket| stats.get_share_rate_history(since, bucket),
         |live, ts| RateHistoryPoint {
             ts,
-            one_minute: Some(live.shares_per_second_1m),
-            five_minutes: Some(live.shares_per_second_5m),
-            ten_minutes: Some(live.shares_per_second_10m),
-            one_hour: Some(live.shares_per_second_1h),
-            six_hours: Some(live.shares_per_second_6h),
-            twenty_four_hours: Some(live.shares_per_second_24h),
+            one_minute: Some(live.shares_per_minute_1m),
+            five_minutes: Some(live.shares_per_minute_5m),
+            ten_minutes: Some(live.shares_per_minute_10m),
+            one_hour: Some(live.shares_per_minute_1h),
+            six_hours: Some(live.shares_per_minute_6h),
+            twenty_four_hours: Some(live.shares_per_minute_24h),
         },
     )
     .await
@@ -462,7 +462,7 @@ async fn share_chart_json(
 
 /// Build the ECharts option object the browser renders. The client only skins
 /// it (theme colours, JS formatter callbacks); everything structural is decided
-/// here. Unit-agnostic — the hashrate and shares/sec panels share it, and the
+/// here. Unit-agnostic — the hashrate and shares/min panels share it, and the
 /// client picks the y-axis formatter per chart.
 fn build_chart_option(history: &[RateHistoryPoint]) -> serde_json::Value {
     let make_series = |name: &str, data: Vec<serde_json::Value>, width: f64| {
@@ -674,10 +674,13 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
 .panel-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.65rem; margin-bottom: 0.7rem; }
 .panel-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 0.7rem; }
 .panel-toggle {
+  display: inline-grid; place-items: center;
   cursor: pointer; font: inherit; font-size: 0.72rem; color: var(--muted);
   background: none; border: 1px solid var(--border); border-radius: 5px;
   padding: 0.22rem 0.45rem;
 }
+.panel-toggle::before, .panel-toggle-label { grid-area: 1 / 1; }
+.panel-toggle::before { content: "Show"; visibility: hidden; }
 .panel-toggle:hover { color: var(--text); border-color: var(--muted); }
 .panel-title { font-size: 0.66rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.13em; color: var(--muted); }
 .timeframe-tabs { display: flex; flex-wrap: wrap; align-items: center; }
@@ -714,6 +717,9 @@ tr:last-child td { border-bottom: none; }
 .led-warn { background: var(--warn); box-shadow: 0 0 5px var(--warn); }
 .led-off { background: var(--muted); opacity: 0.45; }
 .col-led { text-align: center; }
+#workers .col-rate, #workers .col-count {
+  padding-left: 0.35rem; padding-right: 0.35rem; text-align: right;
+}
 /* New chain tip: pulse the number itself in the accent color (two beats),
    matching the other highlighted values instead of flashing the background. */
 @keyframes blockPulse {
@@ -891,7 +897,7 @@ tr:last-child td { border-bottom: none; }
       <div class="label">Accepted</div>
       <div class="val" id="v-accepted">&mdash;</div>
       <div class="sub">session: <span id="v-session-accepted">&mdash;</span></div>
-      <div class="sub" id="v-shares-per-sec" title="Accepted shares per second, averaged over the last minute">&mdash;</div>
+      <div class="sub" id="v-shares-per-min" title="Accepted shares per minute, averaged over the last minute">&mdash;</div>
     </div>
     <div class="kpi">
       <div class="label">Rejected</div>
@@ -931,7 +937,7 @@ tr:last-child td { border-bottom: none; }
           <button type="button" class="timeframe-btn" data-window="180d">180d</button>
           <button type="button" class="timeframe-btn" data-window="all">All</button>
         </div>
-        <button id="chart-toggle" class="panel-toggle" title="Hide or show the hashrate chart">Hide</button>
+        <button id="chart-toggle" class="panel-toggle" title="Hide or show the hashrate chart"><span class="panel-toggle-label">Hide</span></button>
       </div>
     </div>
     <div id="hashrate-chart"></div>
@@ -939,9 +945,9 @@ tr:last-child td { border-bottom: none; }
 
   <div class="panel" id="sharerate-panel">
     <div class="panel-head">
-      <div class="panel-title">Shares per second <span title="Accepted shares per second, decayed over the same windows as the hashrate chart above and plotted on the same range. Moves with vardiff and miner count, so it can shift while hashrate holds steady" style="cursor:help;">&#9432;</span></div>
+      <div class="panel-title">Shares per minute <span title="Accepted shares per minute, decayed over the same windows as the hashrate chart above and plotted on the same range. Moves with vardiff and miner count, so it can shift while hashrate holds steady" style="cursor:help;">&#9432;</span></div>
       <div class="panel-controls">
-        <button id="sharerate-chart-toggle" class="panel-toggle" title="Hide or show the share rate chart">Hide</button>
+        <button id="sharerate-chart-toggle" class="panel-toggle" title="Hide or show the share rate chart"><span class="panel-toggle-label">Hide</span></button>
       </div>
     </div>
     <div id="sharerate-chart"></div>
@@ -958,14 +964,14 @@ tr:last-child td { border-bottom: none; }
         <th class="col-led">Status</th>
         <th>Mode</th>
         <th>Vardiff</th>
-        <th>Hashrate (1m)</th>
-        <th>Hashrate (5m)</th>
-        <th>Hashrate (10m)</th>
-        <th>Hashrate (1h)</th>
-        <th>Hashrate (6h)</th>
-        <th>Hashrate (24h)</th>
-        <th>Accepted</th>
-        <th>Rejected</th>
+        <th class="col-rate" title="1-minute hashrate" aria-label="1-minute hashrate">1m</th>
+        <th class="col-rate" title="5-minute hashrate" aria-label="5-minute hashrate">5m</th>
+        <th class="col-rate" title="10-minute hashrate" aria-label="10-minute hashrate">10m</th>
+        <th class="col-rate" title="1-hour hashrate" aria-label="1-hour hashrate">1h</th>
+        <th class="col-rate" title="6-hour hashrate" aria-label="6-hour hashrate">6h</th>
+        <th class="col-rate" title="24-hour hashrate" aria-label="24-hour hashrate">24h</th>
+        <th class="col-count" title="Accepted shares" aria-label="Accepted shares">Acc.</th>
+        <th class="col-count" title="Rejected shares" aria-label="Rejected shares">Rej.</th>
         <th>Best Share</th>
         <th>Last Share</th>
         <th>Uptime</th>
@@ -1157,7 +1163,7 @@ function updateConnLed() {
 }
 
 // ── Chart panels ─────────────────────────────────────────────────────────────
-// Two panels — hashrate and shares/sec — over one implementation. They differ
+// Two panels — hashrate and shares/min — over one implementation. They differ
 // only in the endpoint they poll, the unit their values carry, and where their
 // preferences are stored. Both are driven by the single range selector, so they
 // always plot the same x axis and can be read against each other.
@@ -1204,7 +1210,7 @@ const hashratePanel = ratePanel({
 });
 const sharePanel = ratePanel({
   canvasId: 'sharerate-chart', toggleId: 'sharerate-chart-toggle', endpoint: '/share-chart',
-  legendKey: 'btcpool-share-legend', collapsedKey: 'shareChartCollapsed', fmt: fmtSps
+  legendKey: 'btcpool-share-legend', collapsedKey: 'shareChartCollapsed', fmt: fmtSpm
 });
 const PANELS = [hashratePanel, sharePanel];
 
@@ -1289,7 +1295,7 @@ function panelCollapsed(panel) {
 function applyPanelCollapsed(panel, collapsed) {
   try { localStorage.setItem(panel.collapsedKey, collapsed ? '1' : '0'); } catch (_) {}
   document.getElementById(panel.canvasId).style.display = collapsed ? 'none' : '';
-  document.getElementById(panel.toggleId).textContent = collapsed ? 'Show' : 'Hide';
+  document.getElementById(panel.toggleId).querySelector('.panel-toggle-label').textContent = collapsed ? 'Show' : 'Hide';
   // The one range selector drives both charts, so it is only meaningless once
   // there is nothing left for it to range over.
   document.getElementById('chart-window-label').style.display =
@@ -1316,15 +1322,15 @@ function fmtHr(hps, short, digits) {
   return hps.toFixed(0) + (short ? ''    : ' H/s');
 }
 
-// Share rate spans a wide range — one USB stick trickles well under a share a
-// second while a farm runs into the thousands — so precision comes from the
+// Share rate spans a wide range — one USB stick trickles a share every few
+// minutes while a farm runs into the thousands — so precision comes from the
 // magnitude rather than being fixed. `digits` is the narrow-screen cap that
 // applyResponsiveLayout passes for the y-axis.
-function fmtSps(sps, short, digits) {
-  if (!isFinite(sps)) return short ? '—' : '— shares/s';
+function fmtSpm(spm, short, digits) {
+  if (!isFinite(spm)) return short ? '—' : '— shares/min';
   const cap = digits === undefined ? 2 : digits;
-  const d = Math.min(cap, sps >= 100 ? 0 : sps >= 10 ? 1 : 2);
-  return sps.toFixed(d) + (short ? '' : ' shares/s');
+  const d = Math.min(cap, spm >= 100 ? 0 : spm >= 10 ? 1 : 2);
+  return spm.toFixed(d) + (short ? '' : ' shares/min');
 }
 
 function fmtDiff(d) {
@@ -1588,7 +1594,7 @@ async function refresh() {
     document.getElementById('v-session-accepted').textContent = d.shares_accepted.toLocaleString();
     // Current throughput under the two totals: the same 1m window the chart's
     // fastest line plots.
-    document.getElementById('v-shares-per-sec').textContent = fmtSps(d.shares_per_second_1m, false);
+    document.getElementById('v-shares-per-min').textContent = fmtSpm(d.shares_per_minute_1m, false);
     const rejectEl = document.getElementById('v-reject-rate');
     rejectEl.textContent = `${lifeRej.toLocaleString()} (${lifePct}%)`;
     rejectEl.title = reasonTooltip('lifetime rejects', d.lifetime_reject_reasons);
@@ -1611,28 +1617,30 @@ async function refresh() {
     if (workers.length === 0) {
       tbody.innerHTML = '<tr><td colspan="15" class="empty-row">No connected workers</td></tr>';
     } else {
-      tbody.innerHTML = workers
-        .sort((a, b) => b.hashrate_60s_hps - a.hashrate_60s_hps)
+      const workerName = worker => worker.worker.includes('.') ? worker.worker.split('.')[1] : worker.worker;
+      tbody.innerHTML = [...workers]
+        .sort((a, b) => workerName(a).localeCompare(workerName(b), undefined, { numeric: true, sensitivity: 'base' })
+          || a.worker.localeCompare(b.worker))
         .map(w => {
-          const workerName = w.worker.includes('.') ? w.worker.split('.')[1] : w.worker;
+          const name = workerName(w);
           const nowSec = Math.floor(Date.now() / 1000);
           const lastShareAgo = w.last_submit_ts > 0 ? fmtUptime(nowSec - w.last_submit_ts) : '—';
           const uptime = w.connected_ts > 0 ? fmtUptime(nowSec - w.connected_ts) : '—';
           const mode = (w.protocol || 'sv1').toUpperCase();
           const led = workerLed(w, nowSec);
           return `<tr>
-            <td>${escHtml(workerName)}</td>
+            <td>${escHtml(name)}</td>
             <td class="col-led"><span class="led ${led.cls}" title="${led.title}"></span></td>
             <td>${mode}</td>
             <td>${fmtDiff(w.current_vardiff)}</td>
-            <td>${fmtHr(w.hashrate_60s_hps, false)}</td>
-            <td>${fmtHr(w.hashrate_5m_hps, false)}</td>
-            <td>${fmtHr(w.hashrate_10m_hps, false)}</td>
-            <td>${fmtHr(w.hashrate_1h_hps, false)}</td>
-            <td>${fmtHr(w.hashrate_6h_hps, false)}</td>
-            <td>${fmtHr(w.hashrate_24h_hps, false)}</td>
-            <td>${w.shares_accepted.toLocaleString()}</td>
-            <td title="${rejectBreakdown(w)}">${w.shares_rejected.toLocaleString()}</td>
+            <td class="col-rate">${fmtHr(w.hashrate_60s_hps, false)}</td>
+            <td class="col-rate">${fmtHr(w.hashrate_5m_hps, false)}</td>
+            <td class="col-rate">${fmtHr(w.hashrate_10m_hps, false)}</td>
+            <td class="col-rate">${fmtHr(w.hashrate_1h_hps, false)}</td>
+            <td class="col-rate">${fmtHr(w.hashrate_6h_hps, false)}</td>
+            <td class="col-rate">${fmtHr(w.hashrate_24h_hps, false)}</td>
+            <td class="col-count">${w.shares_accepted.toLocaleString()}</td>
+            <td class="col-count" title="${rejectBreakdown(w)}">${w.shares_rejected.toLocaleString()}</td>
             <td>${fmtDiff(w.best_share_difficulty)}</td>
             <td>${lastShareAgo}</td>
             <td>${uptime}</td>
@@ -2184,13 +2192,13 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("fetch(panel.endpoint + '?window=' + window)"));
     }
 
-    /// Shares/sec is not a hashrate: formatting it with `fmtHr` would render
+    /// Shares/min is not a hashrate: formatting it with `fmtHr` would render
     /// "4" as "4 H/s" on the axis and in the tooltip.
     #[test]
     fn share_panel_formats_counts_not_hashes() {
-        assert!(DASHBOARD_HTML.contains("fmt: fmtSps"));
+        assert!(DASHBOARD_HTML.contains("fmt: fmtSpm"));
         assert!(DASHBOARD_HTML.contains("fmt: fmtHr"));
-        assert!(DASHBOARD_HTML.contains("function fmtSps(sps, short, digits)"));
+        assert!(DASHBOARD_HTML.contains("function fmtSpm(spm, short, digits)"));
         // The axis and tooltip both go through the panel's formatter rather
         // than naming one directly.
         assert!(DASHBOARD_HTML.contains("formatter: v => panel.fmt(v, true, digits)"));

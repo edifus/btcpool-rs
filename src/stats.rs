@@ -154,7 +154,7 @@ hashrate_windows! {
 }
 
 /// One bucketed sample of a decaying-average series: hashrate in H/s, or
-/// accepted shares/sec. `None` where the underlying column predates the row.
+/// accepted shares/min. `None` where the underlying column predates the row.
 /// Six windows, not seven — 3h is checkpointed but never plotted.
 #[derive(Debug, Clone, Copy)]
 pub struct RateHistoryPoint {
@@ -209,7 +209,7 @@ struct SnapshotWrite {
     worker_rates: HashMap<String, HashrateWindows>,
     share_totals: ShareTotals,
     lifetime_reject_reasons: BTreeMap<String, u64>,
-    /// Pool-wide accepted shares/sec, `hashrate::W_*`-indexed. A bare array
+    /// Pool-wide accepted shares/min, `hashrate::W_*`-indexed. A bare array
     /// rather than a named-field struct: there is one pool meter and no
     /// aggregation to do, and indexing by the `W_*` constants leaves no gap for
     /// fields and window indices to drift apart in.
@@ -385,7 +385,7 @@ impl StatsStore {
             [],
         )?;
 
-        // Pool-wide accepted shares/sec, as decaying averages on the snapshot
+        // Pool-wide accepted shares/min, as decaying averages on the snapshot
         // grid — the same six windows `hashrate_history` carries, so the two
         // charts plot the same points. Unlike `share_history` above these are
         // decayed rather than raw counts, which is what ties them to the
@@ -393,12 +393,12 @@ impl StatsStore {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS share_rate_history (
              ts INTEGER PRIMARY KEY,
-             sps_1m REAL,
-             sps_5m REAL,
-             sps_10m REAL,
-             sps_1h REAL,
-             sps_6h REAL,
-             sps_24h REAL
+             spm_1m REAL,
+             spm_5m REAL,
+             spm_10m REAL,
+             spm_1h REAL,
+             spm_6h REAL,
+             spm_24h REAL
              )",
             [],
         )?;
@@ -410,13 +410,13 @@ impl StatsStore {
             "CREATE TABLE IF NOT EXISTS share_rate_state (
              id INTEGER PRIMARY KEY CHECK (id = 1),
              updated_ts INTEGER NOT NULL,
-             sps_1m REAL NOT NULL,
-             sps_5m REAL NOT NULL,
-             sps_10m REAL NOT NULL,
-             sps_1h REAL NOT NULL,
-             sps_3h REAL NOT NULL,
-             sps_6h REAL NOT NULL,
-             sps_24h REAL NOT NULL
+             spm_1m REAL NOT NULL,
+             spm_5m REAL NOT NULL,
+             spm_10m REAL NOT NULL,
+             spm_1h REAL NOT NULL,
+             spm_3h REAL NOT NULL,
+             spm_6h REAL NOT NULL,
+             spm_24h REAL NOT NULL
              )",
             [],
         )?;
@@ -783,7 +783,7 @@ impl StatsStore {
     ) -> Result<Option<(u64, [f64; hashrate::WINDOW_COUNT])>, rusqlite::Error> {
         let conn = self.read.lock();
         conn.query_row(
-            "SELECT updated_ts, sps_1m, sps_5m, sps_10m, sps_1h, sps_3h, sps_6h, sps_24h
+            "SELECT updated_ts, spm_1m, spm_5m, spm_10m, spm_1h, spm_3h, spm_6h, spm_24h
              FROM share_rate_state WHERE id = 1",
             [],
             |row| {
@@ -808,8 +808,8 @@ impl StatsStore {
         let conn = self.read.lock();
         let mut stmt = match conn.prepare(
             "SELECT (ts / ?2) * ?2 AS bucket_ts,
-                    AVG(sps_1m), AVG(sps_5m), AVG(sps_10m),
-                    AVG(sps_1h), AVG(sps_6h), AVG(sps_24h)
+                    AVG(spm_1m), AVG(spm_5m), AVG(spm_10m),
+                    AVG(spm_1h), AVG(spm_6h), AVG(spm_24h)
              FROM share_rate_history
              WHERE ts >= ?1
              GROUP BY bucket_ts
@@ -1034,7 +1034,7 @@ fn write_snapshot(conn: &Connection, snapshot: &SnapshotWrite) -> Result<(), rus
         // the column order cannot silently drift from the window order.
         tx.execute(
             "INSERT OR REPLACE INTO share_rate_history (
-               ts, sps_1m, sps_5m, sps_10m, sps_1h, sps_6h, sps_24h
+               ts, spm_1m, spm_5m, spm_10m, spm_1h, spm_6h, spm_24h
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 history_ts,
@@ -1048,7 +1048,7 @@ fn write_snapshot(conn: &Connection, snapshot: &SnapshotWrite) -> Result<(), rus
         )?;
         tx.execute(
             "INSERT OR REPLACE INTO share_rate_state (
-               id, updated_ts, sps_1m, sps_5m, sps_10m, sps_1h, sps_3h, sps_6h, sps_24h
+               id, updated_ts, spm_1m, spm_5m, spm_10m, spm_1h, spm_3h, spm_6h, spm_24h
              ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 state_ts,
@@ -1187,11 +1187,13 @@ pub struct PoolStats {
     /// than locking the meter keeps the share path to one relaxed add; the
     /// hashrate ticker drains it.
     pending_shares: AtomicU64,
-    /// Pool-wide accepted shares per second, over the same decaying windows as
-    /// hashrate. One meter rather than one per session: unlike hashrate this is
-    /// not summed from parts, and nothing displays it per worker. It is also
-    /// never evicted when idle — there is only the one, and a quiet pool should
-    /// read zero rather than disappear.
+    /// Pool-wide accepted share rate, over the same decaying windows as
+    /// hashrate. Its state is per second like every `HashrateDecay`; everything
+    /// outside reads it per minute through `share_rate_windows`. One meter
+    /// rather than one per session: unlike hashrate this is not summed from
+    /// parts, and nothing displays it per worker. It is also never evicted when
+    /// idle — there is only the one, and a quiet pool should read zero rather
+    /// than disappear.
     share_rate: Mutex<hashrate::HashrateDecay>,
     worker_protocol: DashMap<String, String>,
     worker_last_submit_ts: DashMap<String, u64>,
@@ -1246,7 +1248,7 @@ struct Persisted {
     stats_since_ts: u64,
     lifetime_reject_reasons: BTreeMap<String, u64>,
     /// Checkpointed pool share rate: when it was written, and the per-window
-    /// shares/sec at that moment. `None` when the table has no row yet, which
+    /// shares/min at that moment. `None` when the table has no row yet, which
     /// is every boot before this feature existed.
     share_rate: Option<(u64, [f64; hashrate::WINDOW_COUNT])>,
 }
@@ -1381,7 +1383,7 @@ impl PoolStats {
         // an idle result is kept rather than dropped: there is only one meter,
         // and it has to exist for the ticker to fold into.
         let share_rate = match persisted_share_rate {
-            Some((updated_ts, rates)) => hashrate::HashrateDecay::restored_rates(
+            Some((updated_ts, rates)) => hashrate::HashrateDecay::restored_per_minute(
                 instant_now,
                 rates,
                 Duration::from_secs(wall_now.saturating_sub(updated_ts)),
@@ -1723,9 +1725,9 @@ impl PoolStats {
         self.record_best_hashrate(total.ten_minutes);
     }
 
-    /// Pool-wide accepted shares per second, `hashrate::W_*`-indexed.
+    /// Pool-wide accepted shares per minute, `hashrate::W_*`-indexed.
     fn share_rate_windows(&self) -> [f64; hashrate::WINDOW_COUNT] {
-        self.share_rate.lock().rates()
+        self.share_rate.lock().per_minute()
     }
 
     /// Track all-time best (persistent) and session-best (since boot).
@@ -2158,12 +2160,12 @@ impl PoolStats {
             total_hashrate_3h: totals.three_hours,
             total_hashrate_6h: totals.six_hours,
             total_hashrate_24h: totals.twenty_four_hours,
-            shares_per_second_1m: share_rates[hashrate::W_1M],
-            shares_per_second_5m: share_rates[hashrate::W_5M],
-            shares_per_second_10m: share_rates[hashrate::W_10M],
-            shares_per_second_1h: share_rates[hashrate::W_1H],
-            shares_per_second_6h: share_rates[hashrate::W_6H],
-            shares_per_second_24h: share_rates[hashrate::W_24H],
+            shares_per_minute_1m: share_rates[hashrate::W_1M],
+            shares_per_minute_5m: share_rates[hashrate::W_5M],
+            shares_per_minute_10m: share_rates[hashrate::W_10M],
+            shares_per_minute_1h: share_rates[hashrate::W_1H],
+            shares_per_minute_6h: share_rates[hashrate::W_6H],
+            shares_per_minute_24h: share_rates[hashrate::W_24H],
             worker_hashrates,
             worker_states,
             network_hashrate_hps: f64::from_bits(self.network_hashrate_hps.load(Ordering::Relaxed)),
@@ -2249,16 +2251,18 @@ pub struct StatsSnapshot {
     pub total_hashrate_3h: f64,
     pub total_hashrate_6h: f64,
     pub total_hashrate_24h: f64,
-    /// Pool-wide accepted shares per second, as decaying averages over the same
+    /// Pool-wide accepted shares per minute, as decaying averages over the same
     /// windows as the hashrate totals above. Share throughput rather than work
-    /// done: it moves with vardiff retargets that leave hashrate flat. Six
-    /// windows only — 3h is checkpointed but not exposed.
-    pub shares_per_second_1m: f64,
-    pub shares_per_second_5m: f64,
-    pub shares_per_second_10m: f64,
-    pub shares_per_second_1h: f64,
-    pub shares_per_second_6h: f64,
-    pub shares_per_second_24h: f64,
+    /// done: it moves with vardiff retargets that leave hashrate flat. Per
+    /// minute rather than per second because a pool of any realistic size sits
+    /// in the tenths otherwise. Six windows only — 3h is checkpointed but not
+    /// exposed.
+    pub shares_per_minute_1m: f64,
+    pub shares_per_minute_5m: f64,
+    pub shares_per_minute_10m: f64,
+    pub shares_per_minute_1h: f64,
+    pub shares_per_minute_6h: f64,
+    pub shares_per_minute_24h: f64,
     pub network_hashrate_hps: f64,
     pub network_difficulty: f64,
     pub est_difficulty_change_pct: f64,
@@ -3013,8 +3017,9 @@ mod tests {
         let saved_at = 1_000_007;
         let restart_at = saved_at + 30;
 
-        // Twenty minutes at a steady 5 shares/sec, which is long enough for the
-        // short windows to converge and leave the long ones part-filled.
+        // Twenty minutes at a steady 5 shares/sec — 300 a minute — which is
+        // long enough for the short windows to converge and leaves the long
+        // ones part-filled.
         let saved = {
             let now = Instant::now();
             let stats = PoolStats::new_with_store_at(Some(db_path.clone()), saved_at, now);
@@ -3031,30 +3036,31 @@ mod tests {
             saved
         };
         assert!(
-            (saved[hashrate::W_1M] - 5.0).abs() < 0.1,
-            "1m should have converged on 5/s, got {}",
+            (saved[hashrate::W_1M] - 300.0).abs() < 6.0,
+            "1m should have converged on 300/min, got {}",
             saved[hashrate::W_1M]
         );
 
         let now = Instant::now();
         let stats = PoolStats::new_with_store_at(Some(db_path.clone()), restart_at, now);
         let expected =
-            hashrate::HashrateDecay::restored_rates(now, saved, Duration::from_secs(30)).rates();
+            hashrate::HashrateDecay::restored_per_minute(now, saved, Duration::from_secs(30))
+                .per_minute();
         let snap = stats.snapshot();
 
-        assert!((snap.shares_per_second_1m - expected[hashrate::W_1M]).abs() < 1e-9);
-        assert!((snap.shares_per_second_24h - expected[hashrate::W_24H]).abs() < 1e-9);
+        assert!((snap.shares_per_minute_1m - expected[hashrate::W_1M]).abs() < 1e-9 * 300.0);
+        assert!((snap.shares_per_minute_24h - expected[hashrate::W_24H]).abs() < 1e-9 * 300.0);
         // Half a time constant of silence bites the 1m window and barely
         // touches the 24h one.
-        assert!(snap.shares_per_second_1m > 0.0);
-        assert!(snap.shares_per_second_1m < 0.8 * saved[hashrate::W_1M]);
-        assert!(snap.shares_per_second_24h > 0.99 * saved[hashrate::W_24H]);
+        assert!(snap.shares_per_minute_1m > 0.0);
+        assert!(snap.shares_per_minute_1m < 0.8 * saved[hashrate::W_1M]);
+        assert!(snap.shares_per_minute_24h > 0.99 * saved[hashrate::W_24H]);
 
         drop(stats);
         std::fs::remove_file(db_path).ok();
     }
 
-    /// "Shares per second the pool is accepting" — a reject is not throughput,
+    /// "Shares per minute the pool is accepting" — a reject is not throughput,
     /// and counting one would make the chart disagree with the accepted card.
     #[test]
     fn share_rate_counts_accepted_shares_only() {
@@ -3065,11 +3071,11 @@ mod tests {
             stats.share_rejected("stale");
         }
         stats.tick_hashrates_at(now + Duration::from_secs(hashrate::TICK_SECS));
-        assert_eq!(stats.snapshot().shares_per_second_1m, 0.0);
+        assert_eq!(stats.snapshot().shares_per_minute_1m, 0.0);
 
         stats.share_accepted(1);
         stats.tick_hashrates_at(now + Duration::from_secs(2 * hashrate::TICK_SECS));
-        assert!(stats.snapshot().shares_per_second_1m > 0.0);
+        assert!(stats.snapshot().shares_per_minute_1m > 0.0);
     }
 
     /// Difficulty weights the hashrate estimate, not this one: two shares are
@@ -3089,8 +3095,8 @@ mod tests {
         large.tick_hashrates_at(tick);
 
         assert_eq!(
-            small.snapshot().shares_per_second_1m,
-            large.snapshot().shares_per_second_1m
+            small.snapshot().shares_per_minute_1m,
+            large.snapshot().shares_per_minute_1m
         );
     }
 

@@ -10,22 +10,46 @@ everything else bumps the **patch** version.
 ## [Unreleased]
 
 ### Added
-- **A shares-per-second chart on the dashboard**, below the hashrate panel and
+- **A shares-per-minute chart on the dashboard**, below the hashrate panel and
   driven by the same range selector, over the same 1m/5m/10m/1h/6h/24h decaying
   averages. Share throughput is a separate signal from work done — it moves with
   vardiff retargets and miner churn while hashrate holds flat — and nothing
   exposed it: the pool counted accepted shares but only ever as a lifetime total.
-  Persisted like the hashrate series, so a restart resumes the averages decayed
-  across the downtime instead of resetting the chart to zero. The current rate
-  also appears on the Accepted card, as `pool_shares_per_second{window}` in
-  Prometheus, as `shares_per_second_*` on `GET /stats`, and at
-  `GET /share-chart`.
+  Per minute rather than per second because a pool of any realistic size spends
+  its life in the tenths otherwise. Persisted like the hashrate series, so a
+  restart resumes the averages decayed across the downtime instead of resetting
+  the chart to zero. The current rate also appears on the Accepted card, as
+  `pool_shares_per_minute{window}` in Prometheus, as `shares_per_minute_*` on
+  `GET /stats`, and at `GET /share-chart`.
+- **Accepted and rejected share totals now survive restarts** when
+  `[metrics] stats_db_path` is configured. The SQLite snapshot records
+  monotonic lifetime counters, restores them at boot, and performs a bounded
+  final persist on SIGINT or SIGTERM so a clean shutdown does not lose the
+  tail between snapshots. The dashboard now gives accepted and rejected shares
+  their own cards, with lifetime totals leading and this process's counts below;
+  `GET /stats` gains `lifetime_shares_accepted`,
+  `lifetime_shares_rejected`, and `stats_since_ts`. Rate-limited messages now
+  enter the pool total, and the authenticated worker's total where available,
+  so these figures agree with `pool_shares_rejected_total`.
+- **Reject reasons are now counted pool-wide for both the current process and
+  the pool's recorded lifetime.** The lifetime breakdown is persisted in the
+  stats database, while `GET /stats` exposes it as `lifetime_reject_reasons`
+  alongside the session-only `reject_reasons`. The dashboard puts each scoped
+  breakdown on the corresponding rejected-total tooltip. Reason tracking starts
+  with this schema, so its sum can trail the lifetime rejected total restored
+  from an older database.
 - **The hashrate chart's selected range and legend survive a page reload**,
   joining the theme, chart-collapse and quote-currency preferences. Picking
   `30d` and refreshing snapped back to `1h`, and the legend reverted to the
   default series set: the client defended legend clicks only within a session,
   against its own 10-second poll, and had nothing to restore them from on a
   fresh load.
+
+### Changed
+- The dashboard overview drops the redundant Pool uptime card — uptime remains
+  in the header — and uses consistent compact labels across the remaining KPI
+  cards. Reject details no longer widen the Rejected card as an inline list;
+  the lifetime and session totals expose their labelled breakdowns on hover.
 
 ## [0.3.0] - 2026-08-07
 

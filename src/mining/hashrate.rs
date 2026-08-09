@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 /// Expected hashes behind one difficulty-1 share (2³²).
 pub const NONCES: f64 = 4_294_967_296.0;
 
+/// Scale from the meter's native per-second state to a per-minute reading.
+pub const SECS_PER_MINUTE: f64 = 60.0;
+
 /// Indices into the decayed window arrays.
 pub const W_1M: usize = 0;
 pub const W_5M: usize = 1;
@@ -92,7 +95,9 @@ fn sane_tdiff(end: Instant, start: Instant) -> f64 {
 /// the unit is whatever the caller feeds [`Self::add_share`]. `stats` runs two
 /// meters off it — per-session difficulty, read back as H/s through
 /// [`Self::hashrates`], and pool-wide accepted share counts, read back as
-/// shares/sec through [`Self::rates`].
+/// shares/min through [`Self::per_minute`]. Each of those readers is paired
+/// with the `restored*` constructor that inverts it, so a checkpoint cannot
+/// come back in the wrong unit.
 #[derive(Debug, Clone)]
 pub struct HashrateDecay {
     dsps: [f64; WINDOW_COUNT],
@@ -123,9 +128,20 @@ impl HashrateDecay {
         Self::restored_rates(now, hashrates.map(|hps| hps / NONCES), offline_for)
     }
 
+    /// Restore a checkpointed per-minute rate. Inverse of
+    /// [`Self::per_minute`], the way [`Self::restored`] is of
+    /// [`Self::hashrates`].
+    pub(crate) fn restored_per_minute(
+        now: Instant,
+        per_minute: [f64; WINDOW_COUNT],
+        offline_for: Duration,
+    ) -> Self {
+        Self::restored_rates(now, per_minute.map(|v| v / SECS_PER_MINUTE), offline_for)
+    }
+
     /// As [`Self::restored`], but for a meter whose unit is not difficulty:
     /// `rates` are the raw per-second values [`Self::rates`] returned, with no
-    /// `NONCES` scaling.
+    /// scaling.
     pub(crate) fn restored_rates(
         now: Instant,
         rates: [f64; WINDOW_COUNT],
@@ -189,6 +205,13 @@ impl HashrateDecay {
     /// [`Self::add_share`] was fed.
     pub fn rates(&self) -> [f64; WINDOW_COUNT] {
         self.dsps
+    }
+
+    /// Decayed units per minute, per window. What a meter fed plain share
+    /// counts reads out as: at pool scale a per-second figure spends its life
+    /// in the tenths, where the leading digits carry no information.
+    pub fn per_minute(&self) -> [f64; WINDOW_COUNT] {
+        self.dsps.map(|d| d * SECS_PER_MINUTE)
     }
 
     /// Decayed hashrate in H/s, per window. Only meaningful for a meter fed
@@ -370,11 +393,12 @@ mod tests {
         }
     }
 
-    /// `restored` is the difficulty-flavoured wrapper and divides by `NONCES`;
-    /// `restored_rates` must not touch the values it is handed, or a restored
-    /// share rate would come back 2³² times too small.
+    /// Each reader must round-trip through its own `restored*` constructor and
+    /// no other. Mixing the pairs is the whole failure mode: a share rate
+    /// restored through `restored` comes back 2³² times too small, and one
+    /// restored through `restored_rates` comes back 60 times too small.
     #[test]
-    fn restored_rates_does_not_scale_by_nonces() {
+    fn each_unit_round_trips_through_its_own_constructor() {
         let start = Instant::now();
         let saved = [4.0; WINDOW_COUNT];
 
@@ -384,6 +408,15 @@ mod tests {
         let scaled = HashrateDecay::restored(start, saved.map(|r| r * NONCES), Duration::ZERO);
         for (actual, expected) in scaled.rates().into_iter().zip(saved) {
             assert!((actual - expected).abs() < 1e-9);
+        }
+
+        let per_min = HashrateDecay::restored_per_minute(start, saved, Duration::ZERO);
+        for (actual, expected) in per_min.per_minute().into_iter().zip(saved) {
+            assert!((actual - expected).abs() < 1e-9);
+        }
+        // …and the underlying state really is the per-second value.
+        for (actual, expected) in per_min.rates().into_iter().zip(saved) {
+            assert!((actual - expected / SECS_PER_MINUTE).abs() < 1e-12);
         }
     }
 

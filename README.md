@@ -389,11 +389,11 @@ With `prometheus_addr` set (default `0.0.0.0:9090`), an HTTP server exposes:
 
 | Route | Description |
 |---|---|
-| `GET /` | HTML dashboard: rolling hashrate and shares/sec averages with 1h-180d ranges, workers, network difficulty + estimated next-retarget move, BIP110/RDTS signal, market data, probability, uptime (auto-refreshes) |
+| `GET /` | HTML dashboard: rolling hashrate and shares/min averages with 1h-180d ranges, workers, network difficulty + estimated next-retarget move, BIP110/RDTS signal, market data, probability, uptime (auto-refreshes) |
 | `GET /stats` | JSON snapshot of current pool state |
 | `GET /history` | Legacy 10-minute hashrate history (`?since=<unix-ts>`) |
 | `GET /chart` | Hashrate ECharts option data (`?window=1h\|6h\|24h\|1w\|30d\|180d\|all`) |
-| `GET /share-chart` | Accepted shares/sec ECharts option data, same `?window=` values |
+| `GET /share-chart` | Accepted shares/min ECharts option data, same `?window=` values |
 | `GET /api/info` | Pool version, network, Stratum port, SV2 status, and authority public key |
 | `GET /metrics` | Prometheus text exposition |
 | `GET /health` | `200` while the block template is refreshing, `503` once it has been stale for 180s (JSON, carries `template_age_secs`) |
@@ -412,7 +412,7 @@ Key Prometheus metrics:
 | `pool_blocks_pending_confirmation` | Found blocks not yet decided (normally 0) |
 | `pool_hashrate_hps{window}` | Pool H/s, one series per averaging window (`1m`, `5m`, `10m`, `1h`, `3h`, `6h`, `24h`) |
 | `pool_worker_hashrate_hps{worker,window}` | Per-worker H/s, same windows |
-| `pool_shares_per_second{window}` | Pool-wide accepted shares/s, same windows and same decay as the hashrate gauges |
+| `pool_shares_per_minute{window}` | Pool-wide accepted shares/min, same windows and same decay as the hashrate gauges |
 | `pool_job_height` | Current template block height |
 | `pool_template_last_refresh_timestamp_seconds` | Unix time of the last successful template refresh |
 | `pool_tip_changes_discovered_by_timer_total` | New tips the ntime timer saw before ZMQ did |
@@ -424,7 +424,7 @@ true rate on the longer windows until they have filled — the `24h` series is
 still climbing a day in. Alert on `pool_hashrate_hps{window="10m"}`; it carries
 no worker label, so it does not fan out with the fleet.
 
-`pool_shares_per_second` is the same decay applied to a plain count of accepted
+`pool_shares_per_minute` is the same decay applied to a plain count of accepted
 shares, so it measures throughput rather than work done: it drops when vardiff
 retargets miners upward even though hashrate is unchanged. Prefer it over
 `rate(pool_shares_accepted_total[…])` if you want the figure the dashboard

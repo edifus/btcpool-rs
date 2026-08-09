@@ -203,7 +203,7 @@ underflow panic). Line references are as of that review and may drift.
   silent otherwise: a range missing from the match arms plots 1h data under its
   own label, and one missing from a JS allowlist toggles fine and forgets on
   reload.
-- [x] **Shares-per-second chart** (2026-08-08): pool-wide accepted share
+- [x] **Shares-per-minute chart** (2026-08-08): pool-wide accepted share
   throughput, over the same 1m/5m/10m/1h/6h/24h decaying averages as hashrate
   and persisted the same way, in its own panel under the hashrate one and driven
   by the same range selector. `HashrateDecay` turned out to be a general rate
