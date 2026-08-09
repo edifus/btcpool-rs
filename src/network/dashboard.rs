@@ -1319,15 +1319,13 @@ function fmtHr(hps, short, digits) {
   return hps.toFixed(0) + (short ? ''    : ' H/s');
 }
 
-// Share rate spans a wide range — one USB stick trickles a share every few
-// minutes while a farm runs into the thousands — so precision comes from the
-// magnitude rather than being fixed. `digits` is the narrow-screen cap that
-// applyResponsiveLayout passes for the y-axis.
+// Share rate reads as a whole count: a fractional share does not exist, and the
+// decaying averages behind it carry more noise than a decimal place would
+// convey. `digits` is unused — it is part of the shared panel formatter
+// contract (see fmtHr), which the chart calls generically for both units.
 function fmtSpm(spm, short, digits) {
   if (!isFinite(spm)) return short ? '—' : '— shares/min';
-  const cap = digits === undefined ? 2 : digits;
-  const d = Math.min(cap, spm >= 100 ? 0 : spm >= 10 ? 1 : 2);
-  return spm.toFixed(d) + (short ? '' : ' shares/min');
+  return Math.round(spm).toLocaleString() + (short ? '' : ' shares/min');
 }
 
 function fmtDiff(d) {
