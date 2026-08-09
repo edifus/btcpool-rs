@@ -674,8 +674,9 @@ mod tests {
     // ── drive_refresh_loop ──────────────────────────────────────────────────
 
     /// Proves the ntime timer keeps firing after the new-block channel closes
-    /// — the exact failure mode this change fixes (`engine.rs`'s old `break`).
-    /// Drives the real `drive_refresh_loop`, not a copy of its control flow.
+    /// — a `break` on channel close would silently stop refreshes for the life
+    /// of the process. Drives the real `drive_refresh_loop`, not a copy of its
+    /// control flow.
     #[tokio::test(start_paused = true)]
     async fn ntime_timer_keeps_firing_after_new_block_channel_closes() {
         let (tx, rx) = tokio::sync::watch::channel(0u64);

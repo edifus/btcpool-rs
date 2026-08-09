@@ -221,8 +221,7 @@ struct SnapshotWrite {
 /// Every write originates on an async task — the share hot path, the snapshot
 /// ticker, the pruner — so none of them may touch the disk directly. They hand
 /// the work to one thread that owns the write connection instead, which also
-/// removes the lock contention that used to put dashboard queries and share
-/// submissions on the same mutex.
+/// keeps dashboard queries and share submissions off a shared mutex.
 enum StoreWrite {
     BestShare(u64),
     BestHashrate(f64),
@@ -656,7 +655,7 @@ impl StatsStore {
     /// Discard history written by an earlier hashrate estimator.
     ///
     /// Values from a different estimator are not comparable with the current
-    /// one, and the sliding-window estimator this replaced could emit readings
+    /// one, and the estimator that wrote them could emit readings
     /// orders of magnitude too high when a lone share landed in a window — a
     /// single such sample pins the chart's y-axis and permanently poisons the
     /// all-time best-hashrate watermark. Rather than try to filter them, drop
@@ -2435,8 +2434,8 @@ mod tests {
     }
 
     /// One connection may re-authorize under a different identity. Shares after
-    /// the switch belong to the new name; before this was fixed they kept
-    /// landing on the old one for the life of the connection.
+    /// the switch belong to the new name, not to the name the connection first
+    /// authorized for the rest of its life.
     #[test]
     fn shares_follow_a_session_that_re_authorizes_under_a_new_name() {
         let stats = PoolStats::new_with_store(None);
@@ -2549,7 +2548,7 @@ mod tests {
         std::fs::remove_file(db_path).ok();
     }
 
-    /// History written by the old sliding-window estimator is not comparable
+    /// History written by a sliding-window estimator is not comparable
     /// with the decaying averages, and its spikes would pin the chart's y-axis
     /// and the all-time watermark forever. Opening such a DB must clear both.
     #[test]
@@ -3362,9 +3361,9 @@ mod tests {
         assert_eq!(back.twenty_four_hours, rates.twenty_four_hours);
     }
 
-    /// The headline bug: on a young pool every window read the same number,
-    /// because the old estimator divided by the age of the oldest share in the
-    /// window rather than by the window itself. The long windows must lag.
+    /// On a young pool the long windows must lag the short ones. Dividing by
+    /// the age of the oldest share in the window rather than by the window
+    /// itself would collapse every window to the same number.
     #[test]
     fn windows_do_not_collapse_on_a_young_pool() {
         let stats = PoolStats::new_with_store(None);
@@ -3419,9 +3418,9 @@ mod tests {
         assert!(state.hashrate_6h_hps > 0.0);
     }
 
-    /// The bug this replaces: a worker whose session was still *connected* was
-    /// exempted from decay entirely, so a rig whose hasher died kept showing
-    /// its last reading forever.
+    /// A still-*connected* worker must decay like any other; exempting
+    /// connected sessions would leave a rig whose hasher died showing its last
+    /// reading forever.
     #[test]
     fn connected_but_silent_worker_still_decays() {
         let stats = PoolStats::new_with_store(None);
@@ -3461,9 +3460,9 @@ mod tests {
         );
     }
 
-    /// Two rigs sharing one worker name must add up. The old code keyed the
-    /// hashrate map by worker name and used `insert`, so the second session
-    /// silently replaced the first and the pool total read half of reality.
+    /// Two rigs sharing one worker name must add up. Keying the hashrate map
+    /// by worker name with `insert` would let the second session silently
+    /// replace the first, reading half of reality into the pool total.
     #[test]
     fn two_sessions_under_one_worker_name_sum() {
         let stats = PoolStats::new_with_store(None);
@@ -3516,8 +3515,8 @@ mod tests {
         );
     }
 
-    /// A single share arriving microseconds before a tick cannot produce the
-    /// absurd reading the old estimator did (949 PH/s from a 2.7 TH/s Bitaxe).
+    /// A burst of shares arriving microseconds before a tick cannot spike the
+    /// pool total: the per-share ceiling bounds the sum.
     #[test]
     fn burst_of_shares_cannot_spike_the_pool_total() {
         let stats = PoolStats::new_with_store(None);

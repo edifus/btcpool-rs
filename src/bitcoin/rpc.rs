@@ -607,8 +607,7 @@ mod tests {
         ));
     }
 
-    /// The regression guard for stale-tip blocks being reported as wins: a
-    /// block that lost a same-height race is consensus-valid but earned
+    /// A block that lost a same-height race is consensus-valid but earned
     /// nothing, so it must not move `pool_blocks_found_total`.
     #[test]
     fn only_a_block_on_the_best_chain_counts_as_a_find() {

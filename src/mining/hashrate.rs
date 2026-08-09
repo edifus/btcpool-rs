@@ -246,8 +246,8 @@ mod tests {
         now
     }
 
-    /// The property the old sliding-window estimator lacked: the steady-state
-    /// reading equals the true rate regardless of how the samples are spaced.
+    /// The steady-state reading equals the true rate regardless of how the
+    /// samples are spaced.
     #[test]
     fn converges_to_true_rate_at_any_sample_spacing() {
         for step in [1_u64, 2, 60] {
@@ -267,10 +267,9 @@ mod tests {
         }
     }
 
-    /// Regression test for the 949 PH/s reading a 2.7 TH/s Bitaxe produced: a
-    /// lone share folded in with a near-zero elapsed time. One share of
-    /// difficulty 4700 can lift the 1m window by at most 4700/60 × 2³²
-    /// ≈ 336 GH/s no matter how small the interval is.
+    /// A lone share folded in with a near-zero elapsed time must not spike the
+    /// average: one share of difficulty 4700 can lift the 1m window by at most
+    /// 4700/60 × 2³² ≈ 336 GH/s no matter how small the interval is.
     #[test]
     fn single_share_cannot_spike_the_average() {
         let start = Instant::now();
@@ -323,8 +322,7 @@ mod tests {
     }
 
     /// A miner that stops submitting decays instead of freezing at its last
-    /// reading — this is what the old code got wrong for *connected* workers,
-    /// which were exempted from decay entirely.
+    /// reading, whether or not the session is still connected.
     #[test]
     fn idle_source_decays_toward_zero() {
         let start = Instant::now();

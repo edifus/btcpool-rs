@@ -26,6 +26,7 @@
 # ignored by the default rule above.
 !/.github/workflows/*.yml
 !/docs/*.png
+!/docs/*.md
 !/examples/**/*.rs
 !/modules/**/*.nix
 !/packaging/systemd/*.service

@@ -1953,8 +1953,8 @@ mod tests {
         assert_eq!(chart_window(Some("unknown")), chart_window(None));
         assert!(DASHBOARD_HTML.contains("const DEFAULT_WINDOW = '1h'"));
 
-        // "1m" and "6m" used to alias 30d/180d, colliding with the 1m series
-        // name. They must fall through to the default now.
+        // "1m" and "6m" must fall through to the default, not alias 30d/180d —
+        // that would collide with the 1m series name.
         assert_eq!(chart_window(Some("1m")), chart_window(None));
         assert_eq!(chart_window(Some("6m")), chart_window(None));
     }

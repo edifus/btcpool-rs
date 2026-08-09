@@ -58,9 +58,9 @@ impl MinerIdentity {
 
 /// Reuse the one implementation of the untrusted-name rules, in
 /// [`crate::security::validate_worker_name`]. Both protocol frontends run that
-/// check before calling [`MinerIdentity::parse`]; repeating the rules here — as
-/// this used to — meant two places to keep in step, with the identity copy
-/// silently governing anything that reached `parse` by another route.
+/// check before calling [`MinerIdentity::parse`]; repeating the rules here
+/// would mean two places to keep in step, with the identity copy silently
+/// governing anything that reaches `parse` by another route.
 fn validate_identity_text(raw: &str, max_len: usize) -> Result<(), PoolError> {
     crate::security::validate_worker_name(raw, max_len).map_err(|e| match e {
         PoolError::InvalidParams { detail, .. } => invalid_identity(&detail),
