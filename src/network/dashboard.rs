@@ -888,12 +888,6 @@ tr:last-child td { border-bottom: none; }
 
   <div class="kpis">
     <div class="kpi">
-      <div class="label">Miners</div>
-      <div class="val" id="v-miners">&mdash;</div>
-      <div class="sub"><span id="v-workers-online">online: &mdash;</span> &middot; <span id="v-workers-degraded">degraded: &mdash;</span></div>
-      <div class="sub" id="v-workers-offline">offline: &mdash;</div>
-    </div>
-    <div class="kpi">
       <div class="label">Accepted</div>
       <div class="val" id="v-accepted">&mdash;</div>
       <div class="sub">session: <span id="v-session-accepted">&mdash;</span></div>
@@ -915,12 +909,15 @@ tr:last-child td { border-bottom: none; }
       <div class="sub">session: <span id="v-session-best-hashrate">&mdash;</span></div>
     </div>
     <div class="kpi">
-      <div class="label">Last block found</div>
-      <div class="val" id="v-last-block-worker">&mdash;</div>
-      <div class="sub trunc" id="v-last-block-payout" title="Payout address encoded in the found block">&mdash;</div>
-      <div class="sub" id="v-last-block-time">&mdash;</div>
-      <div class="sub" id="v-last-block-status" title="A block is only final once it is buried under the configured number of confirmations; until then a reorg can still take it away">&mdash;</div>
-      <div class="sub trunc" id="v-last-block-hash" title="Hash of the last block this pool found">&mdash;</div>
+      <div class="label">Miners</div>
+      <div class="val" id="v-miners">&mdash;</div>
+      <div class="sub"><span id="v-workers-online">online: &mdash;</span> &middot; <span id="v-workers-degraded">degraded: &mdash;</span></div>
+      <div class="sub" id="v-workers-offline">offline: &mdash;</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Pool difficulty</div>
+      <div class="val" id="v-pool-diff" title="Accepted share work since the pool's last found block, as a share of the current network difficulty. 100% is one expected block's worth of work.">&mdash;</div>
+      <div class="sub" id="v-pool-diff-work" title="Accepted share difficulty accumulated since the last found block; finding a block starts it over">work: &mdash;</div>
     </div>
   </div>
 
@@ -964,12 +961,12 @@ tr:last-child td { border-bottom: none; }
         <th class="col-led">Status</th>
         <th>Mode</th>
         <th>Diff</th>
-        <th class="col-rate" title="1-minute average hashrate" aria-label="1-minute average hashrate">Avg 1m</th>
-        <th class="col-rate" title="5-minute average hashrate" aria-label="5-minute average hashrate">Avg 5m</th>
-        <th class="col-rate" title="10-minute average hashrate" aria-label="10-minute average hashrate">Avg 10m</th>
-        <th class="col-rate" title="1-hour average hashrate" aria-label="1-hour average hashrate">Avg 1h</th>
-        <th class="col-rate" title="6-hour average hashrate" aria-label="6-hour average hashrate">Avg 6h</th>
-        <th class="col-rate" title="24-hour average hashrate" aria-label="24-hour average hashrate">Avg 24h</th>
+        <th class="col-rate" title="1-minute average hashrate" aria-label="1-minute average hashrate">1m Avg</th>
+        <th class="col-rate" title="5-minute average hashrate" aria-label="5-minute average hashrate">5m Avg</th>
+        <th class="col-rate" title="10-minute average hashrate" aria-label="10-minute average hashrate">10m Avg</th>
+        <th class="col-rate" title="1-hour average hashrate" aria-label="1-hour average hashrate">1h Avg</th>
+        <th class="col-rate" title="6-hour average hashrate" aria-label="6-hour average hashrate">6h Avg</th>
+        <th class="col-rate" title="24-hour average hashrate" aria-label="24-hour average hashrate">24h Avg</th>
         <th class="col-count" title="Accepted shares" aria-label="Accepted shares">Acc</th>
         <th class="col-count" title="Rejected shares" aria-label="Rejected shares">Rej</th>
         <th>Best</th>
@@ -1377,9 +1374,12 @@ function fmtUptime(secs) {
   return s + 's';
 }
 
-function fmtTimestamp(ts) {
-  if (!ts || ts === 0) return '—';
-  return new Date(ts * 1000).toLocaleString();
+function fmtPct(pct) {
+  if (!isFinite(pct) || pct <= 0) return '0%';
+  if (pct >= 100) return pct.toFixed(0) + '%';
+  if (pct >= 1) return pct.toFixed(2) + '%';
+  if (pct >= 0.0001) return pct.toFixed(4) + '%';
+  return '<0.0001%';
 }
 
 // ── Chart ────────────────────────────────────────────────────────────────────
@@ -1517,23 +1517,11 @@ async function refresh() {
       const btc = d.current_coinbase_value / 1e8;
       document.getElementById('v-block-reward').textContent = 'Reward: ' + btc.toFixed(8) + ' BTC';
     }
-    document.getElementById('v-last-block-worker').textContent = d.last_block_worker || '—';
-    document.getElementById('v-last-block-payout').textContent = d.last_block_payout || '—';
-    document.getElementById('v-last-block-hash').textContent = d.last_block_hash || '—';
-    document.getElementById('v-last-block-time').textContent = fmtTimestamp(d.last_block_ts);
-    // The submitblock verdict is provisional until the confirmation pass
-    // settles it, so say which it is rather than letting the card imply the
-    // block is safe.
-    const lastBlockStatus = document.getElementById('v-last-block-status');
-    const statusText = {
-      pending: 'awaiting confirmation',
-      confirmed: 'confirmed',
-      orphaned: 'reorged out — earned nothing',
-      abandoned: 'unconfirmed: node no longer has it',
-    };
-    lastBlockStatus.textContent = d.last_block_ts ? (statusText[d.last_block_status] || d.last_block_status) : '—';
-    lastBlockStatus.classList.toggle('ok', d.last_block_status === 'confirmed');
-    lastBlockStatus.classList.toggle('bad', d.last_block_status === 'orphaned' || d.last_block_status === 'abandoned');
+    const roundWork = d.pool_difficulty || 0;
+    const netDiffForPool = d.network_difficulty || 0;
+    document.getElementById('v-pool-diff').textContent =
+      netDiffForPool > 0 ? fmtPct(100 * roundWork / netDiffForPool) : '—';
+    document.getElementById('v-pool-diff-work').textContent = 'work: ' + fmtDiff(roundWork);
     document.getElementById('v-best-share').textContent = fmtDiff(d.best_share_difficulty);
     document.getElementById('v-session-best-share').textContent = fmtDiff(d.session_best_share_difficulty);
     document.getElementById('v-best-over-network').textContent = d.best_share_difficulty >= Math.ceil(d.network_difficulty) ? 'YES' : 'no';
@@ -1583,9 +1571,10 @@ async function refresh() {
     const total = d.shares_accepted + d.shares_rejected;
     const rejectPct = total > 0 ? (d.shares_rejected / total * 100).toFixed(1) : '0.0';
 
-    // Pool lifetime totals lead, this process's counts trail — the same
-    // all-time/session split as the best-share and best-hashrate cards. Each
-    // reject figure carries its own scope's per-reason breakdown as a tooltip.
+    // Since-last-block totals lead (the pool's whole life until the first
+    // win), this process's counts trail — the same round/session split as the
+    // best-share and best-hashrate cards. Each reject figure carries its own
+    // scope's per-reason breakdown as a tooltip.
     const lifeAcc = d.lifetime_shares_accepted || 0;
     const lifeRej = d.lifetime_shares_rejected || 0;
     const lifeTotal = lifeAcc + lifeRej;
@@ -1597,7 +1586,7 @@ async function refresh() {
     document.getElementById('v-shares-per-min').textContent = fmtSpm(d.shares_per_minute_1m, false);
     const rejectEl = document.getElementById('v-reject-rate');
     rejectEl.textContent = `${lifeRej.toLocaleString()} (${lifePct}%)`;
-    rejectEl.title = reasonTooltip('lifetime rejects', d.lifetime_reject_reasons);
+    rejectEl.title = reasonTooltip('rejects since last block', d.lifetime_reject_reasons);
     const sessionRejectEl = document.getElementById('v-session-rejects');
     sessionRejectEl.textContent = `${d.shares_rejected.toLocaleString()} (${rejectPct}%)`;
     sessionRejectEl.title = reasonTooltip('session rejects', d.reject_reasons);

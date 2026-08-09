@@ -447,8 +447,8 @@ that turn out to have been reorged away move `pool_blocks_orphaned_total`, so
 **the blocks the pool actually kept are
 `pool_blocks_found_total - pool_blocks_orphaned_total`** — a counter cannot be
 decremented, so the correction is exported alongside rather than folded in. The
-dashboard shows the net figure directly, and marks the last-block card when the
-block it names has been reorged out. The reconciliation runs in both directions:
+dashboard shows the net figure directly. The reconciliation runs in both
+directions:
 a block that lost its height race and is later promoted onto the active chain by
 a reorg is counted then.
 

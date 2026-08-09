@@ -87,7 +87,7 @@ pub fn record_accepted(
     hash_difficulty: u64,
 ) {
     stats.add_share_diff(session_id, worker, credit as f64);
-    stats.share_accepted(hash_difficulty);
+    stats.share_accepted(credit, hash_difficulty);
     stats.worker_share_accepted(worker, hash_difficulty);
     stats.mark_worker_submit(worker);
     metrics::share_accepted(credit, worker);
@@ -131,7 +131,7 @@ pub fn record_rate_limited(stats: &PoolStats, worker: Option<&str>) {
 /// the stale-tip miscount got in. Only a block that won its height is a find:
 /// an `Inconclusive` block is consensus-valid but sits on a side branch and
 /// earned nothing, so it must not move `pool_blocks_found_total` or the
-/// dashboard's last-block card.
+/// dashboard's block count.
 ///
 /// Callers log their own line — they carry protocol and retry-attempt context
 /// this does not.
@@ -151,7 +151,7 @@ pub fn record_block_outcome(
     metrics::block_submission_outcome(outcome.label());
     if outcome.is_win() {
         metrics::block_found();
-        stats.block_found(worker, payout, hash_hex);
+        stats.block_found();
     } else {
         stats.block_inconclusive();
     }
@@ -231,14 +231,10 @@ mod tests {
         let snap = stats.snapshot();
         assert_eq!(snap.blocks_found, 0);
         assert_eq!(snap.blocks_inconclusive, 1);
-        // The last-block card must still be empty — nothing was won.
-        assert_eq!(snap.last_block_hash, "—");
-        assert_eq!(snap.last_block_worker, "—");
-        assert_eq!(snap.last_block_ts, 0);
     }
 
     #[test]
-    fn a_winning_block_updates_the_count_and_the_last_block_card() {
+    fn a_winning_block_updates_the_count() {
         for outcome in [BlockSubmitOutcome::Accepted, BlockSubmitOutcome::Duplicate] {
             let stats = PoolStats::new_with_store(None);
             record_block_outcome(
@@ -253,9 +249,6 @@ mod tests {
             let snap = stats.snapshot();
             assert_eq!(snap.blocks_found, 1, "{outcome:?}");
             assert_eq!(snap.blocks_inconclusive, 0, "{outcome:?}");
-            assert_eq!(snap.last_block_hash, "0000cafe", "{outcome:?}");
-            assert_eq!(snap.last_block_worker, "worker1", "{outcome:?}");
-            assert_eq!(snap.last_block_payout, "bc1qpayout", "{outcome:?}");
         }
     }
 
@@ -331,9 +324,6 @@ mod tests {
         assert_eq!(snap.blocks_found, 0);
         assert_eq!(snap.blocks_orphaned, 1);
         assert_eq!(snap.blocks_pending_confirmation, 0);
-        // The card still names the block, but no longer claims it stood.
-        assert_eq!(snap.last_block_hash, "0000cafe");
-        assert_eq!(snap.last_block_status, "orphaned");
 
         // The sweep snapshots the pending set, so a slow tick can overlap the
         // next one. The second report must not double-count.
@@ -368,10 +358,6 @@ mod tests {
         assert_eq!(snap.blocks_found, 1);
         assert_eq!(snap.blocks_inconclusive, 0);
         assert_eq!(snap.blocks_orphaned, 0);
-        // It is now the most recent block the pool won, so it takes the card.
-        assert_eq!(snap.last_block_hash, "0000cafe");
-        assert_eq!(snap.last_block_worker, "worker1");
-        assert_eq!(snap.last_block_status, "confirmed");
     }
 
     /// Nothing was proved against an abandoned block, so the submit-time

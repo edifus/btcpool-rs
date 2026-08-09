@@ -440,7 +440,7 @@ impl TemplateEngine {
                 match engine.rpc.submit_block(block_hex.clone()).await {
                     Ok(outcome) => {
                         // Mirror the inline-success path so the dashboard's
-                        // block count / last-block panel agree with Prometheus.
+                        // block count agrees with Prometheus.
                         accounting::record_block_outcome(
                             &stats, outcome, height, &worker, &payout, &hash_hex,
                         );

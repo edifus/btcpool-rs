@@ -91,8 +91,9 @@ impl BlockResolution {
     }
 }
 
-/// Status shown on the dashboard's last-block card while confirmation is still
-/// outstanding. `BlockResolution::label` supplies the terminal values.
+/// Status a found block carries in the `found_blocks` ledger until the
+/// confirmation pass decides it. `BlockResolution::label` supplies the
+/// terminal values.
 pub const BLOCK_STATUS_PENDING: &str = "pending";
 
 // Generates `HashrateWindows` and everything that has to walk its fields in
@@ -209,6 +210,14 @@ struct SnapshotWrite {
     worker_rates: HashMap<String, HashrateWindows>,
     share_totals: ShareTotals,
     lifetime_reject_reasons: BTreeMap<String, u64>,
+    /// Accepted-share work accumulated in the current round (see
+    /// `PoolStats::round_work`).
+    round_work: u64,
+    /// The round epoch the share stats above were read under. The writer
+    /// discards share stats carrying an epoch older than the last applied
+    /// `RoundReset`, so a snapshot raced by a reset cannot resurrect the
+    /// previous round's totals.
+    round_epoch: u64,
     /// Pool-wide accepted shares/min, `hashrate::W_*`-indexed. A bare array
     /// rather than a named-field struct: there is one pool meter and no
     /// aggregation to do, and indexing by the `W_*` constants leaves no gap for
@@ -230,6 +239,14 @@ enum StoreWrite {
         difficulty: u64,
     },
     Snapshot(SnapshotWrite),
+    /// The pool found a block: zero every "since the last found block"
+    /// quantity and stamp when the new round began. Watermark writes racing
+    /// this are not epoch-guarded — the worst case is one share-sized
+    /// watermark surviving the reset, re-earned by the next share.
+    RoundReset {
+        epoch: u64,
+        since_ts: u64,
+    },
     PruneWorkerBestShares(usize),
     /// Enrol a found block in the confirmation ledger. Unlike everything else
     /// here this is not a watermark that can be recomputed — losing it means
@@ -627,6 +644,10 @@ impl StatsStore {
         self.enqueue(StoreWrite::Snapshot(snapshot));
     }
 
+    fn round_reset(&self, epoch: u64, since_ts: u64) {
+        self.enqueue(StoreWrite::RoundReset { epoch, since_ts });
+    }
+
     fn migrate_hashrate_history(conn: &Connection) -> Result<(), rusqlite::Error> {
         let mut stmt = conn.prepare("PRAGMA table_info(hashrate_history)")?;
         let existing: std::collections::HashSet<String> = stmt
@@ -712,10 +733,11 @@ impl StatsStore {
         Ok(())
     }
 
-    /// Add the lifetime share counters to `pool_stats`. Runs after
+    /// Add the since-last-block share counters to `pool_stats`. Runs after
     /// `migrate_hashrate_algo` so that migration never sees columns it
-    /// predates. `stats_since_ts` is set exactly once — the first boot with
-    /// this schema — and marks where the lifetime totals start counting from.
+    /// predates. `stats_since_ts` marks where the totals start counting from:
+    /// set on the first boot with this schema, then moved forward by each
+    /// `RoundReset`.
     fn migrate_share_stats(conn: &Connection) -> Result<(), rusqlite::Error> {
         let mut stmt = conn.prepare("PRAGMA table_info(pool_stats)")?;
         let existing: std::collections::HashSet<String> = stmt
@@ -728,6 +750,7 @@ impl StatsStore {
             "lifetime_shares_accepted",
             "lifetime_shares_rejected",
             "stats_since_ts",
+            "round_work",
         ] {
             if !existing.contains(column) {
                 conn.execute(
@@ -746,10 +769,11 @@ impl StatsStore {
         Ok(())
     }
 
-    fn load_lifetime_stats(&self) -> Result<(ShareTotals, u64), rusqlite::Error> {
+    fn load_lifetime_stats(&self) -> Result<(ShareTotals, u64, u64), rusqlite::Error> {
         let conn = self.read.lock();
         conn.query_row(
-            "SELECT lifetime_shares_accepted, lifetime_shares_rejected, stats_since_ts
+            "SELECT lifetime_shares_accepted, lifetime_shares_rejected, stats_since_ts,
+                    round_work
              FROM pool_stats WHERE id = 1",
             [],
             |row| {
@@ -759,6 +783,7 @@ impl StatsStore {
                         rejected: row.get(1)?,
                     },
                     row.get(2)?,
+                    row.get(3)?,
                 ))
             },
         )
@@ -870,14 +895,22 @@ impl StatsStore {
 /// connection, so SQLite never sees two writers and every statement below runs
 /// off the async runtime.
 fn writer_loop(conn: Connection, rx: std::sync::mpsc::Receiver<StoreWrite>) {
+    // Epoch of the last RoundReset applied this boot. Snapshots read their
+    // epoch before their share stats, so one carrying an older epoch was
+    // assembled before that reset and its share stats must not be re-applied.
+    let mut round_epoch = 0u64;
     while let Ok(write) = rx.recv() {
-        if let Err(e) = apply_write(&conn, write) {
+        if let Err(e) = apply_write(&conn, write, &mut round_epoch) {
             warn!("Failed to persist stats update: {e}");
         }
     }
 }
 
-fn apply_write(conn: &Connection, write: StoreWrite) -> Result<(), rusqlite::Error> {
+fn apply_write(
+    conn: &Connection,
+    write: StoreWrite,
+    round_epoch: &mut u64,
+) -> Result<(), rusqlite::Error> {
     match write {
         // The `?1 > ...` guards keep the watermarks monotonic at the SQL level:
         // updates can be queued out of order, and a stale lower value must not
@@ -940,7 +973,26 @@ fn apply_write(conn: &Connection, write: StoreWrite) -> Result<(), rusqlite::Err
                 params![hash, resolution.label(), resolved_ts, BLOCK_STATUS_PENDING],
             )?;
         }
-        StoreWrite::Snapshot(snapshot) => write_snapshot(conn, &snapshot)?,
+        StoreWrite::Snapshot(snapshot) => {
+            let stale_round = snapshot.round_epoch < *round_epoch;
+            write_snapshot(conn, &snapshot, stale_round)?;
+        }
+        StoreWrite::RoundReset { epoch, since_ts } => {
+            *round_epoch = (*round_epoch).max(epoch);
+            conn.execute(
+                "UPDATE pool_stats SET
+                   lifetime_shares_accepted = 0,
+                   lifetime_shares_rejected = 0,
+                   round_work = 0,
+                   best_share_difficulty = 0,
+                   best_hashrate_hps = 0.0,
+                   stats_since_ts = ?1
+                 WHERE id = 1",
+                params![since_ts],
+            )?;
+            conn.execute("DELETE FROM pool_reject_reasons", [])?;
+            conn.execute("DELETE FROM worker_best_shares", [])?;
+        }
         StoreWrite::Flush(ack) => {
             let _ = ack.send(());
         }
@@ -948,7 +1000,11 @@ fn apply_write(conn: &Connection, write: StoreWrite) -> Result<(), rusqlite::Err
     Ok(())
 }
 
-fn write_snapshot(conn: &Connection, snapshot: &SnapshotWrite) -> Result<(), rusqlite::Error> {
+fn write_snapshot(
+    conn: &Connection,
+    snapshot: &SnapshotWrite,
+    stale_round: bool,
+) -> Result<(), rusqlite::Error> {
     let SnapshotWrite {
         history_ts,
         state_ts,
@@ -956,6 +1012,8 @@ fn write_snapshot(conn: &Connection, snapshot: &SnapshotWrite) -> Result<(), rus
         worker_rates,
         share_totals,
         lifetime_reject_reasons,
+        round_work,
+        round_epoch: _,
         share_rates,
     } = snapshot;
     {
@@ -1002,29 +1060,35 @@ fn write_snapshot(conn: &Connection, snapshot: &SnapshotWrite) -> Result<(), rus
             }
         }
 
-        tx.execute(
-            "INSERT OR REPLACE INTO share_history (ts, shares_accepted, shares_rejected)
-             VALUES (?1, ?2, ?3)",
-            params![history_ts, share_totals.accepted, share_totals.rejected],
-        )?;
-        // Scalar MAX keeps the persisted totals monotonic, same idea as the
-        // watermark guards in `apply_write`: the baseline the next boot
-        // restores must never regress, whatever order queued snapshots land in.
-        tx.execute(
-            "UPDATE pool_stats SET
-               lifetime_shares_accepted = MAX(lifetime_shares_accepted, ?1),
-               lifetime_shares_rejected = MAX(lifetime_shares_rejected, ?2)
-             WHERE id = 1",
-            params![share_totals.accepted, share_totals.rejected],
-        )?;
-
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO pool_reject_reasons (reason, count) VALUES (?1, ?2)
-                 ON CONFLICT(reason) DO UPDATE SET count = MAX(count, excluded.count)",
+        // Share stats are round-scoped: a snapshot assembled before a round
+        // reset the writer has already applied must not re-persist them.
+        if !stale_round {
+            tx.execute(
+                "INSERT OR REPLACE INTO share_history (ts, shares_accepted, shares_rejected)
+                 VALUES (?1, ?2, ?3)",
+                params![history_ts, share_totals.accepted, share_totals.rejected],
             )?;
-            for (reason, count) in lifetime_reject_reasons {
-                stmt.execute(params![reason, count])?;
+            // Scalar MAX keeps the persisted totals monotonic within a round,
+            // same idea as the watermark guards in `apply_write`: the baseline
+            // the next boot restores must never regress, whatever order queued
+            // snapshots land in.
+            tx.execute(
+                "UPDATE pool_stats SET
+                   lifetime_shares_accepted = MAX(lifetime_shares_accepted, ?1),
+                   lifetime_shares_rejected = MAX(lifetime_shares_rejected, ?2),
+                   round_work = MAX(round_work, ?3)
+                 WHERE id = 1",
+                params![share_totals.accepted, share_totals.rejected, round_work],
+            )?;
+
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO pool_reject_reasons (reason, count) VALUES (?1, ?2)
+                     ON CONFLICT(reason) DO UPDATE SET count = MAX(count, excluded.count)",
+                )?;
+                for (reason, count) in lifetime_reject_reasons {
+                    stmt.execute(params![reason, count])?;
+                }
             }
         }
 
@@ -1125,14 +1189,27 @@ pub struct PoolStats {
     shares_accepted: AtomicU64,
     shares_rejected: AtomicU64,
     /// Accepted/rejected totals carried over from previous runs. The atomics
-    /// above count this boot only; anything lifetime-facing goes through
-    /// `lifetime_shares_accepted()`/`..rejected()` = base + atomic. Immutable
-    /// after construction, so plain integers.
+    /// above count this boot only; anything round-facing goes through
+    /// `lifetime_shares_accepted()`/`..rejected()` = base + atomic − round
+    /// offset. Immutable after construction, so plain integers.
     lifetime_accepted_base: u64,
     lifetime_rejected_base: u64,
-    /// Unix time lifetime accounting began. Boot time when no stats DB is
-    /// configured, so the pair above still reads coherently.
-    stats_since_ts: u64,
+    /// Value of base + atomic captured at the last round reset, so the
+    /// displayed totals restart at zero while the boot counters keep serving
+    /// the session cards. Zero until a block is found this boot.
+    round_offset_accepted: AtomicU64,
+    round_offset_rejected: AtomicU64,
+    /// Accepted-share work (vardiff credit) accumulated since the pool last
+    /// found a block — the "Pool difficulty" KPI. Restored from the stats DB
+    /// at boot; zeroed by `round_reset`.
+    round_work: AtomicU64,
+    /// Round resets this boot. Snapshot writes carry it so the writer thread
+    /// can discard share stats assembled before a reset it already applied.
+    round_epoch: AtomicU64,
+    /// Unix time the current round's accounting began: DB creation, then the
+    /// last found block. Boot time when no stats DB is configured, so the
+    /// totals above still read coherently.
+    stats_since_ts: AtomicU64,
     /// This boot's rejects by reason, pool-wide. Keys are the closed reject
     /// label set, so cardinality is bounded; a mutex is fine because rejects
     /// are the exception on the share path.
@@ -1140,6 +1217,9 @@ pub struct PoolStats {
     /// Rejects by reason carried over from previous runs; same baseline
     /// arrangement as the share totals above. Immutable after construction.
     lifetime_reject_reasons_base: BTreeMap<String, u64>,
+    /// Merged reason counts captured at the last round reset — the per-reason
+    /// analogue of `round_offset_accepted`.
+    round_offset_reject_reasons: Mutex<BTreeMap<String, u64>>,
     blocks_found: AtomicU64,
     /// Blocks we mined that were consensus-valid but lost a same-height race,
     /// so they sit on a side branch and earned nothing. Tracked apart from
@@ -1162,15 +1242,6 @@ pub struct PoolStats {
     /// Estimated difficulty change (%) at the next retarget, from epoch timestamps.
     /// Stored as f64::to_bits; NaN until first polled / right after a retarget.
     est_difficulty_change_pct: AtomicU64,
-    last_block_worker: Mutex<Option<String>>,
-    last_block_payout: Mutex<Option<String>>,
-    last_block_hash: Mutex<Option<String>>,
-    last_block_ts: AtomicU64,
-    /// Where the last winning block stands with the confirmation pass:
-    /// `BLOCK_STATUS_PENDING` until it resolves, then a `BlockResolution`
-    /// label. Without it the card would keep advertising a block that has since
-    /// been reorged away.
-    last_block_status: Mutex<&'static str>,
     /// Found blocks still awaiting confirmation, keyed by display hash. This is
     /// the working set `mining::confirm` sweeps; it is mirrored to SQLite when
     /// a stats DB is configured and lives here alone when one is not.
@@ -1245,6 +1316,7 @@ struct Persisted {
     blocks_inconclusive: u64,
     lifetime_share_totals: ShareTotals,
     stats_since_ts: u64,
+    round_work: u64,
     lifetime_reject_reasons: BTreeMap<String, u64>,
     /// Checkpointed pool share rate: when it was written, and the per-window
     /// shares/min at that moment. `None` when the table has no row yet, which
@@ -1282,10 +1354,10 @@ impl Persisted {
                 warn!("Failed to restore block counts from DB {path}: {e}");
                 (0, 0, 0)
             });
-        let (lifetime_share_totals, stats_since_ts) =
+        let (lifetime_share_totals, stats_since_ts, round_work) =
             store.load_lifetime_stats().unwrap_or_else(|e| {
-                warn!("Failed to restore lifetime share totals from DB {path}: {e}");
-                (ShareTotals::default(), 0)
+                warn!("Failed to restore share totals from DB {path}: {e}");
+                (ShareTotals::default(), 0, 0)
             });
         let lifetime_reject_reasons = store.load_reject_reasons().unwrap_or_else(|e| {
             warn!("Failed to restore reject reasons from DB {path}: {e}");
@@ -1313,6 +1385,7 @@ impl Persisted {
             blocks_inconclusive,
             lifetime_share_totals,
             stats_since_ts,
+            round_work,
             lifetime_reject_reasons,
             share_rate,
         }
@@ -1341,6 +1414,7 @@ impl PoolStats {
             blocks_inconclusive,
             lifetime_share_totals,
             stats_since_ts,
+            round_work,
             lifetime_reject_reasons,
             share_rate: persisted_share_rate,
         } = stats_db_path
@@ -1395,15 +1469,20 @@ impl PoolStats {
             shares_rejected: AtomicU64::new(0),
             lifetime_accepted_base: lifetime_share_totals.accepted,
             lifetime_rejected_base: lifetime_share_totals.rejected,
+            round_offset_accepted: AtomicU64::new(0),
+            round_offset_rejected: AtomicU64::new(0),
+            round_work: AtomicU64::new(round_work),
+            round_epoch: AtomicU64::new(0),
             // Zero covers every no-persistence path: `Persisted::default()`
             // and a DB the migration has not stamped yet.
-            stats_since_ts: if stats_since_ts == 0 {
+            stats_since_ts: AtomicU64::new(if stats_since_ts == 0 {
                 wall_now
             } else {
                 stats_since_ts
-            },
+            }),
             reject_reasons: Mutex::new(BTreeMap::new()),
             lifetime_reject_reasons_base: lifetime_reject_reasons,
+            round_offset_reject_reasons: Mutex::new(BTreeMap::new()),
             blocks_found: AtomicU64::new(blocks_found),
             blocks_inconclusive: AtomicU64::new(blocks_inconclusive),
             blocks_orphaned: AtomicU64::new(blocks_orphaned),
@@ -1425,11 +1504,6 @@ impl PoolStats {
             worker_last_submit_ts: DashMap::new(),
             worker_best_shares,
             worker_states: DashMap::new(),
-            last_block_worker: Mutex::new(None),
-            last_block_payout: Mutex::new(None),
-            last_block_hash: Mutex::new(None),
-            last_block_ts: AtomicU64::new(0),
-            last_block_status: Mutex::new(BLOCK_STATUS_PENDING),
             pending_blocks,
             start_time: instant_now,
             store,
@@ -1456,24 +1530,28 @@ impl PoolStats {
         self.connected_miners.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub fn share_accepted(&self, difficulty: u64) {
+    /// `credit` is the share's vardiff work value and feeds the round-work
+    /// accumulator; `hash_difficulty` is the actual difficulty of the hash
+    /// and drives the best-share watermarks.
+    pub fn share_accepted(&self, credit: u64, hash_difficulty: u64) {
         self.shares_accepted.fetch_add(1, Ordering::Relaxed);
         // Counted here, not weighted by difficulty: this is share throughput,
         // which is exactly what the hashrate estimate divides back out.
         self.pending_shares.fetch_add(1, Ordering::Relaxed);
+        self.round_work.fetch_add(credit, Ordering::Relaxed);
 
-        // All-time best share. `fetch_max` is the whole CAS loop: it only ever
+        // Round-best share. `fetch_max` is the whole CAS loop: it only ever
         // raises the watermark, so two racing writers cannot lose the higher
         // value. Persist only when this call is the one that raised it.
         if self
             .best_share_difficulty
-            .fetch_max(difficulty, Ordering::Relaxed)
-            < difficulty
+            .fetch_max(hash_difficulty, Ordering::Relaxed)
+            < hash_difficulty
         {
-            self.persist_best_share_difficulty(difficulty);
+            self.persist_best_share_difficulty(hash_difficulty);
         }
         self.session_best_share_difficulty
-            .fetch_max(difficulty, Ordering::Relaxed);
+            .fetch_max(hash_difficulty, Ordering::Relaxed);
     }
 
     /// `reason` must come from the closed reject label set
@@ -1484,14 +1562,18 @@ impl PoolStats {
         *self.reject_reasons.lock().entry(reason).or_insert(0) += 1;
     }
 
+    /// Accepted shares since the last found block (pool lifetime until the
+    /// first win): persisted base plus this boot, minus the round offset.
     fn lifetime_shares_accepted(&self) -> u64 {
         self.lifetime_accepted_base
             .saturating_add(self.shares_accepted.load(Ordering::Relaxed))
+            .saturating_sub(self.round_offset_accepted.load(Ordering::Relaxed))
     }
 
     fn lifetime_shares_rejected(&self) -> u64 {
         self.lifetime_rejected_base
             .saturating_add(self.shares_rejected.load(Ordering::Relaxed))
+            .saturating_sub(self.round_offset_rejected.load(Ordering::Relaxed))
     }
 
     /// This boot's pool-wide rejects by reason.
@@ -1503,34 +1585,66 @@ impl PoolStats {
             .collect()
     }
 
-    /// Lifetime rejects by reason: the persisted baseline plus this boot.
+    /// Rejects by reason since the last found block: the persisted baseline
+    /// plus this boot, minus the counts captured at the last round reset.
     fn lifetime_reject_reasons(&self) -> BTreeMap<String, u64> {
         let mut merged = self.lifetime_reject_reasons_base.clone();
         for (reason, count) in self.reject_reasons.lock().iter() {
             *merged.entry((*reason).to_string()).or_insert(0) += count;
         }
+        let offsets = self.round_offset_reject_reasons.lock();
+        merged.retain(|reason, count| {
+            *count = count.saturating_sub(offsets.get(reason).copied().unwrap_or(0));
+            *count > 0
+        });
         merged
     }
 
-    pub fn block_found(&self, worker: &str, payout: &str, hash: &str) {
+    /// Count a block the pool won and start a new round. The block's identity
+    /// goes to the ledger via `enroll_pending_block`, not here.
+    pub fn block_found(&self) {
         self.blocks_found.fetch_add(1, Ordering::Relaxed);
-        *self.last_block_worker.lock() = Some(worker.to_string());
-        *self.last_block_payout.lock() = Some(payout.to_string());
-        *self.last_block_hash.lock() = Some(hash.to_string());
-        // A block only just claimed has not been confirmed yet, whatever the
-        // previous occupant of this card had reached.
-        *self.last_block_status.lock() = BLOCK_STATUS_PENDING;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        self.last_block_ts.store(now, Ordering::Relaxed);
+        self.round_reset();
     }
 
-    /// A block that was valid but did not become the chain tip.
-    ///
-    /// Deliberately does not touch `last_block_*`: the dashboard's "Last block
-    /// found" card must only ever show a block that actually won.
+    /// Zero every "since the last found block" quantity, in memory and in the
+    /// store. Session counters (this boot's cards) and the Prometheus
+    /// counters, which must stay monotonic, are left alone.
+    fn round_reset(&self) {
+        let epoch = self.round_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = Self::now_secs();
+        self.round_offset_accepted.store(
+            self.lifetime_accepted_base
+                .saturating_add(self.shares_accepted.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        self.round_offset_rejected.store(
+            self.lifetime_rejected_base
+                .saturating_add(self.shares_rejected.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        {
+            let mut offsets = self.round_offset_reject_reasons.lock();
+            *offsets = self.lifetime_reject_reasons_base.clone();
+            for (reason, count) in self.reject_reasons.lock().iter() {
+                *offsets.entry((*reason).to_string()).or_insert(0) += count;
+            }
+        }
+        self.round_work.store(0, Ordering::Relaxed);
+        self.best_share_difficulty.store(0, Ordering::Relaxed);
+        self.best_hashrate_hps.store(0, Ordering::Relaxed);
+        self.stats_since_ts.store(now, Ordering::Relaxed);
+        self.worker_best_shares.clear();
+        for mut state in self.worker_states.iter_mut() {
+            state.best_share_difficulty = 0;
+        }
+        if let Some(store) = &self.store {
+            store.round_reset(epoch, now);
+        }
+    }
+
+    /// A block that was valid but did not become the chain tip. It must not
+    /// count as a find.
     pub fn block_inconclusive(&self) {
         self.blocks_inconclusive.fetch_add(1, Ordering::Relaxed);
     }
@@ -1600,22 +1714,16 @@ impl PoolStats {
                     });
             }
             // Lost its height race, then a reorg put it on the active chain
-            // after all. `block_found` also refreshes the last-block card,
-            // which is right: it is now the most recent block the pool won.
+            // after all: count the find the submit-time verdict missed.
             (false, BlockResolution::Confirmed) => {
                 let _ = self.blocks_inconclusive.fetch_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     |n| Some(n.saturating_sub(1)),
                 );
-                self.block_found(&block.worker, &block.payout, &block.hash);
+                self.block_found();
             }
             _ => {}
-        }
-
-        // Only annotate the card if it is still showing this block.
-        if self.last_block_hash.lock().as_deref() == Some(block.hash.as_str()) {
-            *self.last_block_status.lock() = resolution.label();
         }
 
         if let Some(store) = &self.store {
@@ -1954,6 +2062,10 @@ impl PoolStats {
             // which unsnapped timestamps would hit only by luck, thinning the
             // long-range history away to nothing.
             let history_ts = state_ts / SNAPSHOT_INTERVAL_SECS * SNAPSHOT_INTERVAL_SECS;
+            // Epoch before share stats: a reset landing in between leaves an
+            // old epoch on fresh (already-zeroed) stats, which the writer
+            // treats as stale and skips — never the reverse.
+            let round_epoch = self.round_epoch.load(Ordering::Relaxed);
             let by_worker = self.hashrates_by_worker();
             let mut total = HashrateWindows::default();
             for rates in by_worker.values() {
@@ -1969,6 +2081,8 @@ impl PoolStats {
                     rejected: self.lifetime_shares_rejected(),
                 },
                 lifetime_reject_reasons: self.lifetime_reject_reasons(),
+                round_work: self.round_work.load(Ordering::Relaxed),
+                round_epoch,
                 share_rates: self.share_rate_windows(),
             });
         }
@@ -2133,7 +2247,7 @@ impl PoolStats {
             shares_rejected: self.shares_rejected.load(Ordering::Relaxed),
             lifetime_shares_accepted: self.lifetime_shares_accepted(),
             lifetime_shares_rejected: self.lifetime_shares_rejected(),
-            stats_since_ts: self.stats_since_ts,
+            stats_since_ts: self.stats_since_ts.load(Ordering::Relaxed),
             reject_reasons: self.session_reject_reasons(),
             lifetime_reject_reasons: self.lifetime_reject_reasons(),
             blocks_found: self.blocks_found.load(Ordering::Relaxed),
@@ -2176,23 +2290,7 @@ impl PoolStats {
             session_best_hashrate_hps: f64::from_bits(
                 self.session_best_hashrate_hps.load(Ordering::Relaxed),
             ),
-            last_block_worker: self
-                .last_block_worker
-                .lock()
-                .clone()
-                .unwrap_or_else(|| "—".to_string()),
-            last_block_payout: self
-                .last_block_payout
-                .lock()
-                .clone()
-                .unwrap_or_else(|| "—".to_string()),
-            last_block_hash: self
-                .last_block_hash
-                .lock()
-                .clone()
-                .unwrap_or_else(|| "—".to_string()),
-            last_block_ts: self.last_block_ts.load(Ordering::Relaxed),
-            last_block_status: (*self.last_block_status.lock()).to_string(),
+            pool_difficulty: self.round_work.load(Ordering::Relaxed),
             unsupported_rules: Vec::new(),
             rules_block_work: false,
         }
@@ -2207,20 +2305,21 @@ impl PoolStats {
 pub struct StatsSnapshot {
     pub shares_accepted: u64,
     pub shares_rejected: u64,
-    /// Totals across the pool's whole recorded life (`stats_since_ts` onward);
-    /// the pair above counts this process only. Identical to that pair when no
-    /// stats DB is configured.
+    /// Totals since the pool's last found block (`stats_since_ts` onward) —
+    /// its whole recorded life until the first win; the pair above counts this
+    /// process only. Identical to that pair when no stats DB is configured.
     pub lifetime_shares_accepted: u64,
     pub lifetime_shares_rejected: u64,
-    /// Unix time lifetime accounting began.
+    /// Unix time the current round's accounting began: DB creation, then the
+    /// last found block.
     pub stats_since_ts: u64,
     /// This process's pool-wide rejects by reason. Unlike the per-worker
     /// breakdowns in `worker_states`, this also counts rejects that never
     /// attached to a known worker (pre-auth rate limiting) and survives
     /// worker eviction.
     pub reject_reasons: BTreeMap<String, u64>,
-    /// Rejects by reason across the pool's whole recorded life. Reasons were
-    /// introduced after the lifetime totals, so their sum can trail
+    /// Rejects by reason since the last found block. Reasons were introduced
+    /// after the share totals, so their sum can trail
     /// `lifetime_shares_rejected` on pools with older history.
     pub lifetime_reject_reasons: BTreeMap<String, u64>,
     /// Wins that have survived so far: decremented when the confirmation pass
@@ -2269,13 +2368,11 @@ pub struct StatsSnapshot {
     pub worker_states: Vec<WorkerState>,
     pub uptime_secs: u64,
     pub session_best_hashrate_hps: f64,
-    pub last_block_worker: String,
-    pub last_block_payout: String,
-    pub last_block_hash: String,
-    pub last_block_ts: u64,
-    /// Where the last block stands with the confirmation pass: `pending` until
-    /// it is decided, then a `BlockResolution` label.
-    pub last_block_status: String,
+    /// Accepted-share work (vardiff credit) accumulated since the pool last
+    /// found a block. The dashboard divides it by `network_difficulty` for
+    /// the "Pool difficulty" KPI; 100% of the network difficulty is one
+    /// expected block's worth of work.
+    pub pool_difficulty: u64,
     /// `!`-prefixed `getblocktemplate` rules this build does not implement.
     /// Filled by the dashboard from the TemplateEngine, like `template_version`;
     /// other snapshot consumers receive an empty list.
@@ -2345,9 +2442,9 @@ mod tests {
 
         {
             let stats = PoolStats::new_with_store(Some(db_path.clone()));
-            stats.share_accepted(1_000_000);
+            stats.share_accepted(1_000_000, 1_000_000);
             assert_eq!(stats.snapshot().best_share_difficulty, 1_000_000);
-            stats.share_accepted(1_500_000);
+            stats.share_accepted(1_500_000, 1_500_000);
             assert_eq!(stats.snapshot().best_share_difficulty, 1_500_000);
         }
 
@@ -2681,7 +2778,7 @@ mod tests {
             let stats = PoolStats::new_with_store(Some(db_path.clone()));
             assert!(stats.snapshot().stats_since_ts > 0);
             for _ in 0..3 {
-                stats.share_accepted(1_000);
+                stats.share_accepted(1_000, 1_000);
             }
             stats.share_rejected("stale");
             stats.share_rejected("duplicate");
@@ -2714,7 +2811,7 @@ mod tests {
             assert_eq!(snap.lifetime_reject_reasons.get("stale"), Some(&1));
             assert_eq!(snap.lifetime_reject_reasons.get("duplicate"), Some(&1));
 
-            stats.share_accepted(1_000);
+            stats.share_accepted(1_000, 1_000);
             stats.record_hashrate_snapshot_at(130);
         }
 
@@ -2763,7 +2860,7 @@ mod tests {
         assert!(snap.stats_since_ts >= before);
 
         // And the new write path works against the migrated schema.
-        stats.share_accepted(1_000);
+        stats.share_accepted(1_000, 1_000);
         stats.record_hashrate_snapshot_at(120);
         drop(stats);
 
@@ -2779,13 +2876,13 @@ mod tests {
         let db_path = make_temp_db();
         let stats = PoolStats::new_with_store(Some(db_path.clone()));
 
-        stats.share_accepted(1_000);
-        stats.share_accepted(1_000);
+        stats.share_accepted(1_000, 1_000);
+        stats.share_accepted(1_000, 1_000);
         stats.share_rejected("stale");
         // 125 snaps to the 120 grid line, like the recorder's drifting ticks.
         stats.record_hashrate_snapshot_at(125);
 
-        stats.share_accepted(1_000);
+        stats.share_accepted(1_000, 1_000);
         stats.record_hashrate_snapshot_at(130);
 
         let store = stats.store.as_ref().unwrap();
@@ -2873,7 +2970,7 @@ mod tests {
         let db_path = make_temp_db();
         {
             let stats = PoolStats::new_with_store(Some(db_path.clone()));
-            stats.share_accepted(1_000);
+            stats.share_accepted(1_000, 1_000);
             stats.share_rejected("stale");
             stats.record_hashrate_snapshot_at(120);
             let store = stats.store.as_ref().unwrap();
@@ -3025,7 +3122,7 @@ mod tests {
             let mut tick = now;
             for _ in 0..600 {
                 for _ in 0..(5 * hashrate::TICK_SECS) {
-                    stats.share_accepted(1);
+                    stats.share_accepted(1, 1);
                 }
                 tick += Duration::from_secs(hashrate::TICK_SECS);
                 stats.tick_hashrates_at(tick);
@@ -3072,7 +3169,7 @@ mod tests {
         stats.tick_hashrates_at(now + Duration::from_secs(hashrate::TICK_SECS));
         assert_eq!(stats.snapshot().shares_per_minute_1m, 0.0);
 
-        stats.share_accepted(1);
+        stats.share_accepted(1, 1);
         stats.tick_hashrates_at(now + Duration::from_secs(2 * hashrate::TICK_SECS));
         assert!(stats.snapshot().shares_per_minute_1m > 0.0);
     }
@@ -3087,8 +3184,8 @@ mod tests {
         let small = PoolStats::new_with_store_at(None, 1_000, now);
         let large = PoolStats::new_with_store_at(None, 1_000, now);
         for _ in 0..10 {
-            small.share_accepted(1);
-            large.share_accepted(1_000_000);
+            small.share_accepted(1, 1);
+            large.share_accepted(1_000_000, 1_000_000);
         }
         small.tick_hashrates_at(tick);
         large.tick_hashrates_at(tick);
@@ -3106,8 +3203,8 @@ mod tests {
     fn shutdown_persist_flushes_without_drop() {
         let db_path = make_temp_db();
         let stats = PoolStats::new_with_store(Some(db_path.clone()));
-        stats.share_accepted(1_000);
-        stats.share_accepted(1_000);
+        stats.share_accepted(1_000, 1_000);
+        stats.share_accepted(1_000, 1_000);
         stats.share_rejected("stale");
 
         stats.shutdown_persist();
@@ -3147,6 +3244,121 @@ mod tests {
         assert!(stats.worker_states.get("online").is_some());
         assert!(stats.worker_states.get("recent").is_some());
         assert!(stats.worker_states.get("idle").is_none());
+    }
+
+    #[test]
+    fn pool_difficulty_accumulates_credit_and_resets_when_a_block_is_found() {
+        let stats = PoolStats::new_with_store(None);
+        assert_eq!(stats.snapshot().pool_difficulty, 0);
+
+        stats.share_accepted(1_000, 5_000);
+        stats.share_accepted(2_500, 2_500);
+        assert_eq!(stats.snapshot().pool_difficulty, 3_500);
+
+        stats.block_found();
+        assert_eq!(stats.snapshot().pool_difficulty, 0);
+
+        stats.share_accepted(4_000, 4_000);
+        assert_eq!(stats.snapshot().pool_difficulty, 4_000);
+    }
+
+    #[test]
+    fn finding_a_block_starts_a_new_round_of_kpis() {
+        let stats = PoolStats::new_with_store(None);
+        stats.mark_worker_online("w", 1_000);
+        stats.share_accepted(1_000, 9_000_000);
+        stats.worker_share_accepted("w", 9_000_000);
+        stats.share_rejected("stale");
+        stats.record_best_hashrate(5.0e12);
+
+        stats.block_found();
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.blocks_found, 1);
+        assert_eq!(snap.lifetime_shares_accepted, 0);
+        assert_eq!(snap.lifetime_shares_rejected, 0);
+        assert!(snap.lifetime_reject_reasons.is_empty());
+        assert_eq!(snap.best_share_difficulty, 0);
+        assert_eq!(snap.best_hashrate_hps, 0.0);
+        assert_eq!(snap.pool_difficulty, 0);
+        let w = snap.worker_states.iter().find(|w| w.worker == "w").unwrap();
+        assert_eq!(w.best_share_difficulty, 0);
+
+        // Session counters describe this boot, not the round: they keep going.
+        assert_eq!(snap.shares_accepted, 1);
+        assert_eq!(snap.shares_rejected, 1);
+        assert_eq!(snap.session_best_share_difficulty, 9_000_000);
+        assert_eq!(snap.session_best_hashrate_hps, 5.0e12);
+
+        // The next round accumulates from zero.
+        stats.share_accepted(500, 500);
+        stats.share_rejected("duplicate");
+        let snap = stats.snapshot();
+        assert_eq!(snap.lifetime_shares_accepted, 1);
+        assert_eq!(snap.lifetime_shares_rejected, 1);
+        assert_eq!(snap.lifetime_reject_reasons.get("duplicate"), Some(&1));
+        assert_eq!(snap.lifetime_reject_reasons.get("stale"), None);
+        assert_eq!(snap.pool_difficulty, 500);
+        assert_eq!(snap.best_share_difficulty, 500);
+    }
+
+    #[test]
+    fn a_round_reset_survives_a_restart() {
+        let db_path = make_temp_db();
+        {
+            let stats = PoolStats::new_with_store(Some(db_path.clone()));
+            stats.mark_worker_online("w", 1_000);
+            stats.share_accepted(2_000, 8_000);
+            stats.worker_share_accepted("w", 8_000);
+            stats.share_rejected("stale");
+            stats.record_hashrate_snapshot_at(120);
+            stats.block_found();
+            stats.shutdown_persist();
+        }
+
+        let stats = PoolStats::new_with_store(Some(db_path.clone()));
+        let snap = stats.snapshot();
+        assert_eq!(snap.lifetime_shares_accepted, 0);
+        assert_eq!(snap.lifetime_shares_rejected, 0);
+        assert!(snap.lifetime_reject_reasons.is_empty());
+        assert_eq!(snap.best_share_difficulty, 0);
+        assert_eq!(snap.pool_difficulty, 0);
+        assert!(snap
+            .worker_states
+            .iter()
+            .all(|w| w.best_share_difficulty == 0));
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    #[test]
+    fn a_stale_snapshot_cannot_resurrect_a_reset_round() {
+        let db_path = make_temp_db();
+        let store = StatsStore::open(&db_path).unwrap();
+        store.round_reset(1, 1_000);
+        // Assembled before the reset (epoch 0), applied after it.
+        store.record_hashrate_snapshot(SnapshotWrite {
+            history_ts: 60,
+            state_ts: 60,
+            share_totals: ShareTotals {
+                accepted: 999,
+                rejected: 9,
+            },
+            round_work: 12_345,
+            round_epoch: 0,
+            ..Default::default()
+        });
+        store.flush();
+
+        let (totals, since_ts, round_work) = store.load_lifetime_stats().unwrap();
+        assert_eq!(totals.accepted, 0);
+        assert_eq!(totals.rejected, 0);
+        assert_eq!(round_work, 0);
+        assert_eq!(since_ts, 1_000);
+
+        drop(store);
+        std::fs::remove_file(db_path).ok();
     }
 
     #[test]
@@ -3223,7 +3435,7 @@ mod tests {
 
         {
             let stats = PoolStats::new_with_store(Some(db_path.clone()));
-            stats.block_found("w1", "bc1qpayout", "0000cafe");
+            stats.block_found();
             stats.enroll_pending_block(800_000, "0000cafe", "w1", "bc1qpayout", true);
             assert_eq!(stats.snapshot().blocks_pending_confirmation, 1);
         }
@@ -3256,7 +3468,7 @@ mod tests {
             for (hash, won) in [("aa", true), ("bb", true), ("cc", false)] {
                 stats.enroll_pending_block(800_000, hash, "w1", "bc1qpayout", won);
                 if won {
-                    stats.block_found("w1", "bc1qpayout", hash);
+                    stats.block_found();
                 } else {
                     stats.block_inconclusive();
                 }

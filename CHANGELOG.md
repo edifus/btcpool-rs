@@ -10,6 +10,13 @@ everything else bumps the **patch** version.
 ## [Unreleased]
 
 ### Added
+- **A Pool difficulty KPI on the dashboard overview** — accepted share work
+  accumulated since the pool's last found block, shown as a percentage of the
+  current network difficulty (100% is one expected block's worth of work) with
+  the raw accumulated difficulty below. Persisted in the stats DB, so a
+  restart does not reset it — only finding a block does. Exposed as
+  `pool_difficulty` on `GET /stats`. The overview cards now read Accepted,
+  Rejected, Best share, Best hashrate, Miners, Pool difficulty.
 - **A shares-per-minute chart on the dashboard**, below the hashrate panel and
   driven by the same range selector, over the same 1m/5m/10m/1h/6h/24h decaying
   averages. Share throughput is a separate signal from work done — it moves with
@@ -46,6 +53,13 @@ everything else bumps the **patch** version.
   fresh load.
 
 ### Changed
+- **Every cumulative KPI now measures since the pool's last found block rather
+  than pool lifetime** — identical for a solo pool until the first win.
+  Finding a block starts a new round: accepted and rejected totals (and their
+  reason breakdowns), best share, best hashrate, per-worker best shares, and
+  the accumulated pool difficulty all reset, in memory and in the stats DB,
+  and `stats_since_ts` moves to the block. The session cards and the
+  Prometheus counters, which must stay monotonic, are unaffected.
 - **Operational log levels now separate useful lifecycle events from routine
   connection noise.** Block notifications, vardiff changes, miner capability
   negotiation, subscription metadata, and SV2 setup/extranonce details are
@@ -72,6 +86,12 @@ everything else bumps the **patch** version.
 - `BTCPOOL_*` config overrides announce themselves on stderr instead of through
   `tracing`. Overrides are applied while loading the config, before the
   subscriber exists, so those lines were being written to nothing.
+
+### Removed
+- **The Last block found card, and the `last_block_*` fields on `GET /stats`
+  that fed it.** The block counts and the SQLite `found_blocks` ledger are
+  untouched, so nothing recorded about found blocks is lost — only the
+  most-recent-block convenience fields.
 
 ### Fixed
 - **An empty `[logging] log_dir` no longer writes log files into the working
