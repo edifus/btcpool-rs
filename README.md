@@ -73,7 +73,7 @@ and exercised on every commit, so you can check it rather than trust it.
 | Block submission | `submitblock` on valid block, immediate with latency logging |
 | Security | Per-IP connection rate limiting, per-session share rate limiting (token bucket), invalid-share counting, IP ban list with TTL, message size limit |
 | Metrics | Prometheus endpoint (`/metrics`): hashrate, share counts, block finds, connected miners |
-| Logging | Structured JSON or human-readable via `tracing` |
+| Logging | Human-readable on stdout via `tracing`, always; optional rotating log files, plain or structured JSON |
 
 ---
 
@@ -272,8 +272,8 @@ sudo systemctl enable --now btcpool-rs
 journalctl -u btcpool-rs -f
 ```
 
-Logs go to the journal by default (`log_dir` empty); set `log_dir` plus
-`LogsDirectory=` in the unit for file logging instead.
+Logs always reach the journal. To *also* keep rotating files on disk, set
+`log_dir` in `config.toml` and uncomment `LogsDirectory=` in the unit.
 
 ---
 

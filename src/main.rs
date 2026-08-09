@@ -266,66 +266,69 @@ async fn shutdown_signal() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn init_tracing(cfg: &config::LoggingConfig) {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-    let filter = EnvFilter::try_new(&cfg.level).unwrap_or_else(|_| EnvFilter::new("info"));
+    // RUST_LOG when set, [logging] level otherwise.
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(&cfg.level))
+        .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    if let Some(log_dir) = &cfg.log_dir {
-        use std::path::PathBuf;
+    // stdout is unconditional — the systemd journal and the Docker log driver
+    // capture it — and always human-readable. `json` formats the log file only.
+    let mut layers = vec![fmt_layer(false, std::io::stdout)];
+
+    if let Some(dir) = cfg.log_dir_path() {
         use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
-        // Expand ~ if present
-        let log_dir_path = if let Some(stripped) = log_dir.strip_prefix("~/") {
-            if let Some(home) = std::env::var_os("HOME") {
-                PathBuf::from(home).join(stripped)
-            } else {
-                PathBuf::from(log_dir)
-            }
-        } else {
-            PathBuf::from(log_dir)
-        };
-
-        // Create directory if it doesn't exist
-        if let Err(e) = std::fs::create_dir_all(&log_dir_path) {
-            eprintln!(
-                "Failed to create log directory {}: {}",
-                log_dir_path.display(),
-                e
-            );
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("Failed to create log directory {}: {e}", dir.display());
             std::process::exit(1);
         }
 
-        let file_appender =
-            RollingFileAppender::new(Rotation::DAILY, log_dir_path, "btcpool-rs.log");
+        // Rotated daily as `btcpool-rs.log.YYYY-MM-DD`.
+        let appender = RollingFileAppender::builder()
+            .rotation(Rotation::DAILY)
+            .filename_prefix("btcpool-rs.log")
+            .build(&dir)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to open log file in {}: {e}", dir.display());
+                std::process::exit(1);
+            });
 
-        if cfg.json {
-            fmt()
-                .json()
-                .with_env_filter(filter)
-                .with_current_span(true)
-                .with_writer(file_appender)
-                .with_ansi(false)
-                .init();
-        } else {
-            fmt()
-                .with_env_filter(filter)
-                .with_target(true)
-                .with_writer(file_appender)
-                .with_ansi(false)
-                .init();
-        }
-    } else if cfg.json {
-        fmt()
+        layers.push(fmt_layer(cfg.json, appender));
+    }
+
+    // Filter added last so the fmt layers are typed against a bare `Registry`.
+    // Position does not affect reach: as a layer, EnvFilter filters globally.
+    tracing_subscriber::registry()
+        .with(layers)
+        .with(filter)
+        .init();
+}
+
+/// One `fmt` sink, structured or human-readable. Boxed because the two
+/// formatters are different types and both sinks share a `Vec`.
+fn fmt_layer<S, W>(json: bool, writer: W) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    use tracing_subscriber::{fmt, Layer};
+
+    // ANSI off on both sinks: escape codes are noise in the journal and corrupt
+    // file logs.
+    if json {
+        fmt::layer()
             .json()
-            .with_env_filter(filter)
             .with_current_span(true)
+            .with_writer(writer)
             .with_ansi(false)
-            .init();
+            .boxed()
     } else {
-        fmt()
-            .with_env_filter(filter)
+        fmt::layer()
             .with_target(true)
+            .with_writer(writer)
             .with_ansi(false)
-            .init();
+            .boxed()
     }
 }

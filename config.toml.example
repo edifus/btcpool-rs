@@ -228,10 +228,13 @@ stats_db_path = "pool_stats.sqlite"
 # Log level: trace | debug | info | warn | error
 level = "info"
 
-# Emit structured JSON logs (useful for log aggregators like Loki)
+# Emit structured JSON to the log file (useful for log aggregators like Loki).
+# Applies to log_dir output only — stdout, and therefore the journal, stays
+# human-readable. Has no effect unless log_dir is set.
 json = false
 
-# Optional: Directory to write log files to (e.g., for systemd service).
-# If set, logs will be written to a rotating file in this directory.
-# Supports ~ expansion. Leave empty or omit to log to stdout/stderr.
+# Optional: Directory to write log files to. Logs always go to stdout — the
+# systemd journal and the Docker log driver both read it from there — and this
+# adds a rotating daily file alongside them (btcpool-rs.log.YYYY-MM-DD).
+# Supports ~ expansion. Leave empty or omit for stdout only (the default).
 log_dir = ""

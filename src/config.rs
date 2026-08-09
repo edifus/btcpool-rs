@@ -281,10 +281,23 @@ pub struct MetricsConfig {
 pub struct LoggingConfig {
     pub level: String,
     pub json: bool,
-    /// Optional directory to write logs to (e.g., "/var/log/btcpool-rs/").
-    /// If set, logs will be written to a file in this directory.
-    /// Supports `~` expansion.
+    /// Directory for rotating log files (e.g., "/var/log/btcpool-rs/"). Logs
+    /// always go to stdout; this adds a file copy alongside them. Empty or
+    /// absent disables file logging. Supports `~` expansion.
     pub log_dir: Option<String>,
+}
+
+impl LoggingConfig {
+    /// Resolved log directory, or `None` when file logging is off. Empty and
+    /// whitespace-only values are off, the same as an absent key — `Option`
+    /// alone does not cover that, since `""` deserializes to `Some("")`.
+    pub fn log_dir_path(&self) -> Option<PathBuf> {
+        self.log_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map(expand_tilde)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -421,8 +434,9 @@ fn apply_env_overrides(
             Some(_) => anyhow::bail!("{name}: cannot override non-scalar {section}.{key}"),
             None => infer_toml_scalar(raw),
         };
-        // Names only — values may be credentials.
-        tracing::info!("Config override from environment: {section}.{key}");
+        // Names only — values may be credentials. stderr because config loads
+        // before the tracing subscriber exists; systemd and Docker capture it.
+        eprintln!("Config override from environment: {section}.{key}");
         table.insert(key, parsed);
     }
     Ok(())
@@ -463,6 +477,7 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{apply_env_overrides, Config, PoolConfig};
+    use std::path::PathBuf;
 
     /// A complete, valid config; tests override single values on top of it.
     fn config_toml(coinbase_tag: &str, extranonce1: usize, extranonce2: usize) -> String {
@@ -559,6 +574,33 @@ json = false
             let err = config.validate().unwrap_err().to_string();
             assert!(err.contains(hint), "unexpected error for {depth}: {err}");
         }
+    }
+
+    /// `""` deserializes to `Some("")`, not `None`, so an empty `log_dir` would
+    /// otherwise enable file logging and resolve relative to the process
+    /// working directory.
+    #[test]
+    fn empty_log_dir_disables_file_logging() {
+        let base = config_toml("/btcpool-rs/", 4, 4);
+        let parse = |src: &str| {
+            toml::from_str::<Config>(src)
+                .unwrap()
+                .logging
+                .log_dir_path()
+        };
+
+        // Absent, empty, and whitespace-only all mean "stdout only".
+        assert_eq!(parse(&base), None);
+        for value in ["\"\"", "\"   \""] {
+            let src = base.replace("json = false", &format!("json = false\nlog_dir = {value}"));
+            assert_eq!(parse(&src), None, "log_dir = {value} should disable files");
+        }
+
+        let src = base.replace(
+            "json = false",
+            "json = false\nlog_dir = \"/var/log/btcpool-rs\"",
+        );
+        assert_eq!(parse(&src), Some(PathBuf::from("/var/log/btcpool-rs")));
     }
 
     // Fixtures pass vars directly instead of mutating the process environment,

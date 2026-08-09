@@ -50,6 +50,27 @@ everything else bumps the **patch** version.
   in the header — and uses consistent compact labels across the remaining KPI
   cards. Reject details no longer widen the Rejected card as an inline list;
   the lifetime and session totals expose their labelled breakdowns on hover.
+- **Logs now always go to stdout**, so the systemd journal and the Docker log
+  driver always have them. Configuring `[logging] log_dir` previously *replaced*
+  stdout with the log file; it now adds a rotating file alongside stdout rather
+  than diverting it.
+- **`[logging] json` now formats the log file only**, and has no effect without
+  `log_dir`. Structured output exists for log shippers, which read the file.
+- `RUST_LOG` is honoured, taking precedence over `[logging] level` when set.
+  README and CONTRIBUTING have documented `RUST_LOG=debug cargo run` for a while,
+  but the filter was built from the config string alone and ignored the
+  environment.
+- `BTCPOOL_*` config overrides announce themselves on stderr instead of through
+  `tracing`. Overrides are applied while loading the config, before the
+  subscriber exists, so those lines were being written to nothing.
+
+### Fixed
+- **An empty `[logging] log_dir` no longer writes log files into the working
+  directory.** `log_dir` is optional, but `""` deserialized to `Some("")`
+  rather than `None` and took the file-logging path anyway. Empty and
+  whitespace-only values now mean "stdout only", as every doc already claimed.
+- A log directory that cannot be created or opened now exits with a legible
+  message on stderr instead of a panic backtrace from inside the appender.
 
 ## [0.3.0] - 2026-08-07
 

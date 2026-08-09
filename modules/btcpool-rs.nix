@@ -75,6 +75,9 @@ let
         logging = {
           level = "info";
           json = false;
+          # Empty = journal only. Set a directory to also keep rotating files
+          # on disk; the unit would then want a matching LogsDirectory. `json`
+          # above formats those files; the journal stays human-readable.
           log_dir = "";
         };
       };
