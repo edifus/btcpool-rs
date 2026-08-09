@@ -964,16 +964,16 @@ tr:last-child td { border-bottom: none; }
         <th class="col-led">Status</th>
         <th>Mode</th>
         <th>Vardiff</th>
-        <th class="col-rate" title="1-minute hashrate" aria-label="1-minute hashrate">1m</th>
-        <th class="col-rate" title="5-minute hashrate" aria-label="5-minute hashrate">5m</th>
-        <th class="col-rate" title="10-minute hashrate" aria-label="10-minute hashrate">10m</th>
-        <th class="col-rate" title="1-hour hashrate" aria-label="1-hour hashrate">1h</th>
-        <th class="col-rate" title="6-hour hashrate" aria-label="6-hour hashrate">6h</th>
-        <th class="col-rate" title="24-hour hashrate" aria-label="24-hour hashrate">24h</th>
-        <th class="col-count" title="Accepted shares" aria-label="Accepted shares">Acc.</th>
-        <th class="col-count" title="Rejected shares" aria-label="Rejected shares">Rej.</th>
-        <th>Best Share</th>
-        <th>Last Share</th>
+        <th class="col-rate" title="1-minute average hashrate" aria-label="1-minute average hashrate">Avg 1m</th>
+        <th class="col-rate" title="5-minute average hashrate" aria-label="5-minute average hashrate">Avg 5m</th>
+        <th class="col-rate" title="10-minute average hashrate" aria-label="10-minute average hashrate">Avg 10m</th>
+        <th class="col-rate" title="1-hour average hashrate" aria-label="1-hour average hashrate">Avg 1h</th>
+        <th class="col-rate" title="6-hour average hashrate" aria-label="6-hour average hashrate">Avg 6h</th>
+        <th class="col-rate" title="24-hour average hashrate" aria-label="24-hour average hashrate">Avg 24h</th>
+        <th class="col-count" title="Accepted shares" aria-label="Accepted shares">Acc</th>
+        <th class="col-count" title="Rejected shares" aria-label="Rejected shares">Rej</th>
+        <th>Best</th>
+        <th>Last</th>
         <th>Uptime</th>
       </tr>
     </thead>
