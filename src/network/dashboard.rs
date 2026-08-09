@@ -945,7 +945,7 @@ tr:last-child td { border-bottom: none; }
 
   <div class="panel" id="sharerate-panel">
     <div class="panel-head">
-      <div class="panel-title">Shares per minute <span title="Accepted shares per minute, decayed over the same windows as the hashrate chart above and plotted on the same range. Moves with vardiff and miner count, so it can shift while hashrate holds steady" style="cursor:help;">&#9432;</span></div>
+      <div class="panel-title">Shares per minute <span title="Accepted shares per minute, averaged over the last minute; long ranges use time-bucket averages" style="cursor:help;">&#9432;</span></div>
       <div class="panel-controls">
         <button id="sharerate-chart-toggle" class="panel-toggle" title="Hide or show the share rate chart"><span class="panel-toggle-label">Hide</span></button>
       </div>
