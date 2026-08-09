@@ -1569,7 +1569,7 @@ async function refresh() {
     document.getElementById('server-uptime').textContent = 'Uptime ' + fmtUptime(d.uptime_secs);
 
     const total = d.shares_accepted + d.shares_rejected;
-    const rejectPct = total > 0 ? (d.shares_rejected / total * 100).toFixed(1) : '0.0';
+    const rejectPct = total > 0 ? (d.shares_rejected / total * 100).toFixed(2) : '0.00';
 
     // Since-last-block totals lead (the pool's whole life until the first
     // win), this process's counts trail — the same round/session split as the
@@ -1578,7 +1578,7 @@ async function refresh() {
     const lifeAcc = d.lifetime_shares_accepted || 0;
     const lifeRej = d.lifetime_shares_rejected || 0;
     const lifeTotal = lifeAcc + lifeRej;
-    const lifePct = lifeTotal > 0 ? (lifeRej / lifeTotal * 100).toFixed(1) : '0.0';
+    const lifePct = lifeTotal > 0 ? (lifeRej / lifeTotal * 100).toFixed(2) : '0.00';
     document.getElementById('v-accepted').textContent = lifeAcc.toLocaleString();
     document.getElementById('v-session-accepted').textContent = d.shares_accepted.toLocaleString();
     // Current throughput under the two totals: the same 1m window the chart's
