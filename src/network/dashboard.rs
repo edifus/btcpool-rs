@@ -1496,10 +1496,10 @@ async function refresh() {
     document.getElementById('v-session-accepted').textContent = d.shares_accepted.toLocaleString();
     const rejectEl = document.getElementById('v-reject-rate');
     rejectEl.textContent = `${lifeRej.toLocaleString()} (${lifePct}%)`;
-    rejectEl.title = reasonTooltip(d.lifetime_reject_reasons);
+    rejectEl.title = reasonTooltip('lifetime rejects', d.lifetime_reject_reasons);
     const sessionRejectEl = document.getElementById('v-session-rejects');
     sessionRejectEl.textContent = `${d.shares_rejected.toLocaleString()} (${rejectPct}%)`;
-    sessionRejectEl.title = reasonTooltip(d.reject_reasons);
+    sessionRejectEl.title = reasonTooltip('session rejects', d.reject_reasons);
 
     const workers = Array.isArray(d.worker_states) ? d.worker_states : [];
     const onlineCount = workers.filter(w => w.online).length;
@@ -1569,12 +1569,12 @@ function rejectLabel(reason) {
   return REJECT_LABELS[reason] || reason;
 }
 
-function reasonTooltip(reasons) {
+function reasonTooltip(label, reasons) {
   const parts = Object.entries(reasons || {})
     .filter(([, n]) => n > 0)
     .sort((a, b) => b[1] - a[1])
     .map(([r, n]) => `${rejectLabel(r)}: ${n.toLocaleString()}`);
-  return parts.length ? parts.join('\n') : 'no rejects';
+  return parts.length ? [label, ...parts].join('\n') : `no ${label}`;
 }
 
 function rejectBreakdown(w) {
