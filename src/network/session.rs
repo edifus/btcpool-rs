@@ -152,7 +152,7 @@ pub async fn run(
     network: bitcoin::Network,
 ) {
     if ban_list.is_banned(&peer.ip()) {
-        debug!("Rejected banned IP: {peer}");
+        warn!("Rejected banned IP: {peer}");
         return;
     }
 
@@ -200,7 +200,7 @@ pub async fn run(
             ) => {
                 match line_result {
                     Err(_) => {
-                        warn!("Miner {peer} idle timeout — disconnecting");
+                        info!("Miner {peer} idle timeout — disconnecting");
                         break;
                     }
                     Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -240,7 +240,7 @@ pub async fn run(
                                 if let Some(worker) = &session.worker {
                                     metrics::miner_disconnect(&reason, worker);
                                 }
-                                warn!("Disconnecting {peer}: {reason}");
+                                info!("Disconnecting {peer}: {reason}");
                                 break;
                             }
                         }
@@ -251,7 +251,7 @@ pub async fn run(
                             if let Some(worker) = &session.worker {
                                 metrics::vardiff_retarget(worker, old_diff, new_diff);                                session.stats.update_worker_vardiff(worker, new_diff);                            }
                             let msg = ResponseBuilder::set_difficulty(new_diff);
-                            debug!(
+                            info!(
                                 peer = %session.peer,
                                 worker = ?session.worker,
                                 difficulty = new_diff,
@@ -348,13 +348,13 @@ async fn send_messages(
         tracing::trace!(peer = %peer, raw = %msg, "→ pool");
         let line = format!("{msg}\n");
         if let Err(e) = w.write_all(line.as_bytes()).await {
-            warn!("Write error to {peer}: {e}");
+            debug!("Write error to {peer}: {e}");
             return false;
         }
     }
 
     if let Err(e) = w.flush().await {
-        warn!("Flush error to {peer}: {e}");
+        debug!("Flush error to {peer}: {e}");
         return false;
     }
 
@@ -513,12 +513,12 @@ fn handle_configure(
         session.version_rolling_min_bit_count = params.version_rolling_min_bit_count;
 
         if session.version_rolling_enabled {
-            debug!(
+            info!(
                 "{} version-rolling enabled, mask={:08x}",
                 session.peer, negotiated
             );
         } else {
-            debug!(
+            info!(
                 "{} version-rolling not enabled: negotiated mask {:08x} does not satisfy requested minimum bit count {:?}",
                 session.peer, negotiated, params.version_rolling_min_bit_count
             );
@@ -550,7 +550,7 @@ fn handle_suggest_difficulty(
     // floor. Vardiff owns the difficulty from here.
     let applied = session.vardiff.suggest(params.difficulty);
     session.difficulty = applied;
-    debug!(
+    info!(
         peer = %session.peer,
         suggested = params.difficulty,
         applied,
@@ -575,7 +575,7 @@ fn handle_subscribe(
 ) -> HandleResult {
     session.subscribed = true;
     session.user_agent = params.user_agent.clone();
-    debug!(
+    info!(
         peer = %session.peer,
         user_agent = ?params.user_agent,
         "Subscribed"
@@ -603,7 +603,7 @@ async fn handle_authorize(
     }
 
     if let Err(e) = session.guard.check_worker_name(&params.worker) {
-        warn!(peer = %session.peer, "Rejected worker name: {e}");
+        debug!(peer = %session.peer, "Rejected worker name: {e}");
         return HandleResult::Messages(vec![ResponseBuilder::err(&req.id, e.to_stratum_error())]);
     }
 
@@ -614,7 +614,7 @@ async fn handle_authorize(
     ) {
         Ok(identity) => Arc::new(identity),
         Err(e) => {
-            warn!(peer = %session.peer, worker = %params.worker, "Rejected payout identity: {e}");
+            debug!(peer = %session.peer, worker = %params.worker, "Rejected payout identity: {e}");
             return HandleResult::Messages(vec![ResponseBuilder::ok(
                 &req.id,
                 serde_json::Value::Bool(false),

@@ -188,7 +188,7 @@ pub async fn run(
     network: bitcoin::Network,
 ) {
     if ban_list.is_banned(&peer.ip()) {
-        debug!("Rejected banned IP: {peer}");
+        warn!("Rejected banned IP: {peer}");
         return;
     }
 
@@ -207,12 +207,12 @@ pub async fn run(
     .await
     {
         Err(_) => {
-            warn!("SV2 {peer} Noise handshake timed out");
+            info!("SV2 {peer} Noise handshake timed out");
             return;
         }
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            warn!("SV2 {peer} Noise handshake failed: {e}");
+            debug!("SV2 {peer} Noise handshake failed: {e}");
             return;
         }
     };
@@ -278,7 +278,7 @@ pub async fn run(
             // ── Inbound (decrypted) SV2 message ─────────────────────────────
             inbound = tokio::time::timeout_at(last_inbound + read_timeout, inbound_rx.recv()) => {
                 let (msg_type, mut payload) = match inbound {
-                    Err(_) => { warn!("SV2 miner {peer} idle timeout — disconnecting"); break; }
+                    Err(_) => { info!("SV2 miner {peer} idle timeout — disconnecting"); break; }
                     Ok(None) => { debug!("SV2 {peer} reader closed"); break; }
                     Ok(Some(m)) => { last_inbound = tokio::time::Instant::now(); m }
                 };
@@ -296,7 +296,7 @@ pub async fn run(
                         if let Some(worker) = &session.worker {
                             metrics::miner_disconnect(&reason, worker);
                         }
-                        warn!("Disconnecting SV2 {peer}: {reason}");
+                        info!("Disconnecting SV2 {peer}: {reason}");
                         break;
                     }
                 }
@@ -311,7 +311,7 @@ pub async fn run(
                             session.stats.update_worker_vardiff(worker, new_diff);
                         }
                         let target = job::difficulty_to_sv2_target(new_diff);
-                        debug!(peer = %peer, worker = ?session.worker, difficulty = new_diff, "Sending SV2 set_target");
+                        info!(peer = %peer, worker = ?session.worker, difficulty = new_diff, "Sending SV2 set_target");
                         match messages::set_target(session.channel_id, target) {
                             Ok(p) => if !writer.send(MESSAGE_TYPE_SET_TARGET, true, &p).await { break; },
                             Err(e) => { error!("encode set_target: {e}"); break; }
@@ -453,7 +453,7 @@ async fn handle_setup_connection(
     }
     let used_version = SV2_PROTOCOL_VERSION.min(setup.max_version);
     session.setup_done = true;
-    debug!(peer = %session.peer, used_version, "SV2 SetupConnection");
+    info!(peer = %session.peer, used_version, "SV2 SetupConnection");
 
     match messages::setup_connection_success(used_version) {
         Ok(p) => {
@@ -500,7 +500,7 @@ async fn handle_open_extended(
     };
 
     if let Err(e) = session.guard.check_worker_name(&open.user_identity) {
-        warn!(peer = %session.peer, "Rejected SV2 user_identity: {e}");
+        debug!(peer = %session.peer, "Rejected SV2 user_identity: {e}");
         return open_error(writer, open.request_id, "invalid-user-identity").await;
     }
     let identity = match MinerIdentity::parse(
@@ -510,7 +510,7 @@ async fn handle_open_extended(
     ) {
         Ok(identity) => Arc::new(identity),
         Err(e) => {
-            warn!(peer = %session.peer, worker = %open.user_identity, "Rejected SV2 payout identity: {e}");
+            debug!(peer = %session.peer, worker = %open.user_identity, "Rejected SV2 payout identity: {e}");
             return open_error(writer, open.request_id, "invalid-user-identity").await;
         }
     };
@@ -559,7 +559,7 @@ async fn handle_open_extended(
     let prefix_len = session.extranonce_total - granted;
     session.extranonce_size = granted;
     session.extranonce_prefix = crate::network::session::generate_extranonce1(prefix_len);
-    debug!(
+    info!(
         peer = %session.peer,
         granted,
         prefix_len,
@@ -575,7 +575,7 @@ async fn handle_open_extended(
     // declared `max_target` (SV2: assigned target MUST be ≤ max_target).
     let mut target = job::difficulty_to_sv2_target(session.difficulty);
     if !job::sv2_target_le(&target, &open.max_target) {
-        warn!(
+        info!(
             peer = %session.peer,
             "SV2 device max_target easier than initial difficulty target; clamping to max_target"
         );
@@ -658,7 +658,7 @@ async fn handle_submit(
     // splice depends on it. Guard so a malformed length is a clean reject, not a
     // panic in the validation task.
     if submit.extranonce.len() != session.extranonce_size {
-        warn!(
+        debug!(
             worker = %worker,
             got = submit.extranonce.len(),
             expected = session.extranonce_size,

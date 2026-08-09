@@ -274,7 +274,7 @@ pub fn validate_share_no_dedup(
         // ── 9. Check hash meets pool share target ─────────────────────────────
         let share_target = difficulty_to_target(session_difficulty);
         if !meets_target(&hash, &share_target) {
-            tracing::warn!(
+            tracing::debug!(
                 hash_le = %hex::encode(hash),
                 hash_be = %block_hash_display(&hash),
                 share_target = %hex::encode(share_target),

@@ -46,6 +46,15 @@ everything else bumps the **patch** version.
   fresh load.
 
 ### Changed
+- **Operational log levels now separate useful lifecycle events from routine
+  connection noise.** Block notifications, vardiff changes, miner capability
+  negotiation, subscription metadata, and SV2 setup/extranonce details are
+  visible at `info`. Idle timeouts and intentional protocol disconnects are
+  lifecycle events; ordinary socket failures and malformed peer input stay at
+  `debug`; bans and other enforced security controls remain `warn`. A
+  low-difficulty share no longer emits two warnings: the validator's detailed
+  target check is `debug`, while the protocol session retains the bounded
+  `Share rejected` warning with worker and reason context.
 - The dashboard overview drops the redundant Pool uptime card — uptime remains
   in the header — and uses consistent compact labels across the remaining KPI
   cards. Reject details no longer widen the Rejected card as an inline list;
