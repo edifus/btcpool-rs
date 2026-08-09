@@ -704,7 +704,7 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
 #sharerate-panel { margin-top: 1.1rem; }
 table { width: 100%; border-collapse: collapse; font-size: 0.84rem; font-variant-numeric: tabular-nums; }
 th {
-  text-align: center; color: var(--muted); font-weight: 500; padding: 0.34rem 0.55rem;
+  text-align: left; color: var(--muted); font-weight: 500; padding: 0.34rem 0.55rem;
   border-bottom: 1px solid var(--border); font-size: 0.66rem;
   text-transform: uppercase; letter-spacing: 0.09em; white-space: nowrap;
 }
