@@ -173,6 +173,16 @@ pub fn update_pool_hashrate(windows: [f64; 7]) {
     }
 }
 
+/// Pool-wide accepted shares per second, over the same averaging windows as
+/// `pool_hashrate_hps`. Distinct from `rate(pool_shares_accepted_total[…])`:
+/// this is the decaying average the dashboard plots, so the two agree without
+/// the range-selector guesswork.
+pub fn update_pool_share_rate(windows: [f64; 7]) {
+    for (sps, window) in windows.iter().zip(HASHRATE_WINDOW_LABELS) {
+        gauge!("pool_shares_per_second", "window" => window).set(*sps);
+    }
+}
+
 /// Per-worker hashrate, one series per worker per averaging window. A worker
 /// that has gone away is exported as zero for one tick before its series are
 /// left to the idle timeout, so dashboards fall to zero rather than flatlining

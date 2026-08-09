@@ -87,6 +87,12 @@ fn sane_tdiff(end: Instant, start: Instant) -> f64 {
 /// source with nothing pending decays it toward zero, so a miner that stops
 /// hashing (or drops the connection entirely) falls off on its own rather than
 /// freezing at its last reading.
+///
+/// Nothing here is specific to difficulty: the state is "units per second" and
+/// the unit is whatever the caller feeds [`Self::add_share`]. `stats` runs two
+/// meters off it — per-session difficulty, read back as H/s through
+/// [`Self::hashrates`], and pool-wide accepted share counts, read back as
+/// shares/sec through [`Self::rates`].
 #[derive(Debug, Clone)]
 pub struct HashrateDecay {
     dsps: [f64; WINDOW_COUNT],
@@ -114,10 +120,21 @@ impl HashrateDecay {
         hashrates: [f64; WINDOW_COUNT],
         offline_for: Duration,
     ) -> Self {
+        Self::restored_rates(now, hashrates.map(|hps| hps / NONCES), offline_for)
+    }
+
+    /// As [`Self::restored`], but for a meter whose unit is not difficulty:
+    /// `rates` are the raw per-second values [`Self::rates`] returned, with no
+    /// `NONCES` scaling.
+    pub(crate) fn restored_rates(
+        now: Instant,
+        rates: [f64; WINDOW_COUNT],
+        offline_for: Duration,
+    ) -> Self {
         let mut decay = Self {
-            dsps: hashrates.map(|hps| {
-                if hps.is_finite() && hps > 0.0 {
-                    hps / NONCES
+            dsps: rates.map(|rate| {
+                if rate.is_finite() && rate > 0.0 {
+                    rate
                 } else {
                     0.0
                 }
@@ -149,8 +166,9 @@ impl HashrateDecay {
         }
     }
 
-    /// Record an accepted share of `diff` assigned difficulty. Cheap: it only
-    /// accumulates, leaving the arithmetic to the next [`Self::tick`].
+    /// Record `diff` units — assigned difficulty for a hashrate meter, or a
+    /// plain share count for a share-rate one. Cheap: it only accumulates,
+    /// leaving the arithmetic to the next [`Self::tick`].
     pub fn add_share(&mut self, diff: f64) {
         if diff.is_finite() && diff > 0.0 {
             self.pending += diff;
@@ -167,13 +185,14 @@ impl HashrateDecay {
         }
     }
 
-    /// Decayed difficulty-shares per second, per window.
-    #[cfg(test)]
-    pub fn dsps(&self) -> [f64; WINDOW_COUNT] {
+    /// Decayed units per second, per window, in whatever unit
+    /// [`Self::add_share`] was fed.
+    pub fn rates(&self) -> [f64; WINDOW_COUNT] {
         self.dsps
     }
 
-    /// Decayed hashrate in H/s, per window.
+    /// Decayed hashrate in H/s, per window. Only meaningful for a meter fed
+    /// share difficulties.
     pub fn hashrates(&self) -> [f64; WINDOW_COUNT] {
         self.dsps.map(|d| d * NONCES)
     }
@@ -324,7 +343,7 @@ mod tests {
         let start = Instant::now();
         let mut decay = HashrateDecay::new(start);
         feed(&mut decay, start, 1.0 * TH, 3_600, 1);
-        let dsps = decay.dsps();
+        let dsps = decay.rates();
         let hr = decay.hashrates();
         for i in 0..WINDOW_COUNT {
             assert!((hr[i] - dsps[i] * NONCES).abs() < 1.0);
@@ -348,6 +367,23 @@ mod tests {
         for (actual, expected) in restored.hashrates().into_iter().zip(ticked.hashrates()) {
             let error = (actual - expected).abs() / expected;
             assert!(error < 1e-12, "restored value differed by {error:e}");
+        }
+    }
+
+    /// `restored` is the difficulty-flavoured wrapper and divides by `NONCES`;
+    /// `restored_rates` must not touch the values it is handed, or a restored
+    /// share rate would come back 2³² times too small.
+    #[test]
+    fn restored_rates_does_not_scale_by_nonces() {
+        let start = Instant::now();
+        let saved = [4.0; WINDOW_COUNT];
+
+        let raw = HashrateDecay::restored_rates(start, saved, Duration::ZERO);
+        assert_eq!(raw.rates(), saved);
+
+        let scaled = HashrateDecay::restored(start, saved.map(|r| r * NONCES), Duration::ZERO);
+        for (actual, expected) in scaled.rates().into_iter().zip(saved) {
+            assert!((actual - expected).abs() < 1e-9);
         }
     }
 

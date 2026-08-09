@@ -10,6 +10,16 @@ everything else bumps the **patch** version.
 ## [Unreleased]
 
 ### Added
+- **A shares-per-second chart on the dashboard**, below the hashrate panel and
+  driven by the same range selector, over the same 1m/5m/10m/1h/6h/24h decaying
+  averages. Share throughput is a separate signal from work done — it moves with
+  vardiff retargets and miner churn while hashrate holds flat — and nothing
+  exposed it: the pool counted accepted shares but only ever as a lifetime total.
+  Persisted like the hashrate series, so a restart resumes the averages decayed
+  across the downtime instead of resetting the chart to zero. The current rate
+  also appears on the Accepted card, as `pool_shares_per_second{window}` in
+  Prometheus, as `shares_per_second_*` on `GET /stats`, and at
+  `GET /share-chart`.
 - **The hashrate chart's selected range and legend survive a page reload**,
   joining the theme, chart-collapse and quote-currency preferences. Picking
   `30d` and refreshing snapped back to `1h`, and the legend reverted to the

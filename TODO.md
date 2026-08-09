@@ -203,6 +203,17 @@ underflow panic). Line references are as of that review and may drift.
   silent otherwise: a range missing from the match arms plots 1h data under its
   own label, and one missing from a JS allowlist toggles fine and forgets on
   reload.
+- [x] **Shares-per-second chart** (2026-08-08): pool-wide accepted share
+  throughput, over the same 1m/5m/10m/1h/6h/24h decaying averages as hashrate
+  and persisted the same way, in its own panel under the hashrate one and driven
+  by the same range selector. `HashrateDecay` turned out to be a general rate
+  meter already — feeding it a share count instead of a difficulty gives the
+  identical windows and the identical decay-across-downtime restore — so this
+  was a second meter plus `share_rate_history`/`share_rate_state`, not a second
+  estimator. The two tables ride the estimator-version wipe with
+  `hashrate_history`, while `share_history`'s raw cumulative counts still do
+  not: the line is decayed-vs-raw, not shares-vs-hashrate. Per-worker share
+  rates are deliberately out of scope; `SnapshotWrite` is where they would go.
 - [ ] **Multi-node Bitcoin RPC failover.** Today a single `bitcoin_rpc.url`; if
   that node restarts (see the near-daily needrestart sweep) or crashes, template
   refresh stalls until it returns. Accept a list of node endpoints and fail over

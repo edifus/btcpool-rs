@@ -15,7 +15,7 @@
 use crate::{
     mining::engine::TemplateEngine,
     settings::RuntimeSettings,
-    stats::{HashrateHistoryPoint, PoolStats},
+    stats::{PoolStats, RateHistoryPoint},
 };
 use axum::{
     extract::{Query, State},
@@ -102,6 +102,7 @@ pub async fn start(
         .route("/stats", get(stats_json))
         .route("/history", get(history_json))
         .route("/chart", get(chart_json))
+        .route("/share-chart", get(share_chart_json))
         .route("/api/info", get(info_get))
         .route("/metrics", get(metrics_text))
         .route("/health", get(health))
@@ -281,15 +282,17 @@ async fn history_json(
     Query(params): Query<HistoryParams>,
 ) -> Json<Vec<HistoryPoint>> {
     let since = params.since.unwrap_or(0);
-    let points = hashrate_history(&state, since, 60)
-        .await
-        .into_iter()
-        .filter_map(|point| {
-            point
-                .ten_minutes
-                .map(|hps| HistoryPoint { ts: point.ts, hps })
-        })
-        .collect();
+    let points = rate_history(&state, since, 60, |stats, since, bucket| {
+        stats.get_hashrate_history(since, bucket)
+    })
+    .await
+    .into_iter()
+    .filter_map(|point| {
+        point
+            .ten_minutes
+            .map(|hps| HistoryPoint { ts: point.ts, hps })
+    })
+    .collect();
     Json(points)
 }
 
@@ -351,20 +354,21 @@ fn chart_window(value: Option<&str>) -> ChartWindow {
 /// SQLite connection shared with the rest of the process. Doing that inline
 /// would park a runtime worker thread on disk I/O for as long as it takes —
 /// with enough dashboard tabs open, long enough to stall the share path.
-async fn hashrate_history(
+async fn rate_history(
     state: &DashState,
     since: u64,
     bucket_secs: u64,
-) -> Vec<HashrateHistoryPoint> {
+    query: fn(&crate::stats::PoolStats, u64, u64) -> Vec<RateHistoryPoint>,
+) -> Vec<RateHistoryPoint> {
     let stats = state.stats.clone();
-    tokio::task::spawn_blocking(move || stats.get_hashrate_history(since, bucket_secs))
+    tokio::task::spawn_blocking(move || query(&stats, since, bucket_secs))
         .await
         .unwrap_or_default()
 }
 
 fn chart_series_data(
-    history: &[HashrateHistoryPoint],
-    value: fn(&HashrateHistoryPoint) -> Option<f64>,
+    history: &[RateHistoryPoint],
+    value: fn(&RateHistoryPoint) -> Option<f64>,
 ) -> Vec<serde_json::Value> {
     history
         .iter()
@@ -372,11 +376,17 @@ fn chart_series_data(
         .collect()
 }
 
-async fn chart_json(
-    State(state): State<DashState>,
-    Query(params): Query<ChartParams>,
+/// Shared body of `/chart` and `/share-chart`. The two differ only in which
+/// table they read and which snapshot fields cap the series; everything about
+/// the range, the bucket grid and the rendered option is identical, which is
+/// what keeps the two panels plotting the same x axis.
+async fn rate_chart_response(
+    state: DashState,
+    requested: Option<&str>,
+    query: fn(&crate::stats::PoolStats, u64, u64) -> Vec<RateHistoryPoint>,
+    live_point: fn(&crate::stats::StatsSnapshot, u64) -> RateHistoryPoint,
 ) -> impl IntoResponse {
-    let window = chart_window(params.window.as_deref());
+    let window = chart_window(requested);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -386,7 +396,7 @@ async fn chart_json(
         .map(|duration| now.saturating_sub(duration))
         .unwrap_or(0);
 
-    let mut history = hashrate_history(&state, since, window.bucket_secs).await;
+    let mut history = rate_history(&state, since, window.bucket_secs, query).await;
 
     // Append the current live value as the trailing edge of the chart, snapped
     // to the bucket grid. Every other point is a bucket mean, so plotting a raw
@@ -396,16 +406,7 @@ async fn chart_json(
     // samples and there is nothing to add.
     let live_bucket = now / window.bucket_secs.max(1) * window.bucket_secs.max(1);
     if history.last().map(|p| p.ts) != Some(live_bucket) {
-        let live = state.stats.snapshot();
-        history.push(HashrateHistoryPoint {
-            ts: live_bucket,
-            one_minute: Some(live.total_hashrate_60s),
-            five_minutes: Some(live.total_hashrate_5m),
-            ten_minutes: Some(live.total_hashrate_10m),
-            one_hour: Some(live.total_hashrate_1h),
-            six_hours: Some(live.total_hashrate_6h),
-            twenty_four_hours: Some(live.total_hashrate_24h),
-        });
+        history.push(live_point(&state.stats.snapshot(), live_bucket));
     }
 
     let chart = build_chart_option(&history);
@@ -417,10 +418,53 @@ async fn chart_json(
     )
 }
 
+async fn chart_json(
+    State(state): State<DashState>,
+    Query(params): Query<ChartParams>,
+) -> impl IntoResponse {
+    rate_chart_response(
+        state,
+        params.window.as_deref(),
+        |stats, since, bucket| stats.get_hashrate_history(since, bucket),
+        |live, ts| RateHistoryPoint {
+            ts,
+            one_minute: Some(live.total_hashrate_60s),
+            five_minutes: Some(live.total_hashrate_5m),
+            ten_minutes: Some(live.total_hashrate_10m),
+            one_hour: Some(live.total_hashrate_1h),
+            six_hours: Some(live.total_hashrate_6h),
+            twenty_four_hours: Some(live.total_hashrate_24h),
+        },
+    )
+    .await
+}
+
+async fn share_chart_json(
+    State(state): State<DashState>,
+    Query(params): Query<ChartParams>,
+) -> impl IntoResponse {
+    rate_chart_response(
+        state,
+        params.window.as_deref(),
+        |stats, since, bucket| stats.get_share_rate_history(since, bucket),
+        |live, ts| RateHistoryPoint {
+            ts,
+            one_minute: Some(live.shares_per_second_1m),
+            five_minutes: Some(live.shares_per_second_5m),
+            ten_minutes: Some(live.shares_per_second_10m),
+            one_hour: Some(live.shares_per_second_1h),
+            six_hours: Some(live.shares_per_second_6h),
+            twenty_four_hours: Some(live.shares_per_second_24h),
+        },
+    )
+    .await
+}
+
 /// Build the ECharts option object the browser renders. The client only skins
 /// it (theme colours, JS formatter callbacks); everything structural is decided
-/// here.
-fn build_chart_option(history: &[HashrateHistoryPoint]) -> serde_json::Value {
+/// here. Unit-agnostic — the hashrate and shares/sec panels share it, and the
+/// client picks the y-axis formatter per chart.
+fn build_chart_option(history: &[RateHistoryPoint]) -> serde_json::Value {
     let make_series = |name: &str, data: Vec<serde_json::Value>, width: f64| {
         json!({
             "name": name,
@@ -629,12 +673,12 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
 #workers .panel { overflow-x: auto; }
 .panel-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.65rem; margin-bottom: 0.7rem; }
 .panel-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 0.7rem; }
-#chart-toggle {
+.panel-toggle {
   cursor: pointer; font: inherit; font-size: 0.72rem; color: var(--muted);
   background: none; border: 1px solid var(--border); border-radius: 5px;
   padding: 0.22rem 0.45rem;
 }
-#chart-toggle:hover { color: var(--text); border-color: var(--muted); }
+.panel-toggle:hover { color: var(--text); border-color: var(--muted); }
 .panel-title { font-size: 0.66rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.13em; color: var(--muted); }
 .timeframe-tabs { display: flex; flex-wrap: wrap; align-items: center; }
 .timeframe-btn {
@@ -651,6 +695,10 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
    its own — the debounced resize handler is what makes this take effect.
    vh, not dvh: dvh follows the mobile URL bar and would re-lay-out on scroll. */
 #hashrate-chart { height: clamp(280px, 40vh, 420px); width: 100%; }
+#sharerate-chart { height: clamp(220px, 28vh, 320px); width: 100%; }
+/* The share-rate panel reads as a companion to the hashrate one above it, so
+   they sit closer together than the section's default rhythm. */
+#sharerate-panel { margin-top: 1.1rem; }
 table { width: 100%; border-collapse: collapse; font-size: 0.84rem; font-variant-numeric: tabular-nums; }
 th {
   text-align: left; color: var(--muted); font-weight: 500; padding: 0.34rem 0.55rem;
@@ -843,6 +891,7 @@ tr:last-child td { border-bottom: none; }
       <div class="label">Accepted</div>
       <div class="val" id="v-accepted">&mdash;</div>
       <div class="sub">session: <span id="v-session-accepted">&mdash;</span></div>
+      <div class="sub" id="v-shares-per-sec" title="Accepted shares per second, averaged over the last minute">&mdash;</div>
     </div>
     <div class="kpi">
       <div class="label">Rejected</div>
@@ -882,10 +931,20 @@ tr:last-child td { border-bottom: none; }
           <button type="button" class="timeframe-btn" data-window="180d">180d</button>
           <button type="button" class="timeframe-btn" data-window="all">All</button>
         </div>
-        <button id="chart-toggle" title="Hide or show the hashrate chart">Hide</button>
+        <button id="chart-toggle" class="panel-toggle" title="Hide or show the hashrate chart">Hide</button>
       </div>
     </div>
     <div id="hashrate-chart"></div>
+  </div>
+
+  <div class="panel" id="sharerate-panel">
+    <div class="panel-head">
+      <div class="panel-title">Shares per second <span title="Accepted shares per second, decayed over the same windows as the hashrate chart above and plotted on the same range. Moves with vardiff and miner count, so it can shift while hashrate holds steady" style="cursor:help;">&#9432;</span></div>
+      <div class="panel-controls">
+        <button id="sharerate-chart-toggle" class="panel-toggle" title="Hide or show the share rate chart">Hide</button>
+      </div>
+    </div>
+    <div id="sharerate-chart"></div>
   </div>
 </section>
 
@@ -1097,17 +1156,21 @@ function updateConnLed() {
   }
 }
 
-// ── Chart legend ─────────────────────────────────────────────────────────────
+// ── Chart panels ─────────────────────────────────────────────────────────────
+// Two panels — hashrate and shares/sec — over one implementation. They differ
+// only in the endpoint they poll, the unit their values carry, and where their
+// preferences are stored. Both are driven by the single range selector, so they
+// always plot the same x axis and can be read against each other.
+const LEGEND_SERIES = ['1m', '5m', '10m', '1h', '6h', '24h'];
+
 // The server sends a default show/hide map with every poll; this is what makes a
 // user's toggles outlive a reload. Returns null when nothing usable is stored,
-// matching chartLegendSelected()'s contract, so callers fall through to that
-// server default. Unknown keys are dropped: a renamed series must not resurrect
-// a stale entry that no longer maps to a line.
-const LEGEND_KEY = 'btcpool-chart-legend';
-const LEGEND_SERIES = ['1m', '5m', '10m', '1h', '6h', '24h'];
-function storedLegend() {
+// matching panelLegend()'s contract, so callers fall through to that server
+// default. Unknown keys are dropped: a renamed series must not resurrect a stale
+// entry that no longer maps to a line.
+function storedLegend(key) {
   try {
-    const raw = JSON.parse(localStorage.getItem(LEGEND_KEY));
+    const raw = JSON.parse(localStorage.getItem(key));
     if (!raw || typeof raw !== 'object') return null;
     const out = {};
     LEGEND_SERIES.forEach(name => { if (typeof raw[name] === 'boolean') out[name] = raw[name]; });
@@ -1115,26 +1178,42 @@ function storedLegend() {
   } catch (_) { return null; }
 }
 
-const myChart = echarts.init(document.getElementById('hashrate-chart'), null, { renderer: 'canvas' });
+function ratePanel(cfg) {
+  const panel = Object.assign({
+    chart: echarts.init(document.getElementById(cfg.canvasId), null, { renderer: 'canvas' }),
+    // Last option object handed to the chart, kept so a resize can recompute
+    // the width-dependent bits without refetching.
+    options: null
+  }, cfg);
+  // Remember which series the user toggled. Registered once — instance listeners
+  // survive the notMerge setOption each poll performs — and safe against a loop,
+  // because this event fires on user interaction only, never on the programmatic
+  // `legend.selected` that loadChart re-applies.
+  panel.chart.on('legendselectchanged', event => {
+    try { localStorage.setItem(panel.legendKey, JSON.stringify(event.selected)); } catch (_) {}
+  });
+  document.getElementById(cfg.toggleId).addEventListener('click', () => {
+    applyPanelCollapsed(panel, !panelCollapsed(panel));
+  });
+  return panel;
+}
 
-// Remember which series the user toggled. Registered once — instance listeners
-// survive the notMerge setOption each poll performs — and safe against a loop,
-// because this event fires on user interaction only, never on the programmatic
-// `legend.selected` that loadChart re-applies.
-myChart.on('legendselectchanged', event => {
-  try { localStorage.setItem(LEGEND_KEY, JSON.stringify(event.selected)); } catch (_) {}
+const hashratePanel = ratePanel({
+  canvasId: 'hashrate-chart', toggleId: 'chart-toggle', endpoint: '/chart',
+  legendKey: 'btcpool-chart-legend', collapsedKey: 'chartCollapsed', fmt: fmtHr
 });
+const sharePanel = ratePanel({
+  canvasId: 'sharerate-chart', toggleId: 'sharerate-chart-toggle', endpoint: '/share-chart',
+  legendKey: 'btcpool-share-legend', collapsedKey: 'shareChartCollapsed', fmt: fmtSps
+});
+const PANELS = [hashratePanel, sharePanel];
 
-// Last option object handed to the chart, kept so a resize can recompute the
-// width-dependent bits without refetching.
-let chartOptions = null;
-
-// Anything about the chart that depends on how wide it actually rendered. The
+// Anything about a chart that depends on how wide it actually rendered. The
 // server can't know the viewport, so it ships sensible defaults and these get
 // patched in on top — on every load, on resize, and when the panel is expanded.
-function applyResponsiveLayout(options) {
+function applyResponsiveLayout(panel, options) {
   if (!options) return options;
-  const width = myChart.getWidth() || 0;
+  const width = panel.chart.getWidth() || 0;
 
   // Roughly one x-axis label per 90px, which fits 'HH:mm' at fontSize 10 with
   // clear air between. A phone lands on 4; a wide desktop caps at 10.
@@ -1157,7 +1236,7 @@ function applyResponsiveLayout(options) {
   if (yAxis) {
     const digits = width > 0 && width < 420 ? 0 : 2;
     yAxis.axisLabel = Object.assign(yAxis.axisLabel || {}, {
-      formatter: v => fmtHr(v, true, digits)
+      formatter: v => panel.fmt(v, true, digits)
     });
   }
   return options;
@@ -1170,19 +1249,22 @@ window.addEventListener('resize', () => {
   // makes the canvas follow it — ECharts does not track CSS size on its own.
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
-    myChart.resize();
-    if (!chartOptions) return;
-    // Carry the user's current legend toggles across the merge, or this would
-    // re-apply whichever ones were live when the chart was last fetched.
-    const shown = chartLegendSelected();
-    if (shown && chartOptions.legend) chartOptions.legend.selected = shown;
-    myChart.setOption(applyResponsiveLayout(chartOptions));
+    PANELS.forEach(panel => {
+      panel.chart.resize();
+      if (!panel.options) return;
+      // Carry the user's current legend toggles across the merge, or this would
+      // re-apply whichever ones were live when the chart was last fetched.
+      const shown = panelLegend(panel);
+      if (shown && panel.options.legend) panel.options.legend.selected = shown;
+      panel.chart.setOption(applyResponsiveLayout(panel, panel.options));
+    });
   }, 150);
 });
 
 document.getElementById('theme-toggle').addEventListener('click', () => {
   applyTheme(currentTheme() === 'light' ? 'carbon' : 'light');
-  if (!chartCollapsed()) loadChart(selectedWindow); // re-skin chart from the new theme's CSS vars
+  // Re-skin both charts from the new theme's CSS vars.
+  PANELS.forEach(panel => { if (!panelCollapsed(panel)) loadChart(panel, selectedWindow); });
 });
 
 // ── Mobile nav drawer ────────────────────────────────────────────────────────
@@ -1198,27 +1280,26 @@ document.getElementById('rail-nav').addEventListener('click', () => {
   burgerEl.setAttribute('aria-expanded', 'false');
 });
 
-// ── Chart collapse toggle ────────────────────────────────────────────────────
-// Persisted like the theme choice; while collapsed the periodic chart fetch
+// ── Chart collapse toggles ───────────────────────────────────────────────────
+// Persisted per panel like the theme choice; while collapsed the periodic fetch
 // is skipped, and expanding re-fetches so the chart is current immediately.
-const CHART_COLLAPSED_KEY = 'chartCollapsed';
-function chartCollapsed() {
-  try { return localStorage.getItem(CHART_COLLAPSED_KEY) === '1'; } catch (_) { return false; }
+function panelCollapsed(panel) {
+  try { return localStorage.getItem(panel.collapsedKey) === '1'; } catch (_) { return false; }
 }
-function applyChartCollapsed(collapsed) {
-  try { localStorage.setItem(CHART_COLLAPSED_KEY, collapsed ? '1' : '0'); } catch (_) {}
-  document.getElementById('hashrate-chart').style.display = collapsed ? 'none' : '';
-  document.getElementById('chart-window-label').style.display = collapsed ? 'none' : '';
-  document.getElementById('chart-toggle').textContent = collapsed ? 'Show' : 'Hide';
+function applyPanelCollapsed(panel, collapsed) {
+  try { localStorage.setItem(panel.collapsedKey, collapsed ? '1' : '0'); } catch (_) {}
+  document.getElementById(panel.canvasId).style.display = collapsed ? 'none' : '';
+  document.getElementById(panel.toggleId).textContent = collapsed ? 'Show' : 'Hide';
+  // The one range selector drives both charts, so it is only meaningless once
+  // there is nothing left for it to range over.
+  document.getElementById('chart-window-label').style.display =
+    PANELS.every(panelCollapsed) ? 'none' : '';
   if (!collapsed) {
-    myChart.resize(); // container was display:none; ECharts needs a re-measure
+    panel.chart.resize(); // container was display:none; ECharts needs a re-measure
     // loadChart re-runs applyResponsiveLayout against the width we just measured.
-    loadChart(selectedWindow);
+    loadChart(panel, selectedWindow);
   }
 }
-document.getElementById('chart-toggle').addEventListener('click', () => {
-  applyChartCollapsed(!chartCollapsed());
-});
 
 // ── Formatters ───────────────────────────────────────────────────────────────
 // `digits` defaults to 2; the chart's y-axis drops to 0 on narrow screens so a
@@ -1233,6 +1314,17 @@ function fmtHr(hps, short, digits) {
   if (hps >= 1e6)  return (hps / 1e6 ).toFixed(d) + (short ? ' M'  : ' MH/s');
   if (hps >= 1e3)  return (hps / 1e3 ).toFixed(d) + (short ? ' K'  : ' KH/s');
   return hps.toFixed(0) + (short ? ''    : ' H/s');
+}
+
+// Share rate spans a wide range — one USB stick trickles well under a share a
+// second while a farm runs into the thousands — so precision comes from the
+// magnitude rather than being fixed. `digits` is the narrow-screen cap that
+// applyResponsiveLayout passes for the y-axis.
+function fmtSps(sps, short, digits) {
+  if (!isFinite(sps)) return short ? '—' : '— shares/s';
+  const cap = digits === undefined ? 2 : digits;
+  const d = Math.min(cap, sps >= 100 ? 0 : sps >= 10 ? 1 : 2);
+  return sps.toFixed(d) + (short ? '' : ' shares/s');
 }
 
 function fmtDiff(d) {
@@ -1289,15 +1381,15 @@ function fmtTimestamp(ts) {
 // Which series the user currently has toggled on, or null before the chart has
 // ever been drawn. Read back off the live chart so legend clicks survive the
 // notMerge setOption that each poll performs.
-function chartLegendSelected() {
-  const opt = myChart.getOption();
+function panelLegend(panel) {
+  const opt = panel.chart.getOption();
   if (!opt || !opt.legend || !opt.legend[0]) return null;
   return opt.legend[0].selected || null;
 }
 
-async function loadChart(window) {
+async function loadChart(panel, window) {
   try {
-    const resp = await fetch('/chart?window=' + window);
+    const resp = await fetch(panel.endpoint + '?window=' + window);
     if (!resp.ok) return;
     const options = await resp.json();
     // Skin the server-built option object from the active theme's CSS vars,
@@ -1353,7 +1445,7 @@ async function loadChart(window) {
       // the chart would undo the user's legend clicks once per refresh. The
       // live chart wins where it exists; on the first load it has not been
       // drawn yet, so the persisted map from a previous visit applies instead.
-      const shown = chartLegendSelected() || storedLegend();
+      const shown = panelLegend(panel) || storedLegend(panel.legendKey);
       if (shown) options.legend.selected = shown;
     }
     if (options.tooltip) {
@@ -1371,12 +1463,12 @@ async function loadChart(window) {
         const rows = params
           .filter(p => Array.isArray(p.value) && p.value[1] !== null && p.value[1] !== undefined)
           .sort((a, b) => order.indexOf(a.seriesName) - order.indexOf(b.seriesName))
-          .map(p => '<span style="color:' + (palette[p.seriesName] || p.color) + '">&#9632;</span> ' + p.seriesName + ': ' + fmtHr(p.value[1], false));
+          .map(p => '<span style="color:' + (palette[p.seriesName] || p.color) + '">&#9632;</span> ' + p.seriesName + ': ' + panel.fmt(p.value[1], false));
         return date + '<br/>' + rows.join('<br/>');
       };
     }
-    chartOptions = applyResponsiveLayout(options);
-    myChart.setOption(chartOptions, true);
+    panel.options = applyResponsiveLayout(panel, options);
+    panel.chart.setOption(panel.options, true);
   } catch (e) {
     console.error('Chart fetch error:', e);
   }
@@ -1494,6 +1586,9 @@ async function refresh() {
     const lifePct = lifeTotal > 0 ? (lifeRej / lifeTotal * 100).toFixed(1) : '0.0';
     document.getElementById('v-accepted').textContent = lifeAcc.toLocaleString();
     document.getElementById('v-session-accepted').textContent = d.shares_accepted.toLocaleString();
+    // Current throughput under the two totals: the same 1m window the chart's
+    // fastest line plots.
+    document.getElementById('v-shares-per-sec').textContent = fmtSps(d.shares_per_second_1m, false);
     const rejectEl = document.getElementById('v-reject-rate');
     rejectEl.textContent = `${lifeRej.toLocaleString()} (${lifePct}%)`;
     rejectEl.title = reasonTooltip('lifetime rejects', d.lifetime_reject_reasons);
@@ -1637,7 +1732,8 @@ function attachTimeframeSelector() {
     selectedWindow = button.dataset.window;
     try { localStorage.setItem(WINDOW_KEY, selectedWindow); } catch (_) {}
     highlight();
-    loadChart(selectedWindow);
+    // Both panels, so they never disagree about what range is on screen.
+    PANELS.forEach(panel => { if (!panelCollapsed(panel)) loadChart(panel, selectedWindow); });
   });
   // The markup hardcodes `active` on 1h so a no-JS load still reads sensibly.
   // Correct it here — unconditionally, not just when the chart is visible, or
@@ -1780,11 +1876,10 @@ wireCopy('connect-url', 'connect-copy');
 wireCopy('connect-authority', 'connect-authority-copy');
 
 attachTimeframeSelector();
-if (chartCollapsed()) {
-  applyChartCollapsed(true);
-} else {
-  loadChart(selectedWindow);
-}
+PANELS.forEach(panel => {
+  if (panelCollapsed(panel)) applyPanelCollapsed(panel, true);
+  else loadChart(panel, selectedWindow);
+});
 updateConnLed();
 refresh();
 fetchBtcPrice();
@@ -1792,9 +1887,11 @@ setInterval(refresh, 10000);
 // Re-evaluate the connectivity LED between refreshes so it goes stale on its
 // own even if refresh() stops landing (server down, tab throttled, etc.).
 setInterval(updateConnLed, 5000);
-// Matches the pool's snapshot interval, so the chart gains a point as soon as
+// Matches the pool's snapshot interval, so the charts gain a point as soon as
 // one exists rather than up to a minute later.
-setInterval(() => { if (!chartCollapsed()) loadChart(selectedWindow); }, 10000);
+setInterval(() => {
+  PANELS.forEach(panel => { if (!panelCollapsed(panel)) loadChart(panel, selectedWindow); });
+}, 10000);
 setInterval(fetchBtcPrice, 60000);
 </script>
 </body>
@@ -1909,7 +2006,8 @@ mod tests {
 
     /// The legend's persistence allowlist drops keys it does not recognise, so
     /// a series the server draws but the JS list omits would toggle fine and
-    /// then forget the toggle on reload.
+    /// then forget the toggle on reload. One allowlist covers both panels,
+    /// which only holds because they plot the same six windows.
     #[test]
     fn legend_series_agree_between_js_and_server() {
         let option = build_chart_option(&[]);
@@ -2019,19 +2117,83 @@ mod tests {
         // Density and the wrapped-legend grid offset are recomputed from the
         // measured width, not baked in server-side.
         assert!(DASHBOARD_HTML.contains("xAxis.splitNumber = Math.min"));
-        assert!(DASHBOARD_HTML.contains("function applyResponsiveLayout(options)"));
+        assert!(DASHBOARD_HTML.contains("function applyResponsiveLayout(panel, options)"));
 
-        // A bare `myChart.resize()` on the resize event would leave the label
+        // A bare `panel.chart.resize()` on the resize event would leave the label
         // density — and the viewport-relative height — stale until the next poll.
         assert!(
-            DASHBOARD_HTML.contains("myChart.setOption(applyResponsiveLayout(chartOptions));"),
+            DASHBOARD_HTML
+                .contains("panel.chart.setOption(applyResponsiveLayout(panel, panel.options));"),
             "resize must re-run applyResponsiveLayout, not just resize the canvas"
         );
 
         // The height only follows the viewport because of that resize path.
-        assert!(
-            DASHBOARD_HTML.contains("#hashrate-chart { height: clamp("),
-            "chart height must be viewport-relative, not a fixed pixel value"
-        );
+        for canvas in ["#hashrate-chart", "#sharerate-chart"] {
+            assert!(
+                DASHBOARD_HTML.contains(&format!("{canvas} {{ height: clamp(")),
+                "{canvas} height must be viewport-relative, not a fixed pixel value"
+            );
+        }
+    }
+
+    /// The two chart panels are one implementation with two configs. Every
+    /// per-panel key has to actually differ, or the share chart would overwrite
+    /// the hashrate chart's stored legend and collapse state.
+    #[test]
+    fn chart_panels_do_not_share_state_keys() {
+        // The factory is declared `ratePanel(cfg)`, so only its call sites
+        // carry an inline config object.
+        let panels = DASHBOARD_HTML.matches("ratePanel({").count();
+        assert_eq!(panels, 2, "expected exactly two chart panels");
+
+        for key in [
+            "'btcpool-chart-legend'",
+            "'btcpool-share-legend'",
+            "'chartCollapsed'",
+            "'shareChartCollapsed'",
+            "'hashrate-chart'",
+            "'sharerate-chart'",
+            "'/chart'",
+            "'/share-chart'",
+        ] {
+            assert_eq!(
+                DASHBOARD_HTML.matches(key).count(),
+                1,
+                "{key} must belong to exactly one panel"
+            );
+        }
+
+        // Panel elements are reached through `panel.canvasId`/`panel.toggleId`,
+        // so `all_ids_referenced_by_js_exist_in_markup`'s literal
+        // `getElementById('…')` scrape cannot see them.
+        for id in [
+            "hashrate-chart",
+            "sharerate-chart",
+            "chart-toggle",
+            "sharerate-chart-toggle",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(&format!("id=\"{id}\"")),
+                "panel element {id} is configured but not in the markup"
+            );
+        }
+
+        // Both panels must render through the shared loader, and both endpoints
+        // must be routes the server actually serves.
+        assert!(DASHBOARD_HTML.contains("async function loadChart(panel, window)"));
+        assert!(DASHBOARD_HTML.contains("fetch(panel.endpoint + '?window=' + window)"));
+    }
+
+    /// Shares/sec is not a hashrate: formatting it with `fmtHr` would render
+    /// "4" as "4 H/s" on the axis and in the tooltip.
+    #[test]
+    fn share_panel_formats_counts_not_hashes() {
+        assert!(DASHBOARD_HTML.contains("fmt: fmtSps"));
+        assert!(DASHBOARD_HTML.contains("fmt: fmtHr"));
+        assert!(DASHBOARD_HTML.contains("function fmtSps(sps, short, digits)"));
+        // The axis and tooltip both go through the panel's formatter rather
+        // than naming one directly.
+        assert!(DASHBOARD_HTML.contains("formatter: v => panel.fmt(v, true, digits)"));
+        assert!(DASHBOARD_HTML.contains("panel.fmt(p.value[1], false)"));
     }
 }
