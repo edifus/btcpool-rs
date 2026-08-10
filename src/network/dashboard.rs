@@ -626,7 +626,7 @@ nav a.active { color: var(--text); background: var(--surface2); border-left-colo
 
 /* ── Main column ── */
 main { flex: 1; min-width: 0; max-width: 1240px; padding: 1.7rem 2.1rem 2.5rem; }
-section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
+section { margin-bottom: 1.4rem; scroll-margin-top: 1.2rem; }
 .sec-title {
   font-size: 0.66rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: 0.13em; color: var(--muted); margin-bottom: 0.9rem;
@@ -1009,6 +1009,16 @@ tr:last-child td { border-bottom: none; }
   <div class="kpis">
     <div class="kpi-grid">
     <div class="kpi">
+      <div class="label with-tags">Bitcoin node<span id="v-node-bips"></span></div>
+      <div class="val" id="v-node" style="font-size:0.92rem;">&mdash;</div>
+      <div class="sub" id="v-node-rpc" style="cursor:help;"><span id="v-node-rpc-led" class="led led-off" style="margin-right:0.3rem;"></span><span id="v-node-rpc-text">rpc: &mdash;</span></div>
+    </div>
+    <div class="kpi">
+      <div class="label">Chain tip</div>
+      <div class="val" id="v-height" title="Height of current best chain tip">&mdash;</div>
+      <div class="sub"><span id="v-block-transaction-count">txs: &mdash;</span> &middot; <span id="v-block-reward" style="cursor:help;">reward: &mdash;</span></div>
+    </div>
+    <div class="kpi">
       <div class="label">Network hashrate</div>
       <div class="val" id="v-net-hashrate">&mdash;</div>
       <div class="sub" id="v-net-diff">diff: &mdash;</div>
@@ -1017,16 +1027,6 @@ tr:last-child td { border-bottom: none; }
       <div class="label">Next adjustment</div>
       <div class="val" id="v-net-next-adj" style="font-size:0.92rem;" title="Estimated time until the next difficulty adjustment (2016-block epochs, ~10 min/block)">&mdash;</div>
       <div class="sub" id="v-net-adj-pct" title="Estimated difficulty change at the next retarget, from actual block timestamps in the current 2016-block epoch. Clamped to the protocol's [-75%, +300%] range.">est. move: &mdash;</div>
-    </div>
-    <div class="kpi">
-      <div class="label">Chain tip</div>
-      <div class="val" id="v-height" title="Height of current best chain tip">&mdash;</div>
-      <div class="sub"><span id="v-block-transaction-count">txs: &mdash;</span> &middot; <span id="v-block-reward" style="cursor:help;">reward: &mdash;</span></div>
-    </div>
-    <div class="kpi">
-      <div class="label with-tags">Bitcoin node<span id="v-node-bips"></span></div>
-      <div class="val" id="v-node" style="font-size:0.92rem;">&mdash;</div>
-      <div class="sub" id="v-node-rpc" style="cursor:help;"><span id="v-node-rpc-led" class="led led-off" style="margin-right:0.3rem;"></span><span id="v-node-rpc-text">rpc: &mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label" style="display:flex; justify-content:space-between; align-items:center;">Market

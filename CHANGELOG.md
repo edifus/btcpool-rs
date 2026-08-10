@@ -1018,10 +1018,6 @@ unlinked to avoid any ambiguity with a release of the same number here.
   into the rejected card; best share keyed by vardiff difficulty.
 
 [Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.4.4...HEAD
-[0.4.4]: https://github.com/edifus/btcpool-rs/compare/v0.4.3...v0.4.4
-[0.4.3]: https://github.com/edifus/btcpool-rs/compare/v0.4.2...v0.4.3
-[0.4.2]: https://github.com/edifus/btcpool-rs/compare/v0.4.0...v0.4.2
-[0.4.0]: https://github.com/edifus/btcpool-rs/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/edifus/btcpool-rs/compare/v0.3.0...v0.3.4
 [0.3.0]: https://github.com/edifus/btcpool-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/edifus/btcpool-rs/compare/v0.1.3...v0.2.0
