@@ -280,7 +280,9 @@ pub async fn run(
                                 }
                             };
                             let notify = build_notify(&job, clean);
-                            session.issued_jobs.issue(job.clone(), clean);
+                            session
+                                .issued_jobs
+                                .issue(job.clone(), clean, session.difficulty);
                             session.current_template = Some(template);
 
                             debug!(
@@ -703,7 +705,9 @@ async fn handle_authorize(
             }
         };
         session.current_template = Some(template);
-        session.issued_jobs.issue(job.clone(), true);
+        session
+            .issued_jobs
+            .issue(job.clone(), true, session.difficulty);
 
         debug!(
             peer = %session.peer,
@@ -818,6 +822,7 @@ async fn handle_submit(
     let validation_start = Instant::now();
     let job_height = job_entry.job.height;
     let job_payout = job_entry.job.payout_address.clone();
+    let job_difficulty = job_entry.difficulty;
     let extranonce1 = session.extranonce1.clone();
     let job_entry = job_entry.clone();
     let validation = task::spawn_blocking(move || {
@@ -851,7 +856,7 @@ async fn handle_submit(
             let validation_duration_ms = validation_start.elapsed().as_millis() as f64;
             metrics::share_validation_time(validation_duration_ms);
 
-            let credit = accept_share(session, worker, hash_difficulty);
+            let credit = accept_share(session, worker, hash_difficulty, job_difficulty);
             debug!(
                 worker = worker,
                 job = %params.job_id,
@@ -900,7 +905,7 @@ async fn handle_submit(
                     // Credited and acked either way: the miner produced a valid
                     // block-difficulty share, and losing a same-height race is
                     // not its fault.
-                    accept_share(session, worker, hash_difficulty);
+                    accept_share(session, worker, hash_difficulty, job_difficulty);
                     if outcome.is_win() {
                         info!("🏆 Block submitted! worker={worker} hash={block_hash_hex}");
                     } else {
@@ -956,12 +961,17 @@ async fn handle_submit(
 
 /// Book an accepted share: session counters, vardiff, and the pool-wide stats
 /// and metrics. Returns the difficulty credited to the hashrate estimator.
-fn accept_share(session: &mut Session, worker: &str, hash_difficulty: u64) -> u64 {
+fn accept_share(
+    session: &mut Session,
+    worker: &str,
+    hash_difficulty: u64,
+    job_difficulty: u64,
+) -> u64 {
     session.shares_accepted += 1;
     let now = Instant::now();
     let credit = session
         .credit
-        .credit(session.difficulty, hash_difficulty, now);
+        .credit(session.difficulty, job_difficulty, hash_difficulty, now);
     session.vardiff.record_share(credit, now);
     accounting::record_accepted(
         &session.stats,

@@ -9,6 +9,11 @@ pub struct JobEntry {
     #[allow(dead_code)]
     pub created_at: Instant,
     pub superseded_by_clean: bool,
+    /// Session difficulty in force when this job was sent. A submitted share
+    /// can only be judged against what the miner knew when it took the job,
+    /// so this — not the current vardiff level — is what
+    /// [`crate::mining::credit::ShareCredit`] weighs a share of this job by.
+    pub difficulty: u64,
 }
 
 /// Bounded history of the exact payout-specific jobs issued to one session.
@@ -23,7 +28,7 @@ impl IssuedJobs {
         }
     }
 
-    pub fn issue(&mut self, job: Arc<StratumJob>, clean: bool) {
+    pub fn issue(&mut self, job: Arc<StratumJob>, clean: bool, difficulty: u64) {
         if clean {
             for entry in &mut self.entries {
                 entry.superseded_by_clean = true;
@@ -36,6 +41,7 @@ impl IssuedJobs {
             job,
             created_at: Instant::now(),
             superseded_by_clean: false,
+            difficulty,
         });
     }
 
@@ -88,7 +94,7 @@ mod tests {
     fn history_depth_is_bounded() {
         let mut history = IssuedJobs::new();
         for id in 0..JOB_HISTORY_DEPTH + 2 {
-            history.issue(job(id), false);
+            history.issue(job(id), false, 1_024);
         }
         assert_eq!(history.entries.len(), JOB_HISTORY_DEPTH);
         assert!(history.find("0").is_none());
@@ -98,12 +104,22 @@ mod tests {
     #[test]
     fn clean_job_supersedes_all_previous_jobs() {
         let mut history = IssuedJobs::new();
-        history.issue(job(1), false);
-        history.issue(job(2), false);
-        history.issue(job(3), true);
+        history.issue(job(1), false, 1_024);
+        history.issue(job(2), false, 1_024);
+        history.issue(job(3), true, 1_024);
 
         assert!(history.find("1").unwrap().superseded_by_clean);
         assert!(history.find("2").unwrap().superseded_by_clean);
         assert!(!history.find("3").unwrap().superseded_by_clean);
+    }
+
+    #[test]
+    fn each_job_keeps_the_difficulty_it_was_issued_at() {
+        let mut history = IssuedJobs::new();
+        history.issue(job(1), false, 1_024);
+        history.issue(job(2), false, 4_096);
+
+        assert_eq!(history.find("1").unwrap().difficulty, 1_024);
+        assert_eq!(history.find("2").unwrap().difficulty, 4_096);
     }
 }

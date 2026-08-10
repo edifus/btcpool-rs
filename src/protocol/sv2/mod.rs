@@ -797,7 +797,7 @@ async fn handle_submit(
             hash,
         }) => {
             metrics::share_validation_time(validation_start.elapsed().as_millis() as f64);
-            let credit = accept_share(session, &worker, hash_difficulty);
+            let credit = accept_share(session, &worker, hash_difficulty, job_entry.difficulty);
             debug!(
                 worker = %worker, hash = %hex::encode(hash), diff = assigned_difficulty,
                 hash_diff = hash_difficulty, credit = credit,
@@ -837,7 +837,7 @@ async fn handle_submit(
                     // Credited and acked either way: the miner produced a valid
                     // block-difficulty share, and losing a same-height race is
                     // not its fault.
-                    accept_share(session, &worker, hash_difficulty);
+                    accept_share(session, &worker, hash_difficulty, job_entry.difficulty);
                     if outcome.is_win() {
                         info!("🏆 Block submitted (SV2)! worker={worker} hash={block_hash_hex}");
                     } else {
@@ -880,12 +880,17 @@ async fn handle_submit(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Book an accepted share. Returns the difficulty credited to the estimator.
-fn accept_share(session: &mut Sv2Session, worker: &str, hash_difficulty: u64) -> u64 {
+fn accept_share(
+    session: &mut Sv2Session,
+    worker: &str,
+    hash_difficulty: u64,
+    job_difficulty: u64,
+) -> u64 {
     session.shares_accepted += 1;
     let now = Instant::now();
     let credit = session
         .credit
-        .credit(session.difficulty, hash_difficulty, now);
+        .credit(session.difficulty, job_difficulty, hash_difficulty, now);
     session.vardiff.record_share(credit, now);
     accounting::record_accepted(
         &session.stats,
@@ -982,7 +987,7 @@ async fn send_job(
             return false;
         }
     }
-    session.issued_jobs.issue(job, future);
+    session.issued_jobs.issue(job, future, session.difficulty);
     true
 }
 

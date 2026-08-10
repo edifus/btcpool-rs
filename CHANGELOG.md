@@ -9,6 +9,34 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+### Fixed
+- **Honouring miners were mis-flagged as ignoring `set_difficulty`, collapsing
+  vardiff and halving the recorded pool hashrate.** `hash_to_difficulty`
+  divided in u64 before applying the byte-position shift, quantizing every
+  read in the 256–65535 band down to a multiple of 256 (a difficulty-1500 hash
+  read 1280). A session honouring its assignment therefore produced "below
+  assigned" reads on a few percent of its shares, tripping `ShareCredit`'s
+  evidence threshold within minutes; the verdict was sticky, so the session
+  was credited at the floor for the rest of the connection. Vardiff, fed
+  floor credits, drove the difficulty toward `√(optimal × floor)` and
+  oscillated across the deadzone there, while the dashboard and Prometheus
+  hashrate — fed the same credits — under-read each flagged session by
+  `floor/assigned`. The division now carries 64 fractional bits through the
+  shift, leaving only a ±1 truncation.
+- **Shares are judged against the difficulty of the job they solve.** Each
+  issued job now carries the session difficulty in force when it was sent, and
+  `ShareCredit` weighs a share by the smaller of that stamp and the current
+  assignment. Work in flight across a raise, and a cut a miner applies to the
+  job it is already working, are no longer evidence of ignoring
+  `set_difficulty` — however far outside the 30 s grace window they land — and
+  are credited at the difficulty they actually cleared.
+- **The `set_difficulty` verdict is no longer permanent.** Twenty consecutive
+  shares at or above the effective difficulty clear it and restore full
+  credit. A miner truly pinned to the floor cannot produce such a run once
+  vardiff sits above the floor, while a session flagged in error produces
+  nothing else, so a false positive now costs minutes rather than the
+  connection lifetime.
+
 ## [0.4.0] - 2026-08-09
 
 Vardiff stops chasing noise. The old controller sized a miner's difficulty from

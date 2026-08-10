@@ -766,22 +766,22 @@ pub fn hash_to_difficulty(hash_le: &[u8; 32]) -> u64 {
     const DIFF1_NZ: i32 = 4;
     const DIFF1_SIG: u64 = 0xFFFF_0000_0000_0000;
 
-    let ratio = DIFF1_SIG / hash_sig;
+    // 64.64 fixed-point quotient. Dividing in u64 and shifting the integer
+    // quotient afterwards would quantize the result to multiples of 2^exp —
+    // 256 in the 256–65535 band — under-reading a share by up to 50%. The 64
+    // fractional bits carry the full precision through the shift, leaving only
+    // the final ±1 truncation.
+    let ratio = ((DIFF1_SIG as u128) << 64) / (hash_sig as u128);
     let exp = (nz as i32 - DIFF1_NZ) * 8; // positive → hash has more leading zeros
 
-    if exp >= 64 {
+    if exp > 64 {
+        // ratio > DIFF1_SIG ≥ 2^63.99, so any net left shift exceeds u64.
         u64::MAX
-    } else if exp >= 0 {
-        let exp = exp as u32;
-        if ratio > u64::MAX >> exp {
-            u64::MAX
-        } else {
-            ratio << exp
-        }
-    } else if -exp >= 64 {
-        0
     } else {
-        ratio >> (-exp) as u32
+        // Net right shift of the fractional bits: 0 (exp = 64) through 96
+        // (nz = 0, the sub-1 difficulty band).
+        let shift = (64 - exp) as u32;
+        u64::try_from(ratio >> shift).unwrap_or(u64::MAX)
     }
 }
 
@@ -1056,6 +1056,120 @@ mod tests {
     fn test_difficulty_to_target_diff1() {
         let t = difficulty_to_target(1);
         assert!(t[4] > 0, "diff-1 target should be non-zero around byte 4");
+    }
+
+    /// Reverse a big-endian target into the little-endian orientation
+    /// `hash_to_difficulty` takes — i.e. treat the target itself as a hash
+    /// landing exactly on it, the lowest-value hash a share can carry.
+    fn target_as_hash_le(target_be: &[u8; 32]) -> [u8; 32] {
+        let mut le = *target_be;
+        le.reverse();
+        le
+    }
+
+    /// A hash of true difficulty ~1500 must not read as 1280: truncating the
+    /// integer quotient before the byte-position shift quantized every read in
+    /// the 256–65535 band to a multiple of 256, so honoring miners appeared to
+    /// submit below their assigned difficulty and `ShareCredit` flagged them.
+    #[test]
+    fn hash_to_difficulty_is_not_quantized_to_byte_multiples() {
+        let hash = target_as_hash_le(&difficulty_to_target(1500));
+        let read = hash_to_difficulty(&hash);
+        assert!(
+            (1499..=1501).contains(&read),
+            "difficulty-1500 hash read {read}"
+        );
+    }
+
+    /// A hash meeting `difficulty_to_target(d)` may read at most one under `d`
+    /// — never below the 0.99 evidence tolerance in `ShareCredit`.
+    #[test]
+    fn a_share_on_its_target_reads_within_one_of_its_difficulty() {
+        // Every byte band up to the u64 clamp, hitting values just above a
+        // multiple of 256 (the old failure mode), just below one, and mid-band.
+        let sweep: [u64; 22] = [
+            2,
+            3,
+            255,
+            256,
+            257,
+            511,
+            512,
+            1_400,
+            1_500,
+            5_641,
+            8_265,
+            9_540,
+            16_913,
+            65_535,
+            65_536,
+            65_537,
+            1_000_003,
+            4_000_000,
+            4_294_967_311,
+            1 << 40,
+            (1 << 40) + 12_345,
+            1 << 50,
+        ];
+        for d in sweep {
+            let hash = target_as_hash_le(&difficulty_to_target(d));
+            let read = hash_to_difficulty(&hash);
+            assert!(read + 1 >= d, "difficulty-{d} hash read {read}, below d-1");
+            assert!(read <= d + 2, "difficulty-{d} hash read {read}, above d+2");
+        }
+    }
+
+    /// Cross-check against a floating-point oracle across the full range of
+    /// leading-zero counts, including the saturation band above `u64::MAX`.
+    #[test]
+    fn hash_to_difficulty_matches_a_float_oracle() {
+        let truediff_one = 65_535.0 * 2f64.powi(208);
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for zero_bytes in 0..20 {
+            for _ in 0..50 {
+                let mut hash_be = [0u8; 32];
+                for b in hash_be.iter_mut().skip(zero_bytes) {
+                    *b = (next() & 0xff) as u8;
+                }
+                hash_be[zero_bytes] |= 1; // keep the leading byte non-zero
+                let value = hash_be.iter().fold(0.0, |acc, &b| acc * 256.0 + b as f64);
+                let oracle = truediff_one / value;
+                let mut hash_le = hash_be;
+                hash_le.reverse();
+                let read = hash_to_difficulty(&hash_le) as f64;
+                if oracle > u64::MAX as f64 * 0.999_999 {
+                    assert!(
+                        read >= u64::MAX as f64 * 0.999_999,
+                        "zero_bytes={zero_bytes}: read {read:e} against saturating oracle {oracle:e}"
+                    );
+                    continue;
+                }
+                let error = (read - oracle).abs();
+                assert!(
+                    error <= oracle * 1e-9 + 1.0,
+                    "zero_bytes={zero_bytes}: read {read:e}, oracle {oracle:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hash_to_difficulty_extremes() {
+        // All-zero hash: infinitely hard, clamped.
+        assert_eq!(hash_to_difficulty(&[0u8; 32]), u64::MAX);
+        // A hash with no leading zero bytes sits far above the diff-1 target.
+        let mut huge = [0u8; 32];
+        huge[31] = 0x80; // big-endian 0x80 00 … 00
+        assert_eq!(hash_to_difficulty(&huge), 0);
+        // The diff-1 target itself reads exactly 1.
+        let diff1 = target_as_hash_le(&difficulty_to_target(1));
+        assert_eq!(hash_to_difficulty(&diff1), 1);
     }
 
     #[test]
