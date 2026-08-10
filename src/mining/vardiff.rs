@@ -204,6 +204,7 @@ impl Vardiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mining::credit::ShareCredit;
     use std::time::Duration;
 
     const NONCES: f64 = 4_294_967_296.0;
@@ -239,20 +240,26 @@ mod tests {
             Self(0x2545_F491_4F6C_DD1D)
         }
 
-        /// Next gap, exponentially distributed with mean `mean_secs`.
-        fn next_gap(&mut self, mean_secs: f64) -> Duration {
+        /// Next uniform draw in (0, 1].
+        fn next_uniform(&mut self) -> f64 {
             self.0 ^= self.0 << 13;
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
-            let uniform = (self.0 >> 11) as f64 / (1u64 << 53) as f64;
+            ((self.0 >> 11) as f64 / (1u64 << 53) as f64).max(1e-12)
+        }
+
+        /// Next gap, exponentially distributed with mean `mean_secs`.
+        fn next_gap(&mut self, mean_secs: f64) -> Duration {
+            let uniform = self.next_uniform();
             let gap = -mean_secs * (1.0 - uniform).max(1e-12).ln();
             Duration::from_secs_f64(gap.clamp(1e-4, mean_secs * 20.0))
         }
     }
 
     /// Drive `vd` with a miner of `hashrate` H/s for `secs`, honouring every
-    /// difficulty it is handed. Returns the difficulties emitted, with the time
-    /// each was sent.
+    /// difficulty it is handed, with every share routed through [`ShareCredit`]
+    /// exactly as the session loops do. Returns the difficulties emitted, with
+    /// the time each was sent.
     fn mine(
         vd: &mut Vardiff,
         start: Instant,
@@ -261,15 +268,28 @@ mod tests {
         honor: bool,
     ) -> Vec<(f64, u64)> {
         let mut arrivals = Arrivals::new();
+        let mut credit = ShareCredit::new(FLOOR, start);
         let mut now = start;
         let deadline = start + Duration::from_secs(secs);
         let mut changes = Vec::new();
         while now < deadline {
-            // The difficulty the hardware actually submits at, and so both the
-            // credit and the arrival rate.
-            let submitted = if honor { vd.current } else { FLOOR };
-            now += arrivals.next_gap(submitted as f64 * NONCES / hashrate);
-            vd.record_share(submitted, now);
+            // The threshold the hardware actually submits at, and so the
+            // arrival rate and the hash-difficulty distribution.
+            let enforced = if honor { vd.current } else { FLOOR };
+            // The pool stamps jobs with its current assignment either way.
+            let job_difficulty = vd.current;
+            now += arrivals.next_gap(enforced as f64 * NONCES / hashrate);
+            // Hash difficulties of accepted shares are heavy-tailed: the
+            // enforced threshold over a uniform draw.
+            let hash_difficulty = (enforced as f64 / arrivals.next_uniform()).min(1e15) as u64;
+            let credited = credit.credit(vd.current, job_difficulty, hash_difficulty, now);
+            if honor {
+                assert!(
+                    credit.honors_assigned(),
+                    "an honouring miner was flagged as ignoring set_difficulty"
+                );
+            }
+            vd.record_share(credited, now);
             if let Some(new_diff) = vd.check_retarget(now, None) {
                 changes.push((now.duration_since(start).as_secs_f64(), new_diff));
             }

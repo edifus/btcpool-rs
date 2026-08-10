@@ -9,6 +9,69 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-08-10
+
+Dashboard release.
+
+### Changed
+- **The "BIP110 / RDTS" dashboard card is now a "Bitcoin node" card.**
+  Display node type and version, full agent on mouseover. RPC status LED
+  to display pool connection status.
+  `/stats` gains `node_implementation`, `node_version`, `node_subversion`,
+  `node_rpc_last_ok_secs`, and `template_fresh`.
+- **KPI strip cleanups.** KPI's and Network cards normalized in appearance.
+- **Both charts share one card.** Hashrate averages and shares/min sit in a
+  single panel.
+
+## [0.4.3] - 2026-08-09
+
+### Fixed
+- **Every block found by the network triggered two clean-job broadcasts.** The
+  poll fallback keeps its own last-seen tip, so it re-announced each block the
+  ZMQ listener had already delivered, and a block-driven refresh forced
+  `clean_jobs=true` without checking whether `prev_hash` had actually moved.
+  The second clean, 0.1–1 s after the first, retired the job issued by the
+  first: shares in flight for it — same height, still able to win the block —
+  were rejected as stale, and every miner discarded its work a second time. A
+  refresh now sends a clean job exactly when the template's `prev_hash`
+  differs from the last broadcast one; the redundant re-announcement degrades
+  to an ordinary non-clean template refresh.
+
+## [0.4.2] - 2026-08-09
+
+### Fixed
+- **Legacy extranonce subscription no longer fails Bitaxe setup.** The pool
+  supported `subscribe-extranonce` negotiation through `mining.configure`, but
+  rejected the equivalent standalone `mining.extranonce.subscribe` request as
+  an unknown method. It now acknowledges that legacy capability advertisement
+  with `result: true`, allowing AxeOS extranonce subscribe to remain enabled.
+- **Honouring miners were mis-flagged as ignoring `set_difficulty`, collapsing
+  vardiff and halving the recorded pool hashrate.** `hash_to_difficulty`
+  divided in u64 before applying the byte-position shift, quantizing every
+  read in the 256–65535 band down to a multiple of 256 (a difficulty-1500 hash
+  read 1280). A session honouring its assignment therefore produced "below
+  assigned" reads on a few percent of its shares, tripping `ShareCredit`'s
+  evidence threshold within minutes; the verdict was sticky, so the session
+  was credited at the floor for the rest of the connection. Vardiff, fed
+  floor credits, drove the difficulty toward `√(optimal × floor)` and
+  oscillated across the deadzone there, while the dashboard and Prometheus
+  hashrate — fed the same credits — under-read each flagged session by
+  `floor/assigned`. The division now carries 64 fractional bits through the
+  shift, leaving only a ±1 truncation.
+- **Shares are judged against the difficulty of the job they solve.** Each
+  issued job now carries the session difficulty in force when it was sent, and
+  `ShareCredit` weighs a share by the smaller of that stamp and the current
+  assignment. Work in flight across a raise, and a cut a miner applies to the
+  job it is already working, are no longer evidence of ignoring
+  `set_difficulty` — however far outside the 30 s grace window they land — and
+  are credited at the difficulty they actually cleared.
+- **The `set_difficulty` verdict is no longer permanent.** Twenty consecutive
+  shares at or above the effective difficulty clear it and restore full
+  credit. A miner truly pinned to the floor cannot produce such a run once
+  vardiff sits above the floor, while a session flagged in error produces
+  nothing else, so a false positive now costs minutes rather than the
+  connection lifetime.
+
 ## [0.4.0] - 2026-08-09
 
 Vardiff stops chasing noise. The old controller sized a miner's difficulty from
@@ -954,7 +1017,11 @@ unlinked to avoid any ambiguity with a release of the same number here.
 - Dashboard rework: worker rendering and stats mapping fixes; reject rate moved
   into the rejected card; best share keyed by vardiff difficulty.
 
-[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/edifus/btcpool-rs/compare/v0.4.3...v0.4.4
+[0.4.3]: https://github.com/edifus/btcpool-rs/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/edifus/btcpool-rs/compare/v0.4.0...v0.4.2
+[0.4.0]: https://github.com/edifus/btcpool-rs/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/edifus/btcpool-rs/compare/v0.3.0...v0.3.4
 [0.3.0]: https://github.com/edifus/btcpool-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/edifus/btcpool-rs/compare/v0.1.3...v0.2.0
