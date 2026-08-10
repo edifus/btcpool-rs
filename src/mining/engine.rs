@@ -241,11 +241,8 @@ impl TemplateEngine {
                             .await
                             .as_ref()
                             .map(|t| t.prev_hash.clone());
-                        let clean = should_force_clean(
-                            clean_jobs,
-                            previous_prev_hash.as_deref(),
-                            &template.prev_hash,
-                        );
+                        let clean =
+                            should_force_clean(previous_prev_hash.as_deref(), &template.prev_hash);
                         if clean && !clean_jobs {
                             // The ntime timer noticed a tip change the caller
                             // didn't already know about — proof the block path
@@ -529,19 +526,23 @@ async fn drive_refresh_loop<F, Fut>(
     }
 }
 
-/// Whether a refresh should tell miners to abandon in-flight work. `true`
-/// whenever the caller already knows it must be (a ZMQ-driven block refresh),
-/// and *also* whenever `prev_hash` moved since the last template regardless of
-/// what the caller asked for — which is what turns a timer-discovered tip into
-/// a forced clean job instead of a silently stale one.
+/// Whether a refresh should tell miners to abandon in-flight work: exactly
+/// when `prev_hash` moved since the last broadcast template (or there is no
+/// last template). The caller's reason for refreshing carries no weight — the
+/// block path and the poll fallback each announce every tip change, so a
+/// block-driven refresh can arrive for a tip that was already broadcast, and
+/// a clean job for the same tip would retire jobs that are still valid,
+/// rejecting their in-flight shares as stale and restarting every miner for
+/// nothing. Comparing tips also turns a timer-discovered tip into a forced
+/// clean job instead of a silently stale one.
 ///
 /// Compared on `prev_hash`, not `height`: `hashPrevBlock` is the only field in
 /// the 80-byte header that binds work to a specific chain (height lives only in
 /// the BIP34 coinbase push), so it is a strict superset of a height comparison
 /// — in particular it also catches a same-height reorg, which height alone
 /// would miss.
-fn should_force_clean(caller_requested: bool, previous: Option<&str>, new_prev_hash: &str) -> bool {
-    caller_requested || previous != Some(new_prev_hash)
+fn should_force_clean(previous: Option<&str>, new_prev_hash: &str) -> bool {
+    previous != Some(new_prev_hash)
 }
 
 /// The freshness verdict behind `TemplateEngine::is_template_fresh`, split out
@@ -605,28 +606,24 @@ mod tests {
     // ── should_force_clean ──────────────────────────────────────────────────
 
     #[test]
-    fn should_force_clean_when_caller_requested_it() {
-        // Caller already knows (ZMQ-driven block refresh); the prev_hash
-        // comparison is irrelevant.
-        assert!(should_force_clean(true, Some("aaaa"), "aaaa"));
+    fn a_repeated_block_signal_for_the_same_tip_is_not_clean() {
+        // The poll fallback re-announces a block ZMQ already delivered; a
+        // second clean job for the same tip would stale-reject in-flight
+        // shares on jobs that are still valid.
+        assert!(!should_force_clean(Some("aaaa"), "aaaa"));
     }
 
     #[test]
-    fn should_force_clean_when_prev_hash_changed_under_an_ntime_refresh() {
-        // The timer, not the caller, is the one that noticed the tip moved.
-        assert!(should_force_clean(false, Some("aaaa"), "bbbb"));
-    }
-
-    #[test]
-    fn should_not_force_clean_on_same_block_ntime_refresh() {
-        // Routine ntime refresh: same tip, miners may keep their nonce range.
-        assert!(!should_force_clean(false, Some("aaaa"), "aaaa"));
+    fn should_force_clean_when_prev_hash_changed() {
+        // Whoever noticed the tip moved — block signal or ntime timer — the
+        // outstanding jobs build on the wrong parent.
+        assert!(should_force_clean(Some("aaaa"), "bbbb"));
     }
 
     #[test]
     fn should_force_clean_for_first_template() {
         // No previous template to compare against — treat it like a new tip.
-        assert!(should_force_clean(false, None, "aaaa"));
+        assert!(should_force_clean(None, "aaaa"));
     }
 
     // ── template_age_from ───────────────────────────────────────────────────

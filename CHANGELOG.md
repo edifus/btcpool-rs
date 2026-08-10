@@ -9,6 +9,22 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-08-09
+
+### Fixed
+- **Every block found by the network triggered two clean-job broadcasts.** The
+  poll fallback keeps its own last-seen tip, so it re-announced each block the
+  ZMQ listener had already delivered, and a block-driven refresh forced
+  `clean_jobs=true` without checking whether `prev_hash` had actually moved.
+  The second clean, 0.1–1 s after the first, retired the job issued by the
+  first: shares in flight for it — same height, still able to win the block —
+  were rejected as stale, and every miner discarded its work a second time. A
+  refresh now sends a clean job exactly when the template's `prev_hash`
+  differs from the last broadcast one; the redundant re-announcement degrades
+  to an ordinary non-clean template refresh.
+
+## [0.4.2] - 2026-08-09
+
 ### Fixed
 - **Legacy extranonce subscription no longer fails Bitaxe setup.** The pool
   supported `subscribe-extranonce` negotiation through `mining.configure`, but
