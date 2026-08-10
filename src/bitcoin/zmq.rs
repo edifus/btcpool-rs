@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio_stream::StreamExt;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Sends a unit signal every time a new block is detected.
 pub type NewBlockSender = watch::Sender<u64>;
@@ -127,7 +127,7 @@ async fn run_zmq_listener(endpoint: &str, tx: NewBlockSender) -> anyhow::Result<
                     *n += 1;
                     seq = *n;
                 });
-                debug!(seq, "ZMQ: hashblock notification");
+                info!(seq, "ZMQ: hashblock notification");
             }
             Some(Err(e)) => {
                 return Err(anyhow::anyhow!("ZMQ receive error: {e}"));
@@ -155,7 +155,7 @@ async fn run_poll_fallback(
         match rpc.best_block_hash().await {
             Ok(hash) => {
                 if hash != last_hash {
-                    debug!("Poll: new block hash {hash}");
+                    info!("Poll: new block hash {hash}");
                     last_hash = hash;
                     tx.send_modify(|n| *n += 1);
                 }

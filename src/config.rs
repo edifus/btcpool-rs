@@ -226,6 +226,22 @@ pub struct VardiffConfig {
     pub min_difficulty: u64,
     pub max_difficulty: u64,
     pub max_retarget_factor: f64,
+    /// Lower edge of the deadzone, as a multiple of the assigned difficulty:
+    /// nothing is sent until the computed optimum falls to or below it.
+    #[serde(default = "default_deadzone_low")]
+    pub deadzone_low: f64,
+    /// Upper edge of the deadzone. Widening the band leaves difficulty still
+    /// for longer at the cost of sitting further from the target share time.
+    #[serde(default = "default_deadzone_high")]
+    pub deadzone_high: f64,
+}
+
+fn default_deadzone_low() -> f64 {
+    0.667
+}
+
+fn default_deadzone_high() -> f64 {
+    1.5
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -281,10 +297,23 @@ pub struct MetricsConfig {
 pub struct LoggingConfig {
     pub level: String,
     pub json: bool,
-    /// Optional directory to write logs to (e.g., "/var/log/btcpool-rs/").
-    /// If set, logs will be written to a file in this directory.
-    /// Supports `~` expansion.
+    /// Directory for rotating log files (e.g., "/var/log/btcpool-rs/"). Logs
+    /// always go to stdout; this adds a file copy alongside them. Empty or
+    /// absent disables file logging. Supports `~` expansion.
     pub log_dir: Option<String>,
+}
+
+impl LoggingConfig {
+    /// Resolved log directory, or `None` when file logging is off. Empty and
+    /// whitespace-only values are off, the same as an absent key — `Option`
+    /// alone does not cover that, since `""` deserializes to `Some("")`.
+    pub fn log_dir_path(&self) -> Option<PathBuf> {
+        self.log_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map(expand_tilde)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -335,6 +364,50 @@ impl Config {
                 "[pool] confirmation_depth must be between 1 and 100 (got {}); \
                  6 is the conventional finality threshold",
                 self.pool.confirmation_depth
+            );
+        }
+
+        // Vardiff divides by the target and clamps between reciprocals of the
+        // retarget factor, so these are the values that would panic or drive
+        // every session to the floor rather than merely tune it badly.
+        let vardiff = &self.vardiff;
+        if vardiff.target_share_time_secs == 0 {
+            anyhow::bail!("[vardiff] target_share_time_secs must be >= 1 (got 0)");
+        }
+        if vardiff.min_difficulty == 0 {
+            anyhow::bail!("[vardiff] min_difficulty must be >= 1 (got 0)");
+        }
+        if vardiff.min_difficulty > vardiff.max_difficulty {
+            anyhow::bail!(
+                "[vardiff] min_difficulty ({}) must not exceed max_difficulty ({})",
+                vardiff.min_difficulty,
+                vardiff.max_difficulty
+            );
+        }
+        if !vardiff.max_retarget_factor.is_finite() || vardiff.max_retarget_factor <= 1.0 {
+            anyhow::bail!(
+                "[vardiff] max_retarget_factor must be > 1.0 (got {}); \
+                 it bounds a difficulty change to that ratio in either direction",
+                vardiff.max_retarget_factor
+            );
+        }
+        if !vardiff.deadzone_low.is_finite()
+            || vardiff.deadzone_low <= 0.0
+            || vardiff.deadzone_low >= 1.0
+        {
+            anyhow::bail!(
+                "[vardiff] deadzone_low must be between 0.0 and 1.0 (got {}); \
+                 it is the fraction of the assigned difficulty the optimum has to \
+                 fall to before the difficulty is lowered",
+                vardiff.deadzone_low
+            );
+        }
+        if !vardiff.deadzone_high.is_finite() || vardiff.deadzone_high <= 1.0 {
+            anyhow::bail!(
+                "[vardiff] deadzone_high must be > 1.0 (got {}); \
+                 it is the multiple of the assigned difficulty the optimum has to \
+                 reach before the difficulty is raised",
+                vardiff.deadzone_high
             );
         }
 
@@ -421,8 +494,9 @@ fn apply_env_overrides(
             Some(_) => anyhow::bail!("{name}: cannot override non-scalar {section}.{key}"),
             None => infer_toml_scalar(raw),
         };
-        // Names only — values may be credentials.
-        tracing::info!("Config override from environment: {section}.{key}");
+        // Names only — values may be credentials. stderr because config loads
+        // before the tracing subscriber exists; systemd and Docker capture it.
+        eprintln!("Config override from environment: {section}.{key}");
         table.insert(key, parsed);
     }
     Ok(())
@@ -463,6 +537,7 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{apply_env_overrides, Config, PoolConfig};
+    use std::path::PathBuf;
 
     /// A complete, valid config; tests override single values on top of it.
     fn config_toml(coinbase_tag: &str, extranonce1: usize, extranonce2: usize) -> String {
@@ -471,7 +546,7 @@ mod tests {
 [pool]
 listen_addr = "127.0.0.1:3333"
 coinbase_tag = "{coinbase_tag}"
-initial_difficulty = 4096
+initial_difficulty = 2048
 extranonce1_size = {extranonce1}
 extranonce2_size = {extranonce2}
 max_connections = 16
@@ -487,11 +562,11 @@ poll_fallback = true
 poll_interval_ms = 1000
 
 [vardiff]
-target_share_time_secs = 15
-retarget_interval_secs = 60
-min_difficulty = 4096
-max_difficulty = 65536
-max_retarget_factor = 4.0
+target_share_time_secs = 5
+retarget_interval_secs = 100
+min_difficulty = 256
+max_difficulty = 4000000
+max_retarget_factor = 10.0
 
 [security]
 max_connections_per_ip = 5
@@ -559,6 +634,33 @@ json = false
             let err = config.validate().unwrap_err().to_string();
             assert!(err.contains(hint), "unexpected error for {depth}: {err}");
         }
+    }
+
+    /// `""` deserializes to `Some("")`, not `None`, so an empty `log_dir` would
+    /// otherwise enable file logging and resolve relative to the process
+    /// working directory.
+    #[test]
+    fn empty_log_dir_disables_file_logging() {
+        let base = config_toml("/btcpool-rs/", 4, 4);
+        let parse = |src: &str| {
+            toml::from_str::<Config>(src)
+                .unwrap()
+                .logging
+                .log_dir_path()
+        };
+
+        // Absent, empty, and whitespace-only all mean "stdout only".
+        assert_eq!(parse(&base), None);
+        for value in ["\"\"", "\"   \""] {
+            let src = base.replace("json = false", &format!("json = false\nlog_dir = {value}"));
+            assert_eq!(parse(&src), None, "log_dir = {value} should disable files");
+        }
+
+        let src = base.replace(
+            "json = false",
+            "json = false\nlog_dir = \"/var/log/btcpool-rs\"",
+        );
+        assert_eq!(parse(&src), Some(PathBuf::from("/var/log/btcpool-rs")));
     }
 
     // Fixtures pass vars directly instead of mutating the process environment,

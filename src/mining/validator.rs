@@ -49,8 +49,8 @@ const MAX_NTIME_DRIFT_SECS: u32 = 7200;
 ///
 /// A clock that predates the epoch reads as `u32::MAX`, which makes the absolute
 /// bound saturate out of the way and leaves the template-relative one in force.
-/// That is the pre-existing behaviour: a broken clock should cost the extra
-/// guard, not reject every share the pool receives.
+/// A broken clock should cost the extra guard, not reject every share the pool
+/// receives.
 fn now_unix_secs() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -274,7 +274,7 @@ pub fn validate_share_no_dedup(
         // ── 9. Check hash meets pool share target ─────────────────────────────
         let share_target = difficulty_to_target(session_difficulty);
         if !meets_target(&hash, &share_target) {
-            tracing::warn!(
+            tracing::debug!(
                 hash_le = %hex::encode(hash),
                 hash_be = %block_hash_display(&hash),
                 share_target = %hex::encode(share_target),
@@ -518,8 +518,8 @@ mod tests {
     use super::*;
 
     /// The mainnet genesis block, against the two forms in the same assertion:
-    /// hex-encoding the raw hash directly is what the pool used to report, and
-    /// it is the reverse of the string every explorer and RPC speaks.
+    /// hex-encoding the raw hash directly yields the byte-reversed form of the
+    /// string every explorer and RPC speaks.
     #[test]
     fn a_block_hash_is_displayed_the_way_the_rest_of_bitcoin_writes_it() {
         let mut genesis = [0u8; 32];
@@ -536,10 +536,10 @@ mod tests {
         assert_ne!(block_hash_display(&genesis), hex::encode(genesis));
     }
 
-    /// `prev_hash` is pool-generated and always 64 hex chars, so the old
-    /// `hex::decode` + `copy_from_slice` pair never tripped — but a wrong length
-    /// reached `copy_from_slice` and would have panicked inside the blocking
-    /// validation task. It is an error now.
+    /// `prev_hash` is pool-generated and always 64 hex chars, so the length
+    /// check never trips in practice — but a wrong length must surface as an
+    /// error, not a `copy_from_slice` panic inside the blocking validation
+    /// task.
     #[test]
     fn a_wrong_length_prev_hash_is_an_error_not_a_panic() {
         let merkle = [0u8; 32];

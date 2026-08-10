@@ -15,7 +15,7 @@
 use crate::{
     mining::engine::TemplateEngine,
     settings::RuntimeSettings,
-    stats::{HashrateHistoryPoint, PoolStats},
+    stats::{PoolStats, RateHistoryPoint},
 };
 use axum::{
     extract::{Query, State},
@@ -102,6 +102,7 @@ pub async fn start(
         .route("/stats", get(stats_json))
         .route("/history", get(history_json))
         .route("/chart", get(chart_json))
+        .route("/share-chart", get(share_chart_json))
         .route("/api/info", get(info_get))
         .route("/metrics", get(metrics_text))
         .route("/health", get(health))
@@ -281,15 +282,17 @@ async fn history_json(
     Query(params): Query<HistoryParams>,
 ) -> Json<Vec<HistoryPoint>> {
     let since = params.since.unwrap_or(0);
-    let points = hashrate_history(&state, since, 60)
-        .await
-        .into_iter()
-        .filter_map(|point| {
-            point
-                .ten_minutes
-                .map(|hps| HistoryPoint { ts: point.ts, hps })
-        })
-        .collect();
+    let points = rate_history(&state, since, 60, |stats, since, bucket| {
+        stats.get_hashrate_history(since, bucket)
+    })
+    .await
+    .into_iter()
+    .filter_map(|point| {
+        point
+            .ten_minutes
+            .map(|hps| HistoryPoint { ts: point.ts, hps })
+    })
+    .collect();
     Json(points)
 }
 
@@ -351,20 +354,21 @@ fn chart_window(value: Option<&str>) -> ChartWindow {
 /// SQLite connection shared with the rest of the process. Doing that inline
 /// would park a runtime worker thread on disk I/O for as long as it takes —
 /// with enough dashboard tabs open, long enough to stall the share path.
-async fn hashrate_history(
+async fn rate_history(
     state: &DashState,
     since: u64,
     bucket_secs: u64,
-) -> Vec<HashrateHistoryPoint> {
+    query: fn(&crate::stats::PoolStats, u64, u64) -> Vec<RateHistoryPoint>,
+) -> Vec<RateHistoryPoint> {
     let stats = state.stats.clone();
-    tokio::task::spawn_blocking(move || stats.get_hashrate_history(since, bucket_secs))
+    tokio::task::spawn_blocking(move || query(&stats, since, bucket_secs))
         .await
         .unwrap_or_default()
 }
 
 fn chart_series_data(
-    history: &[HashrateHistoryPoint],
-    value: fn(&HashrateHistoryPoint) -> Option<f64>,
+    history: &[RateHistoryPoint],
+    value: fn(&RateHistoryPoint) -> Option<f64>,
 ) -> Vec<serde_json::Value> {
     history
         .iter()
@@ -372,11 +376,17 @@ fn chart_series_data(
         .collect()
 }
 
-async fn chart_json(
-    State(state): State<DashState>,
-    Query(params): Query<ChartParams>,
+/// Shared body of `/chart` and `/share-chart`. The two differ only in which
+/// table they read and which snapshot fields cap the series; everything about
+/// the range, the bucket grid and the rendered option is identical, which is
+/// what keeps the two panels plotting the same x axis.
+async fn rate_chart_response(
+    state: DashState,
+    requested: Option<&str>,
+    query: fn(&crate::stats::PoolStats, u64, u64) -> Vec<RateHistoryPoint>,
+    live_point: fn(&crate::stats::StatsSnapshot, u64) -> RateHistoryPoint,
 ) -> impl IntoResponse {
-    let window = chart_window(params.window.as_deref());
+    let window = chart_window(requested);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -386,7 +396,7 @@ async fn chart_json(
         .map(|duration| now.saturating_sub(duration))
         .unwrap_or(0);
 
-    let mut history = hashrate_history(&state, since, window.bucket_secs).await;
+    let mut history = rate_history(&state, since, window.bucket_secs, query).await;
 
     // Append the current live value as the trailing edge of the chart, snapped
     // to the bucket grid. Every other point is a bucket mean, so plotting a raw
@@ -396,16 +406,7 @@ async fn chart_json(
     // samples and there is nothing to add.
     let live_bucket = now / window.bucket_secs.max(1) * window.bucket_secs.max(1);
     if history.last().map(|p| p.ts) != Some(live_bucket) {
-        let live = state.stats.snapshot();
-        history.push(HashrateHistoryPoint {
-            ts: live_bucket,
-            one_minute: Some(live.total_hashrate_60s),
-            five_minutes: Some(live.total_hashrate_5m),
-            ten_minutes: Some(live.total_hashrate_10m),
-            one_hour: Some(live.total_hashrate_1h),
-            six_hours: Some(live.total_hashrate_6h),
-            twenty_four_hours: Some(live.total_hashrate_24h),
-        });
+        history.push(live_point(&state.stats.snapshot(), live_bucket));
     }
 
     let chart = build_chart_option(&history);
@@ -417,10 +418,53 @@ async fn chart_json(
     )
 }
 
+async fn chart_json(
+    State(state): State<DashState>,
+    Query(params): Query<ChartParams>,
+) -> impl IntoResponse {
+    rate_chart_response(
+        state,
+        params.window.as_deref(),
+        |stats, since, bucket| stats.get_hashrate_history(since, bucket),
+        |live, ts| RateHistoryPoint {
+            ts,
+            one_minute: Some(live.total_hashrate_60s),
+            five_minutes: Some(live.total_hashrate_5m),
+            ten_minutes: Some(live.total_hashrate_10m),
+            one_hour: Some(live.total_hashrate_1h),
+            six_hours: Some(live.total_hashrate_6h),
+            twenty_four_hours: Some(live.total_hashrate_24h),
+        },
+    )
+    .await
+}
+
+async fn share_chart_json(
+    State(state): State<DashState>,
+    Query(params): Query<ChartParams>,
+) -> impl IntoResponse {
+    rate_chart_response(
+        state,
+        params.window.as_deref(),
+        |stats, since, bucket| stats.get_share_rate_history(since, bucket),
+        |live, ts| RateHistoryPoint {
+            ts,
+            one_minute: Some(live.shares_per_minute_1m),
+            five_minutes: Some(live.shares_per_minute_5m),
+            ten_minutes: Some(live.shares_per_minute_10m),
+            one_hour: Some(live.shares_per_minute_1h),
+            six_hours: Some(live.shares_per_minute_6h),
+            twenty_four_hours: Some(live.shares_per_minute_24h),
+        },
+    )
+    .await
+}
+
 /// Build the ECharts option object the browser renders. The client only skins
 /// it (theme colours, JS formatter callbacks); everything structural is decided
-/// here.
-fn build_chart_option(history: &[HashrateHistoryPoint]) -> serde_json::Value {
+/// here. Unit-agnostic — the hashrate and shares/min panels share it, and the
+/// client picks the y-axis formatter per chart.
+fn build_chart_option(history: &[RateHistoryPoint]) -> serde_json::Value {
     let make_series = |name: &str, data: Vec<serde_json::Value>, width: f64| {
         json!({
             "name": name,
@@ -629,12 +673,15 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
 #workers .panel { overflow-x: auto; }
 .panel-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.65rem; margin-bottom: 0.7rem; }
 .panel-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 0.7rem; }
-#chart-toggle {
+.panel-toggle {
+  display: inline-grid; place-items: center;
   cursor: pointer; font: inherit; font-size: 0.72rem; color: var(--muted);
   background: none; border: 1px solid var(--border); border-radius: 5px;
   padding: 0.22rem 0.45rem;
 }
-#chart-toggle:hover { color: var(--text); border-color: var(--muted); }
+.panel-toggle::before, .panel-toggle-label { grid-area: 1 / 1; }
+.panel-toggle::before { content: "Show"; visibility: hidden; }
+.panel-toggle:hover { color: var(--text); border-color: var(--muted); }
 .panel-title { font-size: 0.66rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.13em; color: var(--muted); }
 .timeframe-tabs { display: flex; flex-wrap: wrap; align-items: center; }
 .timeframe-btn {
@@ -651,13 +698,17 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
    its own — the debounced resize handler is what makes this take effect.
    vh, not dvh: dvh follows the mobile URL bar and would re-lay-out on scroll. */
 #hashrate-chart { height: clamp(280px, 40vh, 420px); width: 100%; }
+#sharerate-chart { height: clamp(220px, 28vh, 320px); width: 100%; }
+/* The share-rate panel reads as a companion to the hashrate one above it, so
+   they sit closer together than the section's default rhythm. */
+#sharerate-panel { margin-top: 1.1rem; }
 table { width: 100%; border-collapse: collapse; font-size: 0.84rem; font-variant-numeric: tabular-nums; }
 th {
   text-align: left; color: var(--muted); font-weight: 500; padding: 0.34rem 0.55rem;
   border-bottom: 1px solid var(--border); font-size: 0.66rem;
   text-transform: uppercase; letter-spacing: 0.09em; white-space: nowrap;
 }
-td { padding: 0.5rem 0.55rem; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+td { text-align: left; padding: 0.5rem 0.55rem; border-bottom: 1px solid var(--grid); white-space: nowrap; }
 tr:last-child td { border-bottom: none; }
 .empty-row { color: var(--muted); text-align: center; padding: 1.2rem; font-size: 0.84rem; }
 /* Worker status LED — green when online, grey when offline. */
@@ -666,6 +717,9 @@ tr:last-child td { border-bottom: none; }
 .led-warn { background: var(--warn); box-shadow: 0 0 5px var(--warn); }
 .led-off { background: var(--muted); opacity: 0.45; }
 .col-led { text-align: center; }
+#workers .col-rate, #workers .col-count {
+  padding-left: 0.35rem; padding-right: 0.35rem;
+}
 /* New chain tip: pulse the number itself in the accent color (two beats),
    matching the other highlighted values instead of flashing the background. */
 @keyframes blockPulse {
@@ -834,15 +888,15 @@ tr:last-child td { border-bottom: none; }
 
   <div class="kpis">
     <div class="kpi">
-      <div class="label">Miners</div>
-      <div class="val" id="v-miners">&mdash;</div>
-      <div class="sub"><span id="v-workers-online">Online: &mdash;</span> &middot; <span id="v-workers-degraded">Degraded: &mdash;</span></div>
-      <div class="sub" id="v-workers-offline">Offline: &mdash;</div>
+      <div class="label">Accepted</div>
+      <div class="val" id="v-accepted">&mdash;</div>
+      <div class="sub">session: <span id="v-session-accepted">&mdash;</span></div>
+      <div class="sub" id="v-shares-per-min" title="Accepted shares per minute, averaged over the last minute">&mdash;</div>
     </div>
     <div class="kpi">
-      <div class="label">Rejects</div>
-      <div class="val" id="v-reject-rate">&mdash;</div>
-      <div class="sub" id="v-stale-rate">Stale: &mdash;</div>
+      <div class="label">Rejected</div>
+      <div class="val" id="v-reject-rate" style="cursor:help;">&mdash;</div>
+      <div class="sub">session: <span id="v-session-rejects" style="cursor:help;">&mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Best share</div>
@@ -855,17 +909,15 @@ tr:last-child td { border-bottom: none; }
       <div class="sub">session: <span id="v-session-best-hashrate">&mdash;</span></div>
     </div>
     <div class="kpi">
-      <div class="label">Pool uptime</div>
-      <div class="val" id="v-uptime">&mdash;</div>
-      <div class="sub">found blocks survive restarts</div>
+      <div class="label">Miners</div>
+      <div class="val" id="v-miners">&mdash;</div>
+      <div class="sub"><span id="v-workers-online">online: &mdash;</span> &middot; <span id="v-workers-degraded">degraded: &mdash;</span></div>
+      <div class="sub" id="v-workers-offline">offline: &mdash;</div>
     </div>
     <div class="kpi">
-      <div class="label">Last block found</div>
-      <div class="val" id="v-last-block-worker">&mdash;</div>
-      <div class="sub trunc" id="v-last-block-payout" title="Payout address encoded in the found block">&mdash;</div>
-      <div class="sub" id="v-last-block-time">&mdash;</div>
-      <div class="sub" id="v-last-block-status" title="A block is only final once it is buried under the configured number of confirmations; until then a reorg can still take it away">&mdash;</div>
-      <div class="sub trunc" id="v-last-block-hash" title="Hash of the last block this pool found">&mdash;</div>
+      <div class="label">Pool difficulty</div>
+      <div class="val" id="v-pool-diff" title="Accepted share work since the pool's last found block, as a share of the current network difficulty. 100% is one expected block's worth of work.">&mdash;</div>
+      <div class="sub" id="v-pool-diff-work" title="Accepted share difficulty accumulated since the last found block; finding a block starts it over">work: &mdash;</div>
     </div>
   </div>
 
@@ -882,10 +934,20 @@ tr:last-child td { border-bottom: none; }
           <button type="button" class="timeframe-btn" data-window="180d">180d</button>
           <button type="button" class="timeframe-btn" data-window="all">All</button>
         </div>
-        <button id="chart-toggle" title="Hide or show the hashrate chart">Hide</button>
+        <button id="chart-toggle" class="panel-toggle" title="Hide or show the hashrate chart"><span class="panel-toggle-label">Hide</span></button>
       </div>
     </div>
     <div id="hashrate-chart"></div>
+  </div>
+
+  <div class="panel" id="sharerate-panel">
+    <div class="panel-head">
+      <div class="panel-title">Shares per minute <span title="Accepted shares per minute, averaged over the last minute; long ranges use time-bucket averages" style="cursor:help;">&#9432;</span></div>
+      <div class="panel-controls">
+        <button id="sharerate-chart-toggle" class="panel-toggle" title="Hide or show the share rate chart"><span class="panel-toggle-label">Hide</span></button>
+      </div>
+    </div>
+    <div id="sharerate-chart"></div>
   </div>
 </section>
 
@@ -898,17 +960,17 @@ tr:last-child td { border-bottom: none; }
         <th>Worker</th>
         <th class="col-led">Status</th>
         <th>Mode</th>
-        <th>Vardiff</th>
-        <th>Hashrate (1m)</th>
-        <th>Hashrate (5m)</th>
-        <th>Hashrate (10m)</th>
-        <th>Hashrate (1h)</th>
-        <th>Hashrate (6h)</th>
-        <th>Hashrate (24h)</th>
-        <th>Accepted</th>
-        <th>Rejected</th>
-        <th>Best Share</th>
-        <th>Last Share</th>
+        <th>Diff</th>
+        <th class="col-rate" title="1-minute average hashrate" aria-label="1-minute average hashrate">1m Avg</th>
+        <th class="col-rate" title="5-minute average hashrate" aria-label="5-minute average hashrate">5m Avg</th>
+        <th class="col-rate" title="10-minute average hashrate" aria-label="10-minute average hashrate">10m Avg</th>
+        <th class="col-rate" title="1-hour average hashrate" aria-label="1-hour average hashrate">1h Avg</th>
+        <th class="col-rate" title="6-hour average hashrate" aria-label="6-hour average hashrate">6h Avg</th>
+        <th class="col-rate" title="24-hour average hashrate" aria-label="24-hour average hashrate">24h Avg</th>
+        <th class="col-count" title="Accepted shares" aria-label="Accepted shares">Acc</th>
+        <th class="col-count" title="Rejected shares" aria-label="Rejected shares">Rej</th>
+        <th>Best</th>
+        <th>Last</th>
         <th>Uptime</th>
       </tr>
     </thead>
@@ -1028,8 +1090,21 @@ function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+// ── Chart range ──────────────────────────────────────────────────────────────
+// Persisted like the theme choice, so a reload keeps the range you were looking
+// at instead of snapping back to 1h. Validated against the allowlist on read:
+// the server already falls back to 1h for an unknown `window=`, but the button
+// highlight is driven off this value and would have nothing to light up.
 const DEFAULT_WINDOW = '1h';
-let selectedWindow = DEFAULT_WINDOW;
+const WINDOW_KEY = 'btcpool-chart-window';
+const WINDOWS = ['1h', '6h', '24h', '1w', '30d', '180d', 'all'];
+function storedWindow() {
+  try {
+    const w = localStorage.getItem(WINDOW_KEY);
+    return WINDOWS.includes(w) ? w : DEFAULT_WINDOW;
+  } catch (_) { return DEFAULT_WINDOW; }
+}
+let selectedWindow = storedWindow();
 let lastBlockHeight = 0;
 // Degraded detection is *relative to each worker's own baseline*, not an absolute
 // timeout — so low-hashrate / never-submitted / just-connected miners (whose
@@ -1084,18 +1159,64 @@ function updateConnLed() {
   }
 }
 
-const myChart = echarts.init(document.getElementById('hashrate-chart'), null, { renderer: 'canvas' });
+// ── Chart panels ─────────────────────────────────────────────────────────────
+// Two panels — hashrate and shares/min — over one implementation. They differ
+// only in the endpoint they poll, the unit their values carry, and where their
+// preferences are stored. Both are driven by the single range selector, so they
+// always plot the same x axis and can be read against each other.
+const LEGEND_SERIES = ['1m', '5m', '10m', '1h', '6h', '24h'];
 
-// Last option object handed to the chart, kept so a resize can recompute the
-// width-dependent bits without refetching.
-let chartOptions = null;
+// The server sends a default show/hide map with every poll; this is what makes a
+// user's toggles outlive a reload. Returns null when nothing usable is stored,
+// matching panelLegend()'s contract, so callers fall through to that server
+// default. Unknown keys are dropped: a renamed series must not resurrect a stale
+// entry that no longer maps to a line.
+function storedLegend(key) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(key));
+    if (!raw || typeof raw !== 'object') return null;
+    const out = {};
+    LEGEND_SERIES.forEach(name => { if (typeof raw[name] === 'boolean') out[name] = raw[name]; });
+    return Object.keys(out).length ? out : null;
+  } catch (_) { return null; }
+}
 
-// Anything about the chart that depends on how wide it actually rendered. The
+function ratePanel(cfg) {
+  const panel = Object.assign({
+    chart: echarts.init(document.getElementById(cfg.canvasId), null, { renderer: 'canvas' }),
+    // Last option object handed to the chart, kept so a resize can recompute
+    // the width-dependent bits without refetching.
+    options: null
+  }, cfg);
+  // Remember which series the user toggled. Registered once — instance listeners
+  // survive the notMerge setOption each poll performs — and safe against a loop,
+  // because this event fires on user interaction only, never on the programmatic
+  // `legend.selected` that loadChart re-applies.
+  panel.chart.on('legendselectchanged', event => {
+    try { localStorage.setItem(panel.legendKey, JSON.stringify(event.selected)); } catch (_) {}
+  });
+  document.getElementById(cfg.toggleId).addEventListener('click', () => {
+    applyPanelCollapsed(panel, !panelCollapsed(panel));
+  });
+  return panel;
+}
+
+const hashratePanel = ratePanel({
+  canvasId: 'hashrate-chart', toggleId: 'chart-toggle', endpoint: '/chart',
+  legendKey: 'btcpool-chart-legend', collapsedKey: 'chartCollapsed', fmt: fmtHr
+});
+const sharePanel = ratePanel({
+  canvasId: 'sharerate-chart', toggleId: 'sharerate-chart-toggle', endpoint: '/share-chart',
+  legendKey: 'btcpool-share-legend', collapsedKey: 'shareChartCollapsed', fmt: fmtSpm
+});
+const PANELS = [hashratePanel, sharePanel];
+
+// Anything about a chart that depends on how wide it actually rendered. The
 // server can't know the viewport, so it ships sensible defaults and these get
 // patched in on top — on every load, on resize, and when the panel is expanded.
-function applyResponsiveLayout(options) {
+function applyResponsiveLayout(panel, options) {
   if (!options) return options;
-  const width = myChart.getWidth() || 0;
+  const width = panel.chart.getWidth() || 0;
 
   // Roughly one x-axis label per 90px, which fits 'HH:mm' at fontSize 10 with
   // clear air between. A phone lands on 4; a wide desktop caps at 10.
@@ -1118,7 +1239,7 @@ function applyResponsiveLayout(options) {
   if (yAxis) {
     const digits = width > 0 && width < 420 ? 0 : 2;
     yAxis.axisLabel = Object.assign(yAxis.axisLabel || {}, {
-      formatter: v => fmtHr(v, true, digits)
+      formatter: v => panel.fmt(v, true, digits)
     });
   }
   return options;
@@ -1131,19 +1252,22 @@ window.addEventListener('resize', () => {
   // makes the canvas follow it — ECharts does not track CSS size on its own.
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
-    myChart.resize();
-    if (!chartOptions) return;
-    // Carry the user's current legend toggles across the merge, or this would
-    // re-apply whichever ones were live when the chart was last fetched.
-    const shown = chartLegendSelected();
-    if (shown && chartOptions.legend) chartOptions.legend.selected = shown;
-    myChart.setOption(applyResponsiveLayout(chartOptions));
+    PANELS.forEach(panel => {
+      panel.chart.resize();
+      if (!panel.options) return;
+      // Carry the user's current legend toggles across the merge, or this would
+      // re-apply whichever ones were live when the chart was last fetched.
+      const shown = panelLegend(panel);
+      if (shown && panel.options.legend) panel.options.legend.selected = shown;
+      panel.chart.setOption(applyResponsiveLayout(panel, panel.options));
+    });
   }, 150);
 });
 
 document.getElementById('theme-toggle').addEventListener('click', () => {
   applyTheme(currentTheme() === 'light' ? 'carbon' : 'light');
-  if (!chartCollapsed()) loadChart(selectedWindow); // re-skin chart from the new theme's CSS vars
+  // Re-skin both charts from the new theme's CSS vars.
+  PANELS.forEach(panel => { if (!panelCollapsed(panel)) loadChart(panel, selectedWindow); });
 });
 
 // ── Mobile nav drawer ────────────────────────────────────────────────────────
@@ -1159,27 +1283,26 @@ document.getElementById('rail-nav').addEventListener('click', () => {
   burgerEl.setAttribute('aria-expanded', 'false');
 });
 
-// ── Chart collapse toggle ────────────────────────────────────────────────────
-// Persisted like the theme choice; while collapsed the periodic chart fetch
+// ── Chart collapse toggles ───────────────────────────────────────────────────
+// Persisted per panel like the theme choice; while collapsed the periodic fetch
 // is skipped, and expanding re-fetches so the chart is current immediately.
-const CHART_COLLAPSED_KEY = 'chartCollapsed';
-function chartCollapsed() {
-  try { return localStorage.getItem(CHART_COLLAPSED_KEY) === '1'; } catch (_) { return false; }
+function panelCollapsed(panel) {
+  try { return localStorage.getItem(panel.collapsedKey) === '1'; } catch (_) { return false; }
 }
-function applyChartCollapsed(collapsed) {
-  try { localStorage.setItem(CHART_COLLAPSED_KEY, collapsed ? '1' : '0'); } catch (_) {}
-  document.getElementById('hashrate-chart').style.display = collapsed ? 'none' : '';
-  document.getElementById('chart-window-label').style.display = collapsed ? 'none' : '';
-  document.getElementById('chart-toggle').textContent = collapsed ? 'Show' : 'Hide';
+function applyPanelCollapsed(panel, collapsed) {
+  try { localStorage.setItem(panel.collapsedKey, collapsed ? '1' : '0'); } catch (_) {}
+  document.getElementById(panel.canvasId).style.display = collapsed ? 'none' : '';
+  document.getElementById(panel.toggleId).querySelector('.panel-toggle-label').textContent = collapsed ? 'Show' : 'Hide';
+  // The one range selector drives both charts, so it is only meaningless once
+  // there is nothing left for it to range over.
+  document.getElementById('chart-window-label').style.display =
+    PANELS.every(panelCollapsed) ? 'none' : '';
   if (!collapsed) {
-    myChart.resize(); // container was display:none; ECharts needs a re-measure
+    panel.chart.resize(); // container was display:none; ECharts needs a re-measure
     // loadChart re-runs applyResponsiveLayout against the width we just measured.
-    loadChart(selectedWindow);
+    loadChart(panel, selectedWindow);
   }
 }
-document.getElementById('chart-toggle').addEventListener('click', () => {
-  applyChartCollapsed(!chartCollapsed());
-});
 
 // ── Formatters ───────────────────────────────────────────────────────────────
 // `digits` defaults to 2; the chart's y-axis drops to 0 on narrow screens so a
@@ -1194,6 +1317,15 @@ function fmtHr(hps, short, digits) {
   if (hps >= 1e6)  return (hps / 1e6 ).toFixed(d) + (short ? ' M'  : ' MH/s');
   if (hps >= 1e3)  return (hps / 1e3 ).toFixed(d) + (short ? ' K'  : ' KH/s');
   return hps.toFixed(0) + (short ? ''    : ' H/s');
+}
+
+// Share rate reads as a whole count: a fractional share does not exist, and the
+// decaying averages behind it carry more noise than a decimal place would
+// convey. `digits` is unused — it is part of the shared panel formatter
+// contract (see fmtHr), which the chart calls generically for both units.
+function fmtSpm(spm, short, digits) {
+  if (!isFinite(spm)) return short ? '—' : '— shares/min';
+  return Math.round(spm).toLocaleString() + (short ? '' : ' shares/min');
 }
 
 function fmtDiff(d) {
@@ -1240,9 +1372,12 @@ function fmtUptime(secs) {
   return s + 's';
 }
 
-function fmtTimestamp(ts) {
-  if (!ts || ts === 0) return '—';
-  return new Date(ts * 1000).toLocaleString();
+function fmtPct(pct) {
+  if (!isFinite(pct) || pct <= 0) return '0%';
+  if (pct >= 100) return pct.toFixed(0) + '%';
+  if (pct >= 1) return pct.toFixed(2) + '%';
+  if (pct >= 0.0001) return pct.toFixed(4) + '%';
+  return '<0.0001%';
 }
 
 // ── Chart ────────────────────────────────────────────────────────────────────
@@ -1250,15 +1385,15 @@ function fmtTimestamp(ts) {
 // Which series the user currently has toggled on, or null before the chart has
 // ever been drawn. Read back off the live chart so legend clicks survive the
 // notMerge setOption that each poll performs.
-function chartLegendSelected() {
-  const opt = myChart.getOption();
+function panelLegend(panel) {
+  const opt = panel.chart.getOption();
   if (!opt || !opt.legend || !opt.legend[0]) return null;
   return opt.legend[0].selected || null;
 }
 
-async function loadChart(window) {
+async function loadChart(panel, window) {
   try {
-    const resp = await fetch('/chart?window=' + window);
+    const resp = await fetch(panel.endpoint + '?window=' + window);
     if (!resp.ok) return;
     const options = await resp.json();
     // Skin the server-built option object from the active theme's CSS vars,
@@ -1311,8 +1446,10 @@ async function loadChart(window) {
     if (options.legend) {
       options.legend.textStyle = { color: muted, fontSize: 11 };
       // The server sends a default show/hide map on every poll. Without this
-      // the chart would undo the user's legend clicks once per refresh.
-      const shown = chartLegendSelected();
+      // the chart would undo the user's legend clicks once per refresh. The
+      // live chart wins where it exists; on the first load it has not been
+      // drawn yet, so the persisted map from a previous visit applies instead.
+      const shown = panelLegend(panel) || storedLegend(panel.legendKey);
       if (shown) options.legend.selected = shown;
     }
     if (options.tooltip) {
@@ -1330,12 +1467,12 @@ async function loadChart(window) {
         const rows = params
           .filter(p => Array.isArray(p.value) && p.value[1] !== null && p.value[1] !== undefined)
           .sort((a, b) => order.indexOf(a.seriesName) - order.indexOf(b.seriesName))
-          .map(p => '<span style="color:' + (palette[p.seriesName] || p.color) + '">&#9632;</span> ' + p.seriesName + ': ' + fmtHr(p.value[1], false));
+          .map(p => '<span style="color:' + (palette[p.seriesName] || p.color) + '">&#9632;</span> ' + p.seriesName + ': ' + panel.fmt(p.value[1], false));
         return date + '<br/>' + rows.join('<br/>');
       };
     }
-    chartOptions = applyResponsiveLayout(options);
-    myChart.setOption(chartOptions, true);
+    panel.options = applyResponsiveLayout(panel, options);
+    panel.chart.setOption(panel.options, true);
   } catch (e) {
     console.error('Chart fetch error:', e);
   }
@@ -1378,23 +1515,11 @@ async function refresh() {
       const btc = d.current_coinbase_value / 1e8;
       document.getElementById('v-block-reward').textContent = 'Reward: ' + btc.toFixed(8) + ' BTC';
     }
-    document.getElementById('v-last-block-worker').textContent = d.last_block_worker || '—';
-    document.getElementById('v-last-block-payout').textContent = d.last_block_payout || '—';
-    document.getElementById('v-last-block-hash').textContent = d.last_block_hash || '—';
-    document.getElementById('v-last-block-time').textContent = fmtTimestamp(d.last_block_ts);
-    // The submitblock verdict is provisional until the confirmation pass
-    // settles it, so say which it is rather than letting the card imply the
-    // block is safe.
-    const lastBlockStatus = document.getElementById('v-last-block-status');
-    const statusText = {
-      pending: 'awaiting confirmation',
-      confirmed: 'confirmed',
-      orphaned: 'reorged out — earned nothing',
-      abandoned: 'unconfirmed: node no longer has it',
-    };
-    lastBlockStatus.textContent = d.last_block_ts ? (statusText[d.last_block_status] || d.last_block_status) : '—';
-    lastBlockStatus.classList.toggle('ok', d.last_block_status === 'confirmed');
-    lastBlockStatus.classList.toggle('bad', d.last_block_status === 'orphaned' || d.last_block_status === 'abandoned');
+    const roundWork = d.pool_difficulty || 0;
+    const netDiffForPool = d.network_difficulty || 0;
+    document.getElementById('v-pool-diff').textContent =
+      netDiffForPool > 0 ? fmtPct(100 * roundWork / netDiffForPool) : '—';
+    document.getElementById('v-pool-diff-work').textContent = 'work: ' + fmtDiff(roundWork);
     document.getElementById('v-best-share').textContent = fmtDiff(d.best_share_difficulty);
     document.getElementById('v-session-best-share').textContent = fmtDiff(d.session_best_share_difficulty);
     document.getElementById('v-best-over-network').textContent = d.best_share_difficulty >= Math.ceil(d.network_difficulty) ? 'YES' : 'no';
@@ -1439,28 +1564,30 @@ async function refresh() {
     }
     document.getElementById('v-session-best-hashrate').textContent = fmtHr(d.session_best_hashrate_hps, false);
     document.getElementById('v-best-hashrate').textContent = fmtHr(d.best_hashrate_hps, false);
-    document.getElementById('v-uptime').textContent = fmtUptime(d.uptime_secs);
     document.getElementById('server-uptime').textContent = 'Uptime ' + fmtUptime(d.uptime_secs);
 
     const total = d.shares_accepted + d.shares_rejected;
-    const rejectPct = total > 0 ? (d.shares_rejected / total * 100).toFixed(1) : '0.0';
-    const staleTotal = Array.isArray(d.worker_states) ? d.worker_states.reduce((sum, w) => sum + (w.shares_stale || 0), 0) : 0;
-    const stalePct = total > 0 ? (staleTotal / total * 100).toFixed(1) : '0.0';
-    const reasonTotals = {};
-    (Array.isArray(d.worker_states) ? d.worker_states : []).forEach(w => {
-      Object.entries(w.reject_reasons || {}).forEach(([r, n]) => {
-        reasonTotals[r] = (reasonTotals[r] || 0) + n;
-      });
-    });
-    const otherReasons = Object.entries(reasonTotals)
-      .filter(([r, n]) => r !== 'stale' && n > 0)
-      .sort((a, b) => b[1] - a[1])
-      .map(([r, n]) => `${rejectLabel(r)}: ${n.toLocaleString()}`)
-      .join(' · ');
+    const rejectPct = total > 0 ? (d.shares_rejected / total * 100).toFixed(2) : '0.00';
 
-    document.getElementById('v-reject-rate').textContent = `${d.shares_rejected.toLocaleString()} (${rejectPct}%)`;
-    document.getElementById('v-stale-rate').textContent =
-      `Stale: ${staleTotal.toLocaleString()} (${stalePct}%)` + (otherReasons ? ` · ${otherReasons}` : '');
+    // Since-last-block totals lead (the pool's whole life until the first
+    // win), this process's counts trail — the same round/session split as the
+    // best-share and best-hashrate cards. Each reject figure carries its own
+    // scope's per-reason breakdown as a tooltip.
+    const lifeAcc = d.lifetime_shares_accepted || 0;
+    const lifeRej = d.lifetime_shares_rejected || 0;
+    const lifeTotal = lifeAcc + lifeRej;
+    const lifePct = lifeTotal > 0 ? (lifeRej / lifeTotal * 100).toFixed(2) : '0.00';
+    document.getElementById('v-accepted').textContent = lifeAcc.toLocaleString();
+    document.getElementById('v-session-accepted').textContent = d.shares_accepted.toLocaleString();
+    // Current throughput under the two totals: the same 1m window the chart's
+    // fastest line plots.
+    document.getElementById('v-shares-per-min').textContent = fmtSpm(d.shares_per_minute_1m, false);
+    const rejectEl = document.getElementById('v-reject-rate');
+    rejectEl.textContent = `${lifeRej.toLocaleString()} (${lifePct}%)`;
+    rejectEl.title = reasonTooltip('rejects since last block', d.lifetime_reject_reasons);
+    const sessionRejectEl = document.getElementById('v-session-rejects');
+    sessionRejectEl.textContent = `${d.shares_rejected.toLocaleString()} (${rejectPct}%)`;
+    sessionRejectEl.title = reasonTooltip('session rejects', d.reject_reasons);
 
     const workers = Array.isArray(d.worker_states) ? d.worker_states : [];
     const onlineCount = workers.filter(w => w.online).length;
@@ -1468,37 +1595,39 @@ async function refresh() {
     const nowSecKpi = Math.floor(Date.now() / 1000);
     const degradedCount = workers.filter(w => isDegraded(w, nowSecKpi)).length;
 
-    document.getElementById('v-workers-online').textContent = 'Online: ' + onlineCount;
-    document.getElementById('v-workers-offline').textContent = 'Offline: ' + offlineCount;
-    document.getElementById('v-workers-degraded').textContent = 'Degraded: ' + degradedCount;
+    document.getElementById('v-workers-online').textContent = 'online: ' + onlineCount;
+    document.getElementById('v-workers-offline').textContent = 'offline: ' + offlineCount;
+    document.getElementById('v-workers-degraded').textContent = 'degraded: ' + degradedCount;
 
     // Workers table
     const tbody = document.getElementById('workers-tbody');
     if (workers.length === 0) {
       tbody.innerHTML = '<tr><td colspan="15" class="empty-row">No connected workers</td></tr>';
     } else {
-      tbody.innerHTML = workers
-        .sort((a, b) => b.hashrate_60s_hps - a.hashrate_60s_hps)
+      const workerName = worker => worker.worker.includes('.') ? worker.worker.split('.')[1] : worker.worker;
+      tbody.innerHTML = [...workers]
+        .sort((a, b) => workerName(a).localeCompare(workerName(b), undefined, { numeric: true, sensitivity: 'base' })
+          || a.worker.localeCompare(b.worker))
         .map(w => {
-          const workerName = w.worker.includes('.') ? w.worker.split('.')[1] : w.worker;
+          const name = workerName(w);
           const nowSec = Math.floor(Date.now() / 1000);
           const lastShareAgo = w.last_submit_ts > 0 ? fmtUptime(nowSec - w.last_submit_ts) : '—';
           const uptime = w.connected_ts > 0 ? fmtUptime(nowSec - w.connected_ts) : '—';
           const mode = (w.protocol || 'sv1').toUpperCase();
           const led = workerLed(w, nowSec);
           return `<tr>
-            <td>${escHtml(workerName)}</td>
+            <td>${escHtml(name)}</td>
             <td class="col-led"><span class="led ${led.cls}" title="${led.title}"></span></td>
             <td>${mode}</td>
             <td>${fmtDiff(w.current_vardiff)}</td>
-            <td>${fmtHr(w.hashrate_60s_hps, false)}</td>
-            <td>${fmtHr(w.hashrate_5m_hps, false)}</td>
-            <td>${fmtHr(w.hashrate_10m_hps, false)}</td>
-            <td>${fmtHr(w.hashrate_1h_hps, false)}</td>
-            <td>${fmtHr(w.hashrate_6h_hps, false)}</td>
-            <td>${fmtHr(w.hashrate_24h_hps, false)}</td>
-            <td>${w.shares_accepted.toLocaleString()}</td>
-            <td title="${rejectBreakdown(w)}">${w.shares_rejected.toLocaleString()}</td>
+            <td class="col-rate">${fmtHr(w.hashrate_60s_hps, false)}</td>
+            <td class="col-rate">${fmtHr(w.hashrate_5m_hps, false)}</td>
+            <td class="col-rate">${fmtHr(w.hashrate_10m_hps, false)}</td>
+            <td class="col-rate">${fmtHr(w.hashrate_1h_hps, false)}</td>
+            <td class="col-rate">${fmtHr(w.hashrate_6h_hps, false)}</td>
+            <td class="col-rate">${fmtHr(w.hashrate_24h_hps, false)}</td>
+            <td class="col-count">${w.shares_accepted.toLocaleString()}</td>
+            <td class="col-count" title="${rejectBreakdown(w)}">${w.shares_rejected.toLocaleString()}</td>
             <td>${fmtDiff(w.best_share_difficulty)}</td>
             <td>${lastShareAgo}</td>
             <td>${uptime}</td>
@@ -1516,16 +1645,26 @@ async function refresh() {
 }
 
 const REJECT_LABELS = {
-  stale: 'Stale',
-  duplicate: 'Duplicate',
-  low_difficulty: 'Low diff',
-  job_not_found: 'Unknown job',
-  bad_extranonce: 'Bad extranonce',
-  invalid: 'Invalid',
+  stale: 'stale',
+  duplicate: 'duplicate',
+  low_difficulty: 'low diff',
+  job_not_found: 'unknown job',
+  bad_extranonce: 'bad extranonce',
+  invalid: 'invalid',
+  rate_limited: 'rate limited',
+  unauthorized: 'unauthorized',
 };
 
 function rejectLabel(reason) {
   return REJECT_LABELS[reason] || reason;
+}
+
+function reasonTooltip(label, reasons) {
+  const parts = Object.entries(reasons || {})
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([r, n]) => `${rejectLabel(r)}: ${n.toLocaleString()}`);
+  return parts.length ? [label, ...parts].join('\n') : `no ${label}`;
 }
 
 function rejectBreakdown(w) {
@@ -1579,15 +1718,23 @@ function updateProbability(ourHps, netHps) {
 
 function attachTimeframeSelector() {
   const group = document.getElementById('chart-window-label');
+  const highlight = () => group.querySelectorAll('.timeframe-btn').forEach(item => {
+    item.classList.toggle('active', item.dataset.window === selectedWindow);
+  });
   group.addEventListener('click', event => {
     const button = event.target.closest('.timeframe-btn');
     if (!button) return;
     selectedWindow = button.dataset.window;
-    group.querySelectorAll('.timeframe-btn').forEach(item => {
-      item.classList.toggle('active', item === button);
-    });
-    loadChart(selectedWindow);
+    try { localStorage.setItem(WINDOW_KEY, selectedWindow); } catch (_) {}
+    highlight();
+    // Both panels, so they never disagree about what range is on screen.
+    PANELS.forEach(panel => { if (!panelCollapsed(panel)) loadChart(panel, selectedWindow); });
   });
+  // The markup hardcodes `active` on 1h so a no-JS load still reads sensibly.
+  // Correct it here — unconditionally, not just when the chart is visible, or
+  // expanding a collapsed panel would show a highlight that disagrees with the
+  // range actually plotted.
+  highlight();
 }
 
 function escHtml(s) {
@@ -1724,11 +1871,10 @@ wireCopy('connect-url', 'connect-copy');
 wireCopy('connect-authority', 'connect-authority-copy');
 
 attachTimeframeSelector();
-if (chartCollapsed()) {
-  applyChartCollapsed(true);
-} else {
-  loadChart(DEFAULT_WINDOW);
-}
+PANELS.forEach(panel => {
+  if (panelCollapsed(panel)) applyPanelCollapsed(panel, true);
+  else loadChart(panel, selectedWindow);
+});
 updateConnLed();
 refresh();
 fetchBtcPrice();
@@ -1736,9 +1882,11 @@ setInterval(refresh, 10000);
 // Re-evaluate the connectivity LED between refreshes so it goes stale on its
 // own even if refresh() stops landing (server down, tab throttled, etc.).
 setInterval(updateConnLed, 5000);
-// Matches the pool's snapshot interval, so the chart gains a point as soon as
+// Matches the pool's snapshot interval, so the charts gain a point as soon as
 // one exists rather than up to a minute later.
-setInterval(() => { if (!chartCollapsed()) loadChart(selectedWindow); }, 10000);
+setInterval(() => {
+  PANELS.forEach(panel => { if (!panelCollapsed(panel)) loadChart(panel, selectedWindow); });
+}, 10000);
 setInterval(fetchBtcPrice, 60000);
 </script>
 </body>
@@ -1792,10 +1940,83 @@ mod tests {
         assert_eq!(chart_window(Some("unknown")), chart_window(None));
         assert!(DASHBOARD_HTML.contains("const DEFAULT_WINDOW = '1h'"));
 
-        // "1m" and "6m" used to alias 30d/180d, colliding with the 1m series
-        // name. They must fall through to the default now.
+        // "1m" and "6m" must fall through to the default, not alias 30d/180d —
+        // that would collide with the 1m series name.
         assert_eq!(chart_window(Some("1m")), chart_window(None));
         assert_eq!(chart_window(Some("6m")), chart_window(None));
+    }
+
+    /// Pull a `const NAME = ['a', 'b'];` string array out of the embedded JS.
+    /// Borrows from `DASHBOARD_HTML`, which is a `const &str` and so `'static`.
+    fn js_string_array(name: &str) -> Vec<&'static str> {
+        let decl = format!("const {name} = [");
+        let start = DASHBOARD_HTML
+            .find(&decl)
+            .unwrap_or_else(|| panic!("{name} declaration not found in the embedded JS"))
+            + decl.len();
+        let rest = &DASHBOARD_HTML[start..];
+        let end = rest.find(']').expect("unterminated array literal");
+        rest[..end]
+            .split(',')
+            .map(|item| item.trim().trim_matches('\''))
+            .filter(|item| !item.is_empty())
+            .collect()
+    }
+
+    /// The range buttons, the JS allowlist that gates what gets persisted, and
+    /// the server's range table are three hand-maintained lists of the same
+    /// thing. Adding a range to one and not the others fails quietly: the new
+    /// button silently serves 1h data, or works but never survives a reload.
+    #[test]
+    fn chart_ranges_agree_between_markup_js_and_server() {
+        let buttons: Vec<&str> = DASHBOARD_HTML
+            .match_indices("data-window=\"")
+            .filter_map(|(idx, pat)| {
+                let rest = &DASHBOARD_HTML[idx + pat.len()..];
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect();
+        assert!(
+            buttons.len() > 3,
+            "data-window scrape found too few: {buttons:?}"
+        );
+        assert_eq!(
+            buttons,
+            js_string_array("WINDOWS"),
+            "range buttons and the JS persistence allowlist have drifted apart"
+        );
+
+        // Every button must reach a distinct server-side range. A typo'd or
+        // unregistered value falls through `chart_window`'s `_` arm to 1h,
+        // which renders as a working button that plots the wrong data.
+        let mut seen: Vec<(&str, ChartWindow)> = Vec::new();
+        for &name in &buttons {
+            let window = chart_window(Some(name));
+            if let Some((other, _)) = seen.iter().find(|(_, w)| *w == window) {
+                panic!("range '{name}' resolves to the same window as '{other}'");
+            }
+            seen.push((name, window));
+        }
+    }
+
+    /// The legend's persistence allowlist drops keys it does not recognise, so
+    /// a series the server draws but the JS list omits would toggle fine and
+    /// then forget the toggle on reload. One allowlist covers both panels,
+    /// which only holds because they plot the same six windows.
+    #[test]
+    fn legend_series_agree_between_js_and_server() {
+        let option = build_chart_option(&[]);
+        let served: Vec<&str> = option["legend"]["data"]
+            .as_array()
+            .expect("legend.data")
+            .iter()
+            .map(|name| name.as_str().expect("series name"))
+            .collect();
+        assert_eq!(
+            served,
+            js_string_array("LEGEND_SERIES"),
+            "legend series and the JS persistence allowlist have drifted apart"
+        );
     }
 
     /// The legend lists the windows shortest-first while the series are drawn
@@ -1891,19 +2112,83 @@ mod tests {
         // Density and the wrapped-legend grid offset are recomputed from the
         // measured width, not baked in server-side.
         assert!(DASHBOARD_HTML.contains("xAxis.splitNumber = Math.min"));
-        assert!(DASHBOARD_HTML.contains("function applyResponsiveLayout(options)"));
+        assert!(DASHBOARD_HTML.contains("function applyResponsiveLayout(panel, options)"));
 
-        // A bare `myChart.resize()` on the resize event would leave the label
+        // A bare `panel.chart.resize()` on the resize event would leave the label
         // density — and the viewport-relative height — stale until the next poll.
         assert!(
-            DASHBOARD_HTML.contains("myChart.setOption(applyResponsiveLayout(chartOptions));"),
+            DASHBOARD_HTML
+                .contains("panel.chart.setOption(applyResponsiveLayout(panel, panel.options));"),
             "resize must re-run applyResponsiveLayout, not just resize the canvas"
         );
 
         // The height only follows the viewport because of that resize path.
-        assert!(
-            DASHBOARD_HTML.contains("#hashrate-chart { height: clamp("),
-            "chart height must be viewport-relative, not a fixed pixel value"
-        );
+        for canvas in ["#hashrate-chart", "#sharerate-chart"] {
+            assert!(
+                DASHBOARD_HTML.contains(&format!("{canvas} {{ height: clamp(")),
+                "{canvas} height must be viewport-relative, not a fixed pixel value"
+            );
+        }
+    }
+
+    /// The two chart panels are one implementation with two configs. Every
+    /// per-panel key has to actually differ, or the share chart would overwrite
+    /// the hashrate chart's stored legend and collapse state.
+    #[test]
+    fn chart_panels_do_not_share_state_keys() {
+        // The factory is declared `ratePanel(cfg)`, so only its call sites
+        // carry an inline config object.
+        let panels = DASHBOARD_HTML.matches("ratePanel({").count();
+        assert_eq!(panels, 2, "expected exactly two chart panels");
+
+        for key in [
+            "'btcpool-chart-legend'",
+            "'btcpool-share-legend'",
+            "'chartCollapsed'",
+            "'shareChartCollapsed'",
+            "'hashrate-chart'",
+            "'sharerate-chart'",
+            "'/chart'",
+            "'/share-chart'",
+        ] {
+            assert_eq!(
+                DASHBOARD_HTML.matches(key).count(),
+                1,
+                "{key} must belong to exactly one panel"
+            );
+        }
+
+        // Panel elements are reached through `panel.canvasId`/`panel.toggleId`,
+        // so `all_ids_referenced_by_js_exist_in_markup`'s literal
+        // `getElementById('…')` scrape cannot see them.
+        for id in [
+            "hashrate-chart",
+            "sharerate-chart",
+            "chart-toggle",
+            "sharerate-chart-toggle",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(&format!("id=\"{id}\"")),
+                "panel element {id} is configured but not in the markup"
+            );
+        }
+
+        // Both panels must render through the shared loader, and both endpoints
+        // must be routes the server actually serves.
+        assert!(DASHBOARD_HTML.contains("async function loadChart(panel, window)"));
+        assert!(DASHBOARD_HTML.contains("fetch(panel.endpoint + '?window=' + window)"));
+    }
+
+    /// Shares/min is not a hashrate: formatting it with `fmtHr` would render
+    /// "4" as "4 H/s" on the axis and in the tooltip.
+    #[test]
+    fn share_panel_formats_counts_not_hashes() {
+        assert!(DASHBOARD_HTML.contains("fmt: fmtSpm"));
+        assert!(DASHBOARD_HTML.contains("fmt: fmtHr"));
+        assert!(DASHBOARD_HTML.contains("function fmtSpm(spm, short, digits)"));
+        // The axis and tooltip both go through the panel's formatter rather
+        // than naming one directly.
+        assert!(DASHBOARD_HTML.contains("formatter: v => panel.fmt(v, true, digits)"));
+        assert!(DASHBOARD_HTML.contains("panel.fmt(p.value[1], false)"));
     }
 }

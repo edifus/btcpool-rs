@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 /// Expected hashes behind one difficulty-1 share (2³²).
 pub const NONCES: f64 = 4_294_967_296.0;
 
+/// Scale from the meter's native per-second state to a per-minute reading.
+pub const SECS_PER_MINUTE: f64 = 60.0;
+
 /// Indices into the decayed window arrays.
 pub const W_1M: usize = 0;
 pub const W_5M: usize = 1;
@@ -53,7 +56,7 @@ pub const TICK_SECS: u64 = 2;
 /// Create an exponentially decaying average over `interval`.
 ///
 /// Ported from ckpool's `decay_time()` in `src/libckpool.c`.
-fn decay_time(f: &mut f64, fadd: f64, fsecs: f64, interval: f64) {
+pub(crate) fn decay_time(f: &mut f64, fadd: f64, fsecs: f64, interval: f64) {
     if fsecs <= 0.0 {
         return;
     }
@@ -73,10 +76,21 @@ fn decay_time(f: &mut f64, fadd: f64, fsecs: f64, interval: f64) {
 /// Seconds between two instants, floored so a clock that barely moved (or a
 /// pair of events in the same microsecond) cannot become a denominator.
 /// Ported from ckpool's `sane_tdiff()`.
-fn sane_tdiff(end: Instant, start: Instant) -> f64 {
+pub(crate) fn sane_tdiff(end: Instant, start: Instant) -> f64 {
     end.saturating_duration_since(start)
         .as_secs_f64()
         .max(0.001)
+}
+
+/// Warm-up correction for an average that started at zero.
+///
+/// A [`decay_time`] average fed a constant rate for `age_secs` reads low by
+/// exactly this factor, so dividing by it recovers the true rate long before
+/// the window has filled. Ported from ckpool's `time_bias()` in
+/// `src/stratifier.c`, which uses it to make vardiff usable on a session that
+/// has only been submitting for a few seconds.
+pub(crate) fn time_bias(age_secs: f64, interval: f64) -> f64 {
+    1.0 - 1.0 / (age_secs / interval).min(36.0).exp()
 }
 
 /// Decayed difficulty-share rates over [`WINDOW_SECS`].
@@ -87,6 +101,14 @@ fn sane_tdiff(end: Instant, start: Instant) -> f64 {
 /// source with nothing pending decays it toward zero, so a miner that stops
 /// hashing (or drops the connection entirely) falls off on its own rather than
 /// freezing at its last reading.
+///
+/// Nothing here is specific to difficulty: the state is "units per second" and
+/// the unit is whatever the caller feeds [`Self::add_share`]. `stats` runs two
+/// meters off it — per-session difficulty, read back as H/s through
+/// [`Self::hashrates`], and pool-wide accepted share counts, read back as
+/// shares/min through [`Self::per_minute`]. Each of those readers is paired
+/// with the `restored*` constructor that inverts it, so a checkpoint cannot
+/// come back in the wrong unit.
 #[derive(Debug, Clone)]
 pub struct HashrateDecay {
     dsps: [f64; WINDOW_COUNT],
@@ -114,10 +136,32 @@ impl HashrateDecay {
         hashrates: [f64; WINDOW_COUNT],
         offline_for: Duration,
     ) -> Self {
+        Self::restored_rates(now, hashrates.map(|hps| hps / NONCES), offline_for)
+    }
+
+    /// Restore a checkpointed per-minute rate. Inverse of
+    /// [`Self::per_minute`], the way [`Self::restored`] is of
+    /// [`Self::hashrates`].
+    pub(crate) fn restored_per_minute(
+        now: Instant,
+        per_minute: [f64; WINDOW_COUNT],
+        offline_for: Duration,
+    ) -> Self {
+        Self::restored_rates(now, per_minute.map(|v| v / SECS_PER_MINUTE), offline_for)
+    }
+
+    /// As [`Self::restored`], but for a meter whose unit is not difficulty:
+    /// `rates` are the raw per-second values [`Self::rates`] returned, with no
+    /// scaling.
+    pub(crate) fn restored_rates(
+        now: Instant,
+        rates: [f64; WINDOW_COUNT],
+        offline_for: Duration,
+    ) -> Self {
         let mut decay = Self {
-            dsps: hashrates.map(|hps| {
-                if hps.is_finite() && hps > 0.0 {
-                    hps / NONCES
+            dsps: rates.map(|rate| {
+                if rate.is_finite() && rate > 0.0 {
+                    rate
                 } else {
                     0.0
                 }
@@ -149,8 +193,9 @@ impl HashrateDecay {
         }
     }
 
-    /// Record an accepted share of `diff` assigned difficulty. Cheap: it only
-    /// accumulates, leaving the arithmetic to the next [`Self::tick`].
+    /// Record `diff` units — assigned difficulty for a hashrate meter, or a
+    /// plain share count for a share-rate one. Cheap: it only accumulates,
+    /// leaving the arithmetic to the next [`Self::tick`].
     pub fn add_share(&mut self, diff: f64) {
         if diff.is_finite() && diff > 0.0 {
             self.pending += diff;
@@ -167,13 +212,21 @@ impl HashrateDecay {
         }
     }
 
-    /// Decayed difficulty-shares per second, per window.
-    #[cfg(test)]
-    pub fn dsps(&self) -> [f64; WINDOW_COUNT] {
+    /// Decayed units per second, per window, in whatever unit
+    /// [`Self::add_share`] was fed.
+    pub fn rates(&self) -> [f64; WINDOW_COUNT] {
         self.dsps
     }
 
-    /// Decayed hashrate in H/s, per window.
+    /// Decayed units per minute, per window. What a meter fed plain share
+    /// counts reads out as: at pool scale a per-second figure spends its life
+    /// in the tenths, where the leading digits carry no information.
+    pub fn per_minute(&self) -> [f64; WINDOW_COUNT] {
+        self.dsps.map(|d| d * SECS_PER_MINUTE)
+    }
+
+    /// Decayed hashrate in H/s, per window. Only meaningful for a meter fed
+    /// share difficulties.
     pub fn hashrates(&self) -> [f64; WINDOW_COUNT] {
         self.dsps.map(|d| d * NONCES)
     }
@@ -204,8 +257,8 @@ mod tests {
         now
     }
 
-    /// The property the old sliding-window estimator lacked: the steady-state
-    /// reading equals the true rate regardless of how the samples are spaced.
+    /// The steady-state reading equals the true rate regardless of how the
+    /// samples are spaced.
     #[test]
     fn converges_to_true_rate_at_any_sample_spacing() {
         for step in [1_u64, 2, 60] {
@@ -225,10 +278,9 @@ mod tests {
         }
     }
 
-    /// Regression test for the 949 PH/s reading a 2.7 TH/s Bitaxe produced: a
-    /// lone share folded in with a near-zero elapsed time. One share of
-    /// difficulty 4700 can lift the 1m window by at most 4700/60 × 2³²
-    /// ≈ 336 GH/s no matter how small the interval is.
+    /// A lone share folded in with a near-zero elapsed time must not spike the
+    /// average: one share of difficulty 4700 can lift the 1m window by at most
+    /// 4700/60 × 2³² ≈ 336 GH/s no matter how small the interval is.
     #[test]
     fn single_share_cannot_spike_the_average() {
         let start = Instant::now();
@@ -281,8 +333,7 @@ mod tests {
     }
 
     /// A miner that stops submitting decays instead of freezing at its last
-    /// reading — this is what the old code got wrong for *connected* workers,
-    /// which were exempted from decay entirely.
+    /// reading, whether or not the session is still connected.
     #[test]
     fn idle_source_decays_toward_zero() {
         let start = Instant::now();
@@ -324,7 +375,7 @@ mod tests {
         let start = Instant::now();
         let mut decay = HashrateDecay::new(start);
         feed(&mut decay, start, 1.0 * TH, 3_600, 1);
-        let dsps = decay.dsps();
+        let dsps = decay.rates();
         let hr = decay.hashrates();
         for i in 0..WINDOW_COUNT {
             assert!((hr[i] - dsps[i] * NONCES).abs() < 1.0);
@@ -348,6 +399,33 @@ mod tests {
         for (actual, expected) in restored.hashrates().into_iter().zip(ticked.hashrates()) {
             let error = (actual - expected).abs() / expected;
             assert!(error < 1e-12, "restored value differed by {error:e}");
+        }
+    }
+
+    /// Each reader must round-trip through its own `restored*` constructor and
+    /// no other. Mixing the pairs is the whole failure mode: a share rate
+    /// restored through `restored` comes back 2³² times too small, and one
+    /// restored through `restored_rates` comes back 60 times too small.
+    #[test]
+    fn each_unit_round_trips_through_its_own_constructor() {
+        let start = Instant::now();
+        let saved = [4.0; WINDOW_COUNT];
+
+        let raw = HashrateDecay::restored_rates(start, saved, Duration::ZERO);
+        assert_eq!(raw.rates(), saved);
+
+        let scaled = HashrateDecay::restored(start, saved.map(|r| r * NONCES), Duration::ZERO);
+        for (actual, expected) in scaled.rates().into_iter().zip(saved) {
+            assert!((actual - expected).abs() < 1e-9);
+        }
+
+        let per_min = HashrateDecay::restored_per_minute(start, saved, Duration::ZERO);
+        for (actual, expected) in per_min.per_minute().into_iter().zip(saved) {
+            assert!((actual - expected).abs() < 1e-9);
+        }
+        // …and the underlying state really is the per-second value.
+        for (actual, expected) in per_min.rates().into_iter().zip(saved) {
+            assert!((actual - expected / SECS_PER_MINUTE).abs() < 1e-12);
         }
     }
 

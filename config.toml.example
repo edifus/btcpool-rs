@@ -42,16 +42,17 @@ coinbase_tag = "/btcpool-rs/"
 # pointed at the wrong node. "mainnet" | "testnet" | "testnet4" | "signet" | "regtest".
 # network = "mainnet"
 
-# Initial share difficulty assigned to new miners.
-# Vardiff will adjust from here. Set near the expected steady-state value
-# for your hardware to avoid excessive rejects on first connect.
+# Initial share difficulty assigned to new miners, overridden by a miner's own
+# `mining.suggest_difficulty`. Vardiff adjusts from here and normally reaches
+# the right value within the first minute, so this only has to be in the right
+# neighbourhood for the hardware you expect.
 #
-# Rough guide (targeting 1 share every 15 seconds):
-#   1 TH/s  →  ~4 096
-#   5 TH/s  →  ~20 000
-#   10 TH/s →  ~40 000
-#   100 TH/s → ~400 000
-initial_difficulty = 4096
+# Rough guide (targeting 1 share every 5 seconds):
+#   0.4 TH/s (Bitaxe Max)   →     ~470
+#   1.2 TH/s (Bitaxe Gamma) →   ~1 400
+#   6.5 TH/s                →   ~7 600
+#   110 TH/s (S19)          → ~128 000
+initial_difficulty = 2048
 
 # Extranonce1 length in bytes (4 is standard; supports up to 255 miners)
 extranonce1_size = 4
@@ -172,20 +173,41 @@ poll_interval_ms = 1000
 
 [vardiff]
 # Target number of seconds between share submissions per miner
-target_share_time_secs = 15
+target_share_time_secs = 5
 
-# How often (seconds) to re-evaluate and adjust difficulty
-retarget_interval_secs = 60
+# How often (seconds) a difficulty change may be considered. A miner running
+# faster than target is re-evaluated early, once it has submitted the number of
+# shares this interval implies. Both are minimums, not a schedule: an on-target
+# miner is checked this often and left alone almost every time.
+retarget_interval_secs = 100
 
-# Hard floor / ceiling on per-miner difficulty
-# Floor should be above 1 but low enough for vardiff to work on small miners.
+# Deadzone. Difficulty is only changed when the newly measured optimum falls
+# below deadzone_low × the assigned value or rises above deadzone_high × it, so
+# the normal wobble of the estimate never reaches the miner. At the 5 s target
+# above, that means difficulty is left alone while the measured share interval
+# stays between roughly 3.3 s and 7.5 s.
+#
+# Widen the band (e.g. 0.5 / 1.333, which is what ckpool uses) for even fewer
+# changes, at the cost of settling further from the target share time.
+deadzone_low = 0.667
+deadzone_high = 1.5
+
+# Hard floor / ceiling on per-miner difficulty.
+# The floor of 256 corresponds to ~220 GH/s at the 5 s target, so every Bitaxe
+# model — Max, Ultra, Supra, Gamma, Gamma Turbo, Hex — is adjusted by vardiff
+# rather than pinned to it. Lower it further only for sub-220 GH/s hardware; it
+# is also the threshold every share is validated against.
 # Note: for cgminer/Avalon hardware the floor is sent as minimum-difficulty at
 # session start and cannot be changed without a reconnect.
-min_difficulty = 4096
-max_difficulty = 65536
+min_difficulty = 256
+# The ceiling covers ~3.4 PH/s at the 5 s target. Vardiff additionally never
+# assigns a target harder than the current network difficulty.
+max_difficulty = 4000000
 
-# Maximum difficulty adjustment ratio per retarget (e.g. 4 = up to 4× change)
-max_retarget_factor = 4.0
+# Safety clamp on how far one change may move the difficulty (10 = up to 10×).
+# The deadzone and the decaying averages do the real smoothing; this only bounds
+# a pathological jump.
+max_retarget_factor = 10.0
 
 [security]
 # Rate-limit: max new TCP connections per IP per minute
@@ -228,10 +250,13 @@ stats_db_path = "pool_stats.sqlite"
 # Log level: trace | debug | info | warn | error
 level = "info"
 
-# Emit structured JSON logs (useful for log aggregators like Loki)
+# Emit structured JSON to the log file (useful for log aggregators like Loki).
+# Applies to log_dir output only — stdout, and therefore the journal, stays
+# human-readable. Has no effect unless log_dir is set.
 json = false
 
-# Optional: Directory to write log files to (e.g., for systemd service).
-# If set, logs will be written to a rotating file in this directory.
-# Supports ~ expansion. Leave empty or omit to log to stdout/stderr.
+# Optional: Directory to write log files to. Logs always go to stdout — the
+# systemd journal and the Docker log driver both read it from there — and this
+# adds a rotating daily file alongside them (btcpool-rs.log.YYYY-MM-DD).
+# Supports ~ expansion. Leave empty or omit for stdout only (the default).
 log_dir = ""

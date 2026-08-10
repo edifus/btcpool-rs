@@ -22,7 +22,7 @@ mod noise;
 pub use noise::init as init_noise_authority;
 
 use crate::{
-    bitcoin::template::{build_job_for_payout, JobTemplate},
+    bitcoin::template::{bits_to_difficulty, build_job_for_payout, JobTemplate},
     config::{Config, VardiffConfig},
     metrics,
     mining::{
@@ -134,7 +134,7 @@ impl Sv2Session {
             extranonce_size: cfg.pool.extranonce2_size,
             extranonce_total: cfg.pool.extranonce1_size + cfg.pool.extranonce2_size,
             difficulty: initial_diff,
-            vardiff: Vardiff::new(cfg.vardiff.clone(), initial_diff),
+            vardiff: Vardiff::new(cfg.vardiff.clone(), initial_diff, Instant::now()),
             vardiff_cfg: cfg.vardiff.clone(),
             credit: ShareCredit::new(cfg.vardiff.min_difficulty, Instant::now()),
             share_set: ShareSet::new(),
@@ -150,6 +150,15 @@ impl Sv2Session {
             connect_time: Instant::now(),
             stats,
         }
+    }
+
+    /// Difficulty of the block currently being worked on, when a template is
+    /// held. Vardiff clamps to it so a miner is never asked for a share harder
+    /// to find than a block.
+    fn network_difficulty(&self) -> Option<u64> {
+        let template = self.pending_template.as_ref()?;
+        let difficulty = bits_to_difficulty(&template.bits).ok()?;
+        (difficulty.is_finite() && difficulty >= 1.0).then_some(difficulty as u64)
     }
 
     /// Allocate an SV2 job_id and remember its engine job-id mapping.
@@ -188,7 +197,7 @@ pub async fn run(
     network: bitcoin::Network,
 ) {
     if ban_list.is_banned(&peer.ip()) {
-        debug!("Rejected banned IP: {peer}");
+        warn!("Rejected banned IP: {peer}");
         return;
     }
 
@@ -207,12 +216,12 @@ pub async fn run(
     .await
     {
         Err(_) => {
-            warn!("SV2 {peer} Noise handshake timed out");
+            info!("SV2 {peer} Noise handshake timed out");
             return;
         }
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            warn!("SV2 {peer} Noise handshake failed: {e}");
+            debug!("SV2 {peer} Noise handshake failed: {e}");
             return;
         }
     };
@@ -278,7 +287,7 @@ pub async fn run(
             // ── Inbound (decrypted) SV2 message ─────────────────────────────
             inbound = tokio::time::timeout_at(last_inbound + read_timeout, inbound_rx.recv()) => {
                 let (msg_type, mut payload) = match inbound {
-                    Err(_) => { warn!("SV2 miner {peer} idle timeout — disconnecting"); break; }
+                    Err(_) => { info!("SV2 miner {peer} idle timeout — disconnecting"); break; }
                     Ok(None) => { debug!("SV2 {peer} reader closed"); break; }
                     Ok(Some(m)) => { last_inbound = tokio::time::Instant::now(); m }
                 };
@@ -296,27 +305,13 @@ pub async fn run(
                         if let Some(worker) = &session.worker {
                             metrics::miner_disconnect(&reason, worker);
                         }
-                        warn!("Disconnecting SV2 {peer}: {reason}");
+                        info!("Disconnecting SV2 {peer}: {reason}");
                         break;
                     }
                 }
 
-                // Vardiff retarget → SetTarget
-                if session.channel_open {
-                    if let Some(new_diff) = session.vardiff.check_retarget() {
-                        let old_diff = session.difficulty;
-                        session.difficulty = new_diff;
-                        if let Some(worker) = &session.worker {
-                            metrics::vardiff_retarget(worker, old_diff, new_diff);
-                            session.stats.update_worker_vardiff(worker, new_diff);
-                        }
-                        let target = job::difficulty_to_sv2_target(new_diff);
-                        debug!(peer = %peer, worker = ?session.worker, difficulty = new_diff, "Sending SV2 set_target");
-                        match messages::set_target(session.channel_id, target) {
-                            Ok(p) => if !writer.send(MESSAGE_TYPE_SET_TARGET, true, &p).await { break; },
-                            Err(e) => { error!("encode set_target: {e}"); break; }
-                        }
-                    }
+                if !apply_retarget(&mut session, &mut writer).await {
+                    break;
                 }
             }
 
@@ -342,6 +337,13 @@ pub async fn run(
                     Err(broadcast::error::RecvError::Lagged(n)) => warn!("SV2 {peer} missed {n} job broadcasts"),
                     Err(_) => break,
                 }
+
+                // Job pushes are the only thing that reaches a miner submitting
+                // nothing, so they are also what lets vardiff ease the target of
+                // one that has stopped.
+                if !apply_retarget(&mut session, &mut writer).await {
+                    break;
+                }
             }
         }
     }
@@ -365,6 +367,42 @@ pub async fn run(
     );
 }
 
+/// Run a vardiff check and push `SetTarget` if the target moved. Returns false
+/// when the write failed and the session should end.
+async fn apply_retarget(session: &mut Sv2Session, writer: &mut NoiseWriter) -> bool {
+    if !session.channel_open {
+        return true;
+    }
+    let network_difficulty = session.network_difficulty();
+    let Some(new_diff) = session
+        .vardiff
+        .check_retarget(Instant::now(), network_difficulty)
+    else {
+        return true;
+    };
+
+    let old_diff = session.difficulty;
+    session.difficulty = new_diff;
+    if let Some(worker) = &session.worker {
+        metrics::vardiff_retarget(worker, old_diff, new_diff);
+        session.stats.update_worker_vardiff(worker, new_diff);
+    }
+    info!(
+        peer = %session.peer,
+        worker = ?session.worker,
+        difficulty = new_diff,
+        "Sending SV2 set_target"
+    );
+    let target = job::difficulty_to_sv2_target(new_diff);
+    match messages::set_target(session.channel_id, target) {
+        Ok(p) => writer.send(MESSAGE_TYPE_SET_TARGET, true, &p).await,
+        Err(e) => {
+            error!("encode set_target: {e}");
+            false
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Message dispatch
 // ─────────────────────────────────────────────────────────────────────────────
@@ -386,7 +424,7 @@ async fn handle_message(
     // are as cheap to send as shares and feed the same per-message stats work,
     // so they share the same bucket (mirrors the SV1 dispatch).
     if !session.guard.share_rate.try_consume() {
-        metrics::share_rejected("rate_limited", session.worker.as_deref().unwrap_or("?"));
+        accounting::record_rate_limited(&session.stats, session.worker.as_deref());
         ban_list.ban(session.peer.ip(), "message rate exceeded");
         return Flow::Disconnect("rate limited".into());
     }
@@ -453,7 +491,7 @@ async fn handle_setup_connection(
     }
     let used_version = SV2_PROTOCOL_VERSION.min(setup.max_version);
     session.setup_done = true;
-    debug!(peer = %session.peer, used_version, "SV2 SetupConnection");
+    info!(peer = %session.peer, used_version, "SV2 SetupConnection");
 
     match messages::setup_connection_success(used_version) {
         Ok(p) => {
@@ -500,7 +538,7 @@ async fn handle_open_extended(
     };
 
     if let Err(e) = session.guard.check_worker_name(&open.user_identity) {
-        warn!(peer = %session.peer, "Rejected SV2 user_identity: {e}");
+        debug!(peer = %session.peer, "Rejected SV2 user_identity: {e}");
         return open_error(writer, open.request_id, "invalid-user-identity").await;
     }
     let identity = match MinerIdentity::parse(
@@ -510,7 +548,7 @@ async fn handle_open_extended(
     ) {
         Ok(identity) => Arc::new(identity),
         Err(e) => {
-            warn!(peer = %session.peer, worker = %open.user_identity, "Rejected SV2 payout identity: {e}");
+            debug!(peer = %session.peer, worker = %open.user_identity, "Rejected SV2 payout identity: {e}");
             return open_error(writer, open.request_id, "invalid-user-identity").await;
         }
     };
@@ -559,7 +597,7 @@ async fn handle_open_extended(
     let prefix_len = session.extranonce_total - granted;
     session.extranonce_size = granted;
     session.extranonce_prefix = crate::network::session::generate_extranonce1(prefix_len);
-    debug!(
+    info!(
         peer = %session.peer,
         granted,
         prefix_len,
@@ -575,7 +613,7 @@ async fn handle_open_extended(
     // declared `max_target` (SV2: assigned target MUST be ≤ max_target).
     let mut target = job::difficulty_to_sv2_target(session.difficulty);
     if !job::sv2_target_le(&target, &open.max_target) {
-        warn!(
+        info!(
             peer = %session.peer,
             "SV2 device max_target easier than initial difficulty target; clamping to max_target"
         );
@@ -658,7 +696,7 @@ async fn handle_submit(
     // splice depends on it. Guard so a malformed length is a clean reject, not a
     // panic in the validation task.
     if submit.extranonce.len() != session.extranonce_size {
-        warn!(
+        debug!(
             worker = %worker,
             got = submit.extranonce.len(),
             expected = session.extranonce_size,
@@ -844,10 +882,11 @@ async fn handle_submit(
 /// Book an accepted share. Returns the difficulty credited to the estimator.
 fn accept_share(session: &mut Sv2Session, worker: &str, hash_difficulty: u64) -> u64 {
     session.shares_accepted += 1;
-    session.vardiff.record_share();
+    let now = Instant::now();
     let credit = session
         .credit
-        .credit(session.difficulty, hash_difficulty, Instant::now());
+        .credit(session.difficulty, hash_difficulty, now);
+    session.vardiff.record_share(credit, now);
     accounting::record_accepted(
         &session.stats,
         &session.session_id,

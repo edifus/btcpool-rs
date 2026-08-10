@@ -53,9 +53,9 @@ Group=btcpool
 # (or set persist_authority_key = false to keep an ephemeral per-process key).
 StateDirectory=btcpool-rs
 
-# Logs go to the journal (journalctl -u btcpool-rs). Keep log_dir empty in
-# config.toml to use this. For file logging instead, uncomment the next line
-# and set log_dir = "/var/log/btcpool-rs" in config.toml:
+# Logs always go to the journal (journalctl -u btcpool-rs). To additionally
+# keep rotating files on disk, uncomment the next line and set
+# log_dir = "/var/log/btcpool-rs" in config.toml:
 #   LogsDirectory=btcpool-rs
 
 # ── Hardening ────────────────────────────────────────────────────────────────

@@ -9,6 +9,139 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-09
+
+Vardiff stops chasing noise. The old controller sized a miner's difficulty from
+a share count over one 60 s window — four shares at the previous target, whose
+Poisson counting noise is ±50% — and jumped straight to that estimate, so a
+miner was handed a new difficulty about once a minute, spanning an order of
+magnitude, forever. It is rebuilt on ckpool's approach and now settles inside
+the first minute and holds for hours. Alongside it, the dashboard grows a
+shares/min chart and a pool-difficulty KPI, and every cumulative figure now
+measures since the pool's last found block rather than since process start.
+
+### Added
+- **A Pool difficulty KPI on the dashboard overview** — accepted share work
+  accumulated since the pool's last found block, shown as a percentage of the
+  current network difficulty (100% is one expected block's worth of work) with
+  the raw accumulated difficulty below. Persisted in the stats DB, so a
+  restart does not reset it — only finding a block does. Exposed as
+  `pool_difficulty` on `GET /stats`. The overview cards now read Accepted,
+  Rejected, Best share, Best hashrate, Miners, Pool difficulty.
+- **A shares-per-minute chart on the dashboard**, below the hashrate panel and
+  driven by the same range selector, over the same 1m/5m/10m/1h/6h/24h decaying
+  averages. Share throughput is a separate signal from work done — it moves with
+  vardiff retargets and miner churn while hashrate holds flat — and nothing
+  exposed it: the pool counted accepted shares but only ever as a lifetime total.
+  Per minute rather than per second because a pool of any realistic size spends
+  its life in the tenths otherwise. Persisted like the hashrate series, so a
+  restart resumes the averages decayed across the downtime instead of resetting
+  the chart to zero. The current rate also appears on the Accepted card, as
+  `pool_shares_per_minute{window}` in Prometheus, as `shares_per_minute_*` on
+  `GET /stats`, and at `GET /share-chart`.
+- **Accepted and rejected share totals now survive restarts** when
+  `[metrics] stats_db_path` is configured. The SQLite snapshot records
+  monotonic lifetime counters, restores them at boot, and performs a bounded
+  final persist on SIGINT or SIGTERM so a clean shutdown does not lose the
+  tail between snapshots. The dashboard now gives accepted and rejected shares
+  their own cards, with lifetime totals leading and this process's counts below;
+  `GET /stats` gains `lifetime_shares_accepted`,
+  `lifetime_shares_rejected`, and `stats_since_ts`. Rate-limited messages now
+  enter the pool total, and the authenticated worker's total where available,
+  so these figures agree with `pool_shares_rejected_total`.
+- **Reject reasons are now counted pool-wide for both the current process and
+  the pool's recorded lifetime.** The lifetime breakdown is persisted in the
+  stats database, while `GET /stats` exposes it as `lifetime_reject_reasons`
+  alongside the session-only `reject_reasons`. The dashboard puts each scoped
+  breakdown on the corresponding rejected-total tooltip. Reason tracking starts
+  with this schema, so its sum can trail the lifetime rejected total restored
+  from an older database.
+- **The hashrate chart's selected range and legend survive a page reload**,
+  joining the theme, chart-collapse and quote-currency preferences. Picking
+  `30d` and refreshing snapped back to `1h`, and the legend reverted to the
+  default series set: the client defended legend clicks only within a session,
+  against its own 10-second poll, and had nothing to restore them from on a
+  fresh load.
+
+### Changed
+- **Vardiff now settles instead of oscillating.** The old controller counted
+  shares in a single 60 s window and jumped straight to the implied difficulty.
+  At the previous 15 s target that window held four shares, whose Poisson
+  counting noise is ±50%, so a miner was handed a new difficulty roughly every
+  minute spanning an order of magnitude — in one observed session, 83 changes
+  between 5,710 and 65,595 around a correct mean of 22,680. Rebuilt on ckpool's
+  approach: two difficulty-weighted decaying averages (time constants derived
+  from the target share time, so they always hold enough shares to be quiet), a
+  warm-up correction so a fresh session is accurate within seconds of its first
+  share, and a multiplicative deadzone that leaves the assigned difficulty alone
+  until the measured optimum is a *factor* away rather than a few percent. A
+  settled miner now converges inside the first minute and then changes
+  difficulty on the order of once every few hours. Three side effects of the old
+  design are gone with it: a paused miner is no longer halved once per window
+  (it decays and is protected by a returning-from-absence guard), a silent
+  session is now retargeted at all — the check ran only on inbound messages and
+  is now also driven by job pushes — and firmware that ignores
+  `set_difficulty` no longer ratchets to `max_difficulty`, because the estimate
+  is built from what each share is credited rather than from how many arrived.
+  Vardiff also never assigns a target harder than the current network
+  difficulty. `[vardiff]` gains `deadzone_low` / `deadzone_high` (both
+  defaulted, so existing configs keep loading) and is now validated at boot.
+- **Difficulty defaults retuned for the hardware people actually run.** The
+  target share time drops from 15 s to **5 s**, `pool.initial_difficulty` from
+  4096 to **2048**, `vardiff.min_difficulty` from 4096 to **256** — ~220 GH/s at
+  the new target, so every Bitaxe model is adjusted by vardiff rather than
+  pinned to the floor — and `vardiff.max_difficulty` from 65,536 to
+  **4,000,000**, which covers ~3.4 PH/s instead of capping a session at 18.8
+  TH/s. `retarget_interval_secs` moves to 100 and `max_retarget_factor` to 10.0,
+  the latter now only a safety clamp on a pathological jump.
+- **Every cumulative KPI now measures since the pool's last found block rather
+  than pool lifetime** — identical for a solo pool until the first win.
+  Finding a block starts a new round: accepted and rejected totals (and their
+  reason breakdowns), best share, best hashrate, per-worker best shares, and
+  the accumulated pool difficulty all reset, in memory and in the stats DB,
+  and `stats_since_ts` moves to the block. The session cards and the
+  Prometheus counters, which must stay monotonic, are unaffected.
+- **Operational log levels now separate useful lifecycle events from routine
+  connection noise.** Block notifications, vardiff changes, miner capability
+  negotiation, subscription metadata, and SV2 setup/extranonce details are
+  visible at `info`. Idle timeouts and intentional protocol disconnects are
+  lifecycle events; ordinary socket failures and malformed peer input stay at
+  `debug`; bans and other enforced security controls remain `warn`. A
+  low-difficulty share no longer emits two warnings: the validator's detailed
+  target check is `debug`, while the protocol session retains the bounded
+  `Share rejected` warning with worker and reason context.
+- The dashboard overview drops the redundant Pool uptime card — uptime remains
+  in the header — and uses consistent compact labels across the remaining KPI
+  cards. Reject details no longer widen the Rejected card as an inline list;
+  the lifetime and session totals expose their labelled breakdowns on hover.
+- **Logs now always go to stdout**, so the systemd journal and the Docker log
+  driver always have them. Configuring `[logging] log_dir` previously *replaced*
+  stdout with the log file; it now adds a rotating file alongside stdout rather
+  than diverting it.
+- **`[logging] json` now formats the log file only**, and has no effect without
+  `log_dir`. Structured output exists for log shippers, which read the file.
+- `RUST_LOG` is honoured, taking precedence over `[logging] level` when set.
+  README and CONTRIBUTING have documented `RUST_LOG=debug cargo run` for a while,
+  but the filter was built from the config string alone and ignored the
+  environment.
+- `BTCPOOL_*` config overrides announce themselves on stderr instead of through
+  `tracing`. Overrides are applied while loading the config, before the
+  subscriber exists, so those lines were being written to nothing.
+
+### Removed
+- **The Last block found card, and the `last_block_*` fields on `GET /stats`
+  that fed it.** The block counts and the SQLite `found_blocks` ledger are
+  untouched, so nothing recorded about found blocks is lost — only the
+  most-recent-block convenience fields.
+
+### Fixed
+- **An empty `[logging] log_dir` no longer writes log files into the working
+  directory.** `log_dir` is optional, but `""` deserialized to `Some("")`
+  rather than `None` and took the file-logging path anyway. Empty and
+  whitespace-only values now mean "stdout only", as every doc already claimed.
+- A log directory that cannot be created or opened now exits with a legible
+  message on stderr instead of a panic backtrace from inside the appender.
+
 ## [0.3.0] - 2026-08-07
 
 A consensus audit of the block-construction path — everything the pool has to
@@ -821,7 +954,8 @@ unlinked to avoid any ambiguity with a release of the same number here.
 - Dashboard rework: worker rendering and stats mapping fixes; reject rate moved
   into the rejected card; best share keyed by vardiff difficulty.
 
-[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.4.0...HEAD
+[0.3.4]: https://github.com/edifus/btcpool-rs/compare/v0.3.0...v0.3.4
 [0.3.0]: https://github.com/edifus/btcpool-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/edifus/btcpool-rs/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/edifus/btcpool-rs/compare/v0.1.2...v0.1.3

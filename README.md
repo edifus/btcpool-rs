@@ -73,7 +73,7 @@ and exercised on every commit, so you can check it rather than trust it.
 | Block submission | `submitblock` on valid block, immediate with latency logging |
 | Security | Per-IP connection rate limiting, per-session share rate limiting (token bucket), invalid-share counting, IP ban list with TTL, message size limit |
 | Metrics | Prometheus endpoint (`/metrics`): hashrate, share counts, block finds, connected miners |
-| Logging | Structured JSON or human-readable via `tracing` |
+| Logging | Human-readable on stdout via `tracing`, always; optional rotating log files, plain or structured JSON |
 
 ---
 
@@ -272,8 +272,8 @@ sudo systemctl enable --now btcpool-rs
 journalctl -u btcpool-rs -f
 ```
 
-Logs go to the journal by default (`log_dir` empty); set `log_dir` plus
-`LogsDirectory=` in the unit for file logging instead.
+Logs always reach the journal. To *also* keep rotating files on disk, set
+`log_dir` in `config.toml` and uncomment `LogsDirectory=` in the unit.
 
 ---
 
@@ -301,7 +301,7 @@ All settings live in `config.toml`. The essentials:
 ```toml
 [pool]
 listen_addr = "0.0.0.0:3333"
-initial_difficulty = 4096                  # ~1 TH/s at 15s/share; vardiff ramps from here
+initial_difficulty = 2048                  # ~1.8 TH/s at 5s/share; vardiff ramps from here
 
 [sv2]
 enabled = true                             # accept SV2 on the same port (false = SV1 only)
@@ -319,20 +319,54 @@ See [`config.toml.example`](config.toml.example) for the fully annotated referen
 
 ### Difficulty and small / large miners
 
-`[vardiff]` automatically tracks each miner's hashrate, but it works within a
-configured floor and ceiling (`min_difficulty` / `max_difficulty`). The default
-floor of **4096** suits roughly **1 TH/s and up** (a Bitaxe, Avalon Nano, or
-larger) at the 15 s target share time. Two cases to know about:
+`[vardiff]` aims for **one share every 5 seconds** from each miner, and adjusts
+each session's difficulty to hold that. It estimates a miner's hashrate from
+decaying averages of the difficulty it has submitted and only changes the
+assigned difficulty when the measured optimum leaves a **deadzone** around
+it (`deadzone_low` / `deadzone_high`).
 
-- **Low-hashrate devices** (USB sticks, NerdMiner-class lottery miners, ~sub-0.3 TH/s)
-  will be pinned at the floor and submit shares slowly, or for very tiny
-  devices almost never. This is purely cosmetic: **share difficulty has no
-  payout effect in solo mining** (you're paid on blocks, 100%, regardless), so
-  such a device still finds and submits a real block normally; it just shows
-  little or no hashrate on the dashboard. If you want better telemetry for small
-  hardware, lower `min_difficulty`.
-- **Large miners / farms** can raise `max_difficulty` so vardiff can settle them
-  at a higher target instead of submitting shares faster than the 15 s goal.
+The floor and ceiling (`min_difficulty` / `max_difficulty`) bound the result. The
+default floor of **256** corresponds to **~220 GH/s** at the 5 s target, so every
+Bitaxe — Max, Ultra, Supra, Gamma, Gamma Turbo, Hex — is adjusted normally rather
+than pinned to it. The ceiling of **4,000,000** covers ~3.4 PH/s, and vardiff
+additionally never assigns a target harder than the current network difficulty.
+
+Where common hardware lands, at the 5 s default:
+
+| Device | ~Hashrate | Settled difficulty |
+|---|---|---|
+| NerdMiner v2 (ESP32) | 78 KH/s | floor (256) |
+| Bitaxe Max (BM1397) | 0.4 TH/s | 470 |
+| Bitaxe Ultra (BM1366) | 0.55 TH/s | 640 |
+| Bitaxe Supra (BM1368) | 0.75 TH/s | 870 |
+| Bitaxe Gamma (BM1370) | 1.2 TH/s | 1,400 |
+| Bitaxe Gamma Turbo | 2.5 TH/s | 2,900 |
+| Bitaxe Hex (6× BM1366) | 3.2 TH/s | 3,700 |
+| Avalon Nano 3 | 4 TH/s | 4,700 |
+| NerdQAxe++ (4× BM1370) | 4.8 TH/s | 5,600 |
+| Avalon Nano 3S | 6 TH/s | 7,000 |
+| Antminer S9 | 13.5 TH/s | 16,000 |
+| Avalon Q | 90 TH/s | 100,000 |
+| Antminer S19 | 95 TH/s | 110,000 |
+| Antminer S19 Pro | 110 TH/s | 130,000 |
+| Whatsminer M50 | 118 TH/s | 140,000 |
+| Antminer S19 XP | 140 TH/s | 160,000 |
+| Antminer S21 | 200 TH/s | 230,000 |
+| Antminer S21 Pro | 234 TH/s | 270,000 |
+
+**These are not values to configure.** Vardiff measures each session and gets
+there on its own within the first minute — the table is for recognizing where
+your hardware should end up, not for setting anything. Hashrates are stock-clock
+approximations.
+
+Landing below the floor is **cosmetic**. A sub-220 GH/s device (USB sticks,
+NerdMiner-class lottery hardware) sits at 256 and submits shares slowly, or for
+very tiny devices almost never. It still finds and submits a real block normally
+— **share difficulty has no payout effect in solo mining**, you are paid on
+blocks, 100%, regardless — it just reads low on the dashboard. Lower
+`min_difficulty` for better telemetry on small hardware, keeping in mind it is
+also the threshold every share is validated against. Miners past the ceiling can
+raise `max_difficulty` rather than submit faster than the 5 s goal.
 
 Miners that send `mining.suggest_difficulty` (e.g. AxeOS's "pool difficulty"
 field) are honored as a **starting** difficulty, clamped to this floor/ceiling;
@@ -389,10 +423,11 @@ With `prometheus_addr` set (default `0.0.0.0:9090`), an HTTP server exposes:
 
 | Route | Description |
 |---|---|
-| `GET /` | HTML dashboard: rolling hashrate averages with 1h-180d ranges, workers, network difficulty + estimated next-retarget move, BIP110/RDTS signal, market data, probability, uptime (auto-refreshes) |
+| `GET /` | HTML dashboard: rolling hashrate and shares/min averages with 1h-180d ranges, workers, network difficulty + estimated next-retarget move, BIP110/RDTS signal, market data, probability, uptime (auto-refreshes) |
 | `GET /stats` | JSON snapshot of current pool state |
 | `GET /history` | Legacy 10-minute hashrate history (`?since=<unix-ts>`) |
-| `GET /chart` | ECharts option data (`?window=1h\|6h\|24h\|1w\|30d\|180d\|all`) |
+| `GET /chart` | Hashrate ECharts option data (`?window=1h\|6h\|24h\|1w\|30d\|180d\|all`) |
+| `GET /share-chart` | Accepted shares/min ECharts option data, same `?window=` values |
 | `GET /api/info` | Pool version, network, Stratum port, SV2 status, and authority public key |
 | `GET /metrics` | Prometheus text exposition |
 | `GET /health` | `200` while the block template is refreshing, `503` once it has been stale for 180s (JSON, carries `template_age_secs`) |
@@ -411,6 +446,7 @@ Key Prometheus metrics:
 | `pool_blocks_pending_confirmation` | Found blocks not yet decided (normally 0) |
 | `pool_hashrate_hps{window}` | Pool H/s, one series per averaging window (`1m`, `5m`, `10m`, `1h`, `3h`, `6h`, `24h`) |
 | `pool_worker_hashrate_hps{worker,window}` | Per-worker H/s, same windows |
+| `pool_shares_per_minute{window}` | Pool-wide accepted shares/min, same windows and same decay as the hashrate gauges |
 | `pool_job_height` | Current template block height |
 | `pool_template_last_refresh_timestamp_seconds` | Unix time of the last successful template refresh |
 | `pool_tip_changes_discovered_by_timer_total` | New tips the ntime timer saw before ZMQ did |
@@ -421,6 +457,13 @@ constant, refreshed every 2s. A freshly connected worker reads well below its
 true rate on the longer windows until they have filled — the `24h` series is
 still climbing a day in. Alert on `pool_hashrate_hps{window="10m"}`; it carries
 no worker label, so it does not fan out with the fleet.
+
+`pool_shares_per_minute` is the same decay applied to a plain count of accepted
+shares, so it measures throughput rather than work done: it drops when vardiff
+retargets miners upward even though hashrate is unchanged. Prefer it over
+`rate(pool_shares_accepted_total[…])` if you want the figure the dashboard
+plots — the range selector there is a guess, this is not. Both the gauge and the
+chart survive a restart, resuming decayed across the downtime.
 
 `pool_blocks_found_total` counts only blocks that became the chain tip. A block
 that is consensus-valid but lost a same-height race earns nothing, and lands in
@@ -438,8 +481,8 @@ that turn out to have been reorged away move `pool_blocks_orphaned_total`, so
 **the blocks the pool actually kept are
 `pool_blocks_found_total - pool_blocks_orphaned_total`** — a counter cannot be
 decremented, so the correction is exported alongside rather than folded in. The
-dashboard shows the net figure directly, and marks the last-block card when the
-block it names has been reorged out. The reconciliation runs in both directions:
+dashboard shows the net figure directly. The reconciliation runs in both
+directions:
 a block that lost its height race and is later promoted onto the active chain by
 a reorg is counted then.
 

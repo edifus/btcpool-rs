@@ -19,7 +19,7 @@ use std::sync::{
     Arc,
 };
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Deadline for a new connection to make protocol progress before it has
 /// authorized a worker: the protocol auto-detect peek here, the SV2 Noise
@@ -184,7 +184,7 @@ pub async fn run(
                 }
                 Ok(Ok(_)) => first[0] == b'{',
                 Ok(Err(e)) => {
-                    warn!("Peek failed for {peer}: {e}");
+                    debug!("Peek failed for {peer}: {e}");
                     active_count.fetch_sub(1, Ordering::Relaxed);
                     return;
                 }

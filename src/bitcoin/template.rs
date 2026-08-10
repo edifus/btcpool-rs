@@ -928,16 +928,16 @@ mod tests {
         assert_eq!(assembled.len(), job.coinbase_template.len());
     }
 
-    /// `assemble_coinbase_into` replaced a `coinbase_template.clone()` per
-    /// validated share. Pin the two properties that swap depends on: the bytes
-    /// are unchanged, and a reused buffer stops allocating.
+    /// `assemble_coinbase_into` avoids a `coinbase_template.clone()` per
+    /// validated share. Pin the two properties it must uphold: the bytes are
+    /// identical to the cloning form's, and a reused buffer stops allocating.
     #[test]
     fn assemble_coinbase_into_matches_the_cloning_form() {
         let payout = payout("address", vec![0x51]);
         let job = build_job_for_payout(sample_template(), &payout, "/test/", 4, 4).unwrap();
 
-        // The reference: what the old implementation did — clone the template,
-        // then splice the extranonce in at the reserved offset.
+        // The reference: clone the template, then splice the extranonce in at
+        // the reserved offset.
         let splice = |en1: &[u8], en2: &[u8]| -> Vec<u8> {
             let mut cb = job.coinbase_template.clone();
             let off = job.extranonce_offset;
@@ -990,7 +990,7 @@ mod tests {
         }
     }
 
-    /// The extranonce offset is now computed from the serialization layout
+    /// The extranonce offset is computed from the serialization layout
     /// rather than found by scanning. Check it against a full deserialization
     /// for both the one-byte and the wide extranonce case.
     #[test]
@@ -1081,15 +1081,15 @@ mod tests {
             recovered, internal,
             "header hashPrevBlock must equal the genesis internal byte order"
         );
-        // And the wire value must NOT be the naive per-word swap of display
-        // (the old bug), which would round-trip back to display order.
+        // And the wire value must NOT be the naive per-word swap of display,
+        // which would round-trip back to display order.
         let mut naive = hex::decode(display).unwrap();
         for chunk in naive.chunks_mut(4) {
             chunk.reverse();
         }
         assert_ne!(
             stratum, naive,
-            "regression: prev-hash reverted to the buggy transform"
+            "prev-hash must not be the per-word swap of display order"
         );
     }
 

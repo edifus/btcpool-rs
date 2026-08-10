@@ -12,7 +12,7 @@
 ///   - Submit latency tracking
 ///   - Security guards (rate limiting, invalid share counting, message size)
 use crate::{
-    bitcoin::template::{build_job_for_payout, JobTemplate, StratumJob},
+    bitcoin::template::{bits_to_difficulty, build_job_for_payout, JobTemplate, StratumJob},
     config::{Config, VardiffConfig},
     error::PoolError,
     metrics,
@@ -125,7 +125,7 @@ impl Session {
             coinbase_tag: cfg.pool.coinbase_tag.clone(),
             network,
             difficulty: initial_diff,
-            vardiff: Vardiff::new(cfg.vardiff.clone(), initial_diff),
+            vardiff: Vardiff::new(cfg.vardiff.clone(), initial_diff, Instant::now()),
             vardiff_cfg: cfg.vardiff.clone(),
             credit: ShareCredit::new(cfg.vardiff.min_difficulty, Instant::now()),
             share_set: ShareSet::new(),
@@ -135,6 +135,15 @@ impl Session {
             connect_time: Instant::now(),
             stats,
         }
+    }
+
+    /// Difficulty of the block currently being worked on, when a template is
+    /// held. Vardiff clamps to it so a miner is never asked for a share harder
+    /// to find than a block.
+    fn network_difficulty(&self) -> Option<u64> {
+        let template = self.current_template.as_ref()?;
+        let difficulty = bits_to_difficulty(&template.bits).ok()?;
+        (difficulty.is_finite() && difficulty >= 1.0).then_some(difficulty as u64)
     }
 }
 
@@ -152,7 +161,7 @@ pub async fn run(
     network: bitcoin::Network,
 ) {
     if ban_list.is_banned(&peer.ip()) {
-        debug!("Rejected banned IP: {peer}");
+        warn!("Rejected banned IP: {peer}");
         return;
     }
 
@@ -200,7 +209,7 @@ pub async fn run(
             ) => {
                 match line_result {
                     Err(_) => {
-                        warn!("Miner {peer} idle timeout — disconnecting");
+                        info!("Miner {peer} idle timeout — disconnecting");
                         break;
                     }
                     Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -240,26 +249,13 @@ pub async fn run(
                                 if let Some(worker) = &session.worker {
                                     metrics::miner_disconnect(&reason, worker);
                                 }
-                                warn!("Disconnecting {peer}: {reason}");
+                                info!("Disconnecting {peer}: {reason}");
                                 break;
                             }
                         }
 
-                        if let Some(new_diff) = session.vardiff.check_retarget() {
-                            let old_diff = session.difficulty;
-                            session.difficulty = new_diff;
-                            if let Some(worker) = &session.worker {
-                                metrics::vardiff_retarget(worker, old_diff, new_diff);                                session.stats.update_worker_vardiff(worker, new_diff);                            }
-                            let msg = ResponseBuilder::set_difficulty(new_diff);
-                            debug!(
-                                peer = %session.peer,
-                                worker = ?session.worker,
-                                difficulty = new_diff,
-                                "Sending vardiff update"
-                            );
-                            if !send_messages(&writer, peer, vec![msg]).await {
-                                break;
-                            }
+                        if !apply_retarget(&mut session, &writer).await {
+                            break;
                         }
                     }
                 }
@@ -313,6 +309,13 @@ pub async fn run(
                     }
                     Err(_) => break,
                 }
+
+                // Job pushes are the only thing that reaches a miner submitting
+                // nothing, so they are also what lets vardiff ease the target of
+                // one that has stopped.
+                if !apply_retarget(&mut session, &writer).await {
+                    break;
+                }
             }
         }
     }
@@ -337,6 +340,36 @@ pub async fn run(
     );
 }
 
+/// Run a vardiff check and push `mining.set_difficulty` if the target moved.
+/// Returns false when the write failed and the session should end.
+async fn apply_retarget(
+    session: &mut Session,
+    writer: &tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
+) -> bool {
+    let network_difficulty = session.network_difficulty();
+    let Some(new_diff) = session
+        .vardiff
+        .check_retarget(Instant::now(), network_difficulty)
+    else {
+        return true;
+    };
+
+    let old_diff = session.difficulty;
+    session.difficulty = new_diff;
+    if let Some(worker) = &session.worker {
+        metrics::vardiff_retarget(worker, old_diff, new_diff);
+        session.stats.update_worker_vardiff(worker, new_diff);
+    }
+    info!(
+        peer = %session.peer,
+        worker = ?session.worker,
+        difficulty = new_diff,
+        "Sending vardiff update"
+    );
+    let msg = ResponseBuilder::set_difficulty(new_diff);
+    send_messages(writer, session.peer, vec![msg]).await
+}
+
 async fn send_messages(
     writer: &tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
     peer: SocketAddr,
@@ -348,13 +381,13 @@ async fn send_messages(
         tracing::trace!(peer = %peer, raw = %msg, "→ pool");
         let line = format!("{msg}\n");
         if let Err(e) = w.write_all(line.as_bytes()).await {
-            warn!("Write error to {peer}: {e}");
+            debug!("Write error to {peer}: {e}");
             return false;
         }
     }
 
     if let Err(e) = w.flush().await {
-        warn!("Flush error to {peer}: {e}");
+        debug!("Flush error to {peer}: {e}");
         return false;
     }
 
@@ -434,7 +467,7 @@ async fn handle_line(
     // subscribe floods are as cheap to send as shares and feed the same
     // per-message stats work, so they share the same bucket.
     if !session.guard.share_rate.try_consume() {
-        metrics::share_rejected("rate_limited", session.worker.as_deref().unwrap_or("?"));
+        accounting::record_rate_limited(&session.stats, session.worker.as_deref());
         ban_list.ban(session.peer.ip(), "message rate exceeded");
         return HandleResult::Disconnect("rate limited".into());
     }
@@ -513,12 +546,12 @@ fn handle_configure(
         session.version_rolling_min_bit_count = params.version_rolling_min_bit_count;
 
         if session.version_rolling_enabled {
-            debug!(
+            info!(
                 "{} version-rolling enabled, mask={:08x}",
                 session.peer, negotiated
             );
         } else {
-            debug!(
+            info!(
                 "{} version-rolling not enabled: negotiated mask {:08x} does not satisfy requested minimum bit count {:?}",
                 session.peer, negotiated, params.version_rolling_min_bit_count
             );
@@ -548,9 +581,9 @@ fn handle_suggest_difficulty(
     // Seed vardiff from the hint, clamped to the configured floor/ceiling so a
     // (buggy or hostile) suggestion can never drop a miner below the share-rate
     // floor. Vardiff owns the difficulty from here.
-    let applied = session.vardiff.suggest(params.difficulty);
+    let applied = session.vardiff.suggest(params.difficulty, Instant::now());
     session.difficulty = applied;
-    debug!(
+    info!(
         peer = %session.peer,
         suggested = params.difficulty,
         applied,
@@ -575,7 +608,7 @@ fn handle_subscribe(
 ) -> HandleResult {
     session.subscribed = true;
     session.user_agent = params.user_agent.clone();
-    debug!(
+    info!(
         peer = %session.peer,
         user_agent = ?params.user_agent,
         "Subscribed"
@@ -603,7 +636,7 @@ async fn handle_authorize(
     }
 
     if let Err(e) = session.guard.check_worker_name(&params.worker) {
-        warn!(peer = %session.peer, "Rejected worker name: {e}");
+        debug!(peer = %session.peer, "Rejected worker name: {e}");
         return HandleResult::Messages(vec![ResponseBuilder::err(&req.id, e.to_stratum_error())]);
     }
 
@@ -614,7 +647,7 @@ async fn handle_authorize(
     ) {
         Ok(identity) => Arc::new(identity),
         Err(e) => {
-            warn!(peer = %session.peer, worker = %params.worker, "Rejected payout identity: {e}");
+            debug!(peer = %session.peer, worker = %params.worker, "Rejected payout identity: {e}");
             return HandleResult::Messages(vec![ResponseBuilder::ok(
                 &req.id,
                 serde_json::Value::Bool(false),
@@ -925,10 +958,11 @@ async fn handle_submit(
 /// and metrics. Returns the difficulty credited to the hashrate estimator.
 fn accept_share(session: &mut Session, worker: &str, hash_difficulty: u64) -> u64 {
     session.shares_accepted += 1;
-    session.vardiff.record_share();
+    let now = Instant::now();
     let credit = session
         .credit
-        .credit(session.difficulty, hash_difficulty, Instant::now());
+        .credit(session.difficulty, hash_difficulty, now);
+    session.vardiff.record_share(credit, now);
     accounting::record_accepted(
         &session.stats,
         &session.session_id,

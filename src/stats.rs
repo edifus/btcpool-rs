@@ -91,8 +91,9 @@ impl BlockResolution {
     }
 }
 
-/// Status shown on the dashboard's last-block card while confirmation is still
-/// outstanding. `BlockResolution::label` supplies the terminal values.
+/// Status a found block carries in the `found_blocks` ledger until the
+/// confirmation pass decides it. `BlockResolution::label` supplies the
+/// terminal values.
 pub const BLOCK_STATUS_PENDING: &str = "pending";
 
 // Generates `HashrateWindows` and everything that has to walk its fields in
@@ -153,8 +154,11 @@ hashrate_windows! {
     twenty_four_hours => hashrate::W_24H,
 }
 
+/// One bucketed sample of a decaying-average series: hashrate in H/s, or
+/// accepted shares/min. `None` where the underlying column predates the row.
+/// Six windows, not seven — 3h is checkpointed but never plotted.
 #[derive(Debug, Clone, Copy)]
-pub struct HashrateHistoryPoint {
+pub struct RateHistoryPoint {
     pub ts: u64,
     pub one_minute: Option<f64>,
     pub five_minutes: Option<f64>,
@@ -182,13 +186,51 @@ struct SessionHashrate {
 // Persistent store for all-time metrics
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Cumulative lifetime share counts, as persisted. A named struct rather than
+/// two bare integers because it is the unit a future per-worker totals map
+/// will carry through the same snapshot write.
+#[derive(Debug, Clone, Copy, Default)]
+struct ShareTotals {
+    accepted: u64,
+    rejected: u64,
+}
+
+/// One sampling tick's worth of persisted state, assembled by
+/// `PoolStats::record_hashrate_snapshot_at` and written as a single
+/// transaction. Grouped rather than passed as a dozen positional arguments
+/// through three layers — `Default` also keeps the test call sites to the
+/// fields each one actually cares about.
+#[derive(Debug, Clone, Default)]
+struct SnapshotWrite {
+    /// Timestamp for the history series, snapped to the sampling grid.
+    history_ts: u64,
+    /// True time of the checkpoint rows, so a restore knows the real gap.
+    state_ts: u64,
+    rates: HashrateWindows,
+    worker_rates: HashMap<String, HashrateWindows>,
+    share_totals: ShareTotals,
+    lifetime_reject_reasons: BTreeMap<String, u64>,
+    /// Accepted-share work accumulated in the current round (see
+    /// `PoolStats::round_work`).
+    round_work: u64,
+    /// The round epoch the share stats above were read under. The writer
+    /// discards share stats carrying an epoch older than the last applied
+    /// `RoundReset`, so a snapshot raced by a reset cannot resurrect the
+    /// previous round's totals.
+    round_epoch: u64,
+    /// Pool-wide accepted shares/min, `hashrate::W_*`-indexed. A bare array
+    /// rather than a named-field struct: there is one pool meter and no
+    /// aggregation to do, and indexing by the `W_*` constants leaves no gap for
+    /// fields and window indices to drift apart in.
+    share_rates: [f64; hashrate::WINDOW_COUNT],
+}
+
 /// A persisted update, applied by the writer thread.
 ///
 /// Every write originates on an async task — the share hot path, the snapshot
 /// ticker, the pruner — so none of them may touch the disk directly. They hand
 /// the work to one thread that owns the write connection instead, which also
-/// removes the lock contention that used to put dashboard queries and share
-/// submissions on the same mutex.
+/// keeps dashboard queries and share submissions off a shared mutex.
 enum StoreWrite {
     BestShare(u64),
     BestHashrate(f64),
@@ -196,11 +238,14 @@ enum StoreWrite {
         worker: String,
         difficulty: u64,
     },
-    Snapshot {
-        history_ts: u64,
-        state_ts: u64,
-        rates: HashrateWindows,
-        worker_rates: HashMap<String, HashrateWindows>,
+    Snapshot(SnapshotWrite),
+    /// The pool found a block: zero every "since the last found block"
+    /// quantity and stamp when the new round began. Watermark writes racing
+    /// this are not epoch-guarded — the worst case is one share-sized
+    /// watermark surviving the reset, re-earned by the next share.
+    RoundReset {
+        epoch: u64,
+        since_ts: u64,
     },
     PruneWorkerBestShares(usize),
     /// Enrol a found block in the confirmation ledger. Unlike everything else
@@ -213,8 +258,8 @@ enum StoreWrite {
         resolved_ts: u64,
     },
     /// Barrier: acknowledged once every write queued before it has been
-    /// applied. Production flushes by dropping the store instead.
-    #[cfg(test)]
+    /// applied. Bounds data loss on the shutdown path, where the store's
+    /// `Drop` never runs because every spawned task holds an `Arc` clone.
     Flush(std::sync::mpsc::Sender<()>),
 }
 
@@ -330,8 +375,71 @@ impl StatsStore {
             [],
         )?;
 
+        // Cumulative lifetime share counts on the snapshot grid. Rows are
+        // running totals, not per-interval deltas: differencing recovers the
+        // rate at any granularity, so the minute-level thinning loses nothing
+        // and a restart just leaves a flat step to difference across. Kept out
+        // of `hashrate_history` because `migrate_hashrate_algo` empties that
+        // table wholesale, and share counts must survive estimator changes.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS share_history (
+             ts INTEGER PRIMARY KEY,
+             shares_accepted INTEGER NOT NULL,
+             shares_rejected INTEGER NOT NULL
+             )",
+            [],
+        )?;
+
+        // Lifetime rejects broken down by reason. Keys come from the closed
+        // `RejectReason` label set (plus "rate_limited"), so the table is
+        // bounded at a handful of rows and never needs pruning.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pool_reject_reasons (
+             reason TEXT PRIMARY KEY,
+             count INTEGER NOT NULL
+             )",
+            [],
+        )?;
+
+        // Pool-wide accepted shares/min, as decaying averages on the snapshot
+        // grid — the same six windows `hashrate_history` carries, so the two
+        // charts plot the same points. Unlike `share_history` above these are
+        // decayed rather than raw counts, which is what ties them to the
+        // estimator version (see `migrate_hashrate_algo`).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS share_rate_history (
+             ts INTEGER PRIMARY KEY,
+             spm_1m REAL,
+             spm_5m REAL,
+             spm_10m REAL,
+             spm_1h REAL,
+             spm_6h REAL,
+             spm_24h REAL
+             )",
+            [],
+        )?;
+        // Checkpoint of the live meter, so a restart resumes the averages
+        // decayed across the downtime instead of starting from zero. All seven
+        // windows, matching `worker_hashrate_state`: restoring 3h as zero would
+        // silently corrupt it the day it gets exposed.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS share_rate_state (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             updated_ts INTEGER NOT NULL,
+             spm_1m REAL NOT NULL,
+             spm_5m REAL NOT NULL,
+             spm_10m REAL NOT NULL,
+             spm_1h REAL NOT NULL,
+             spm_3h REAL NOT NULL,
+             spm_6h REAL NOT NULL,
+             spm_24h REAL NOT NULL
+             )",
+            [],
+        )?;
+
         Self::migrate_hashrate_history(&conn)?;
         Self::migrate_hashrate_algo(&conn)?;
+        Self::migrate_share_stats(&conn)?;
 
         // Enforce the row cap at boot, synchronously and before the writer
         // thread exists, so an attacker-inflated table from a previous run is
@@ -375,14 +483,23 @@ impl StatsStore {
         }
     }
 
-    /// Block until every write queued so far has been applied.
-    #[cfg(test)]
+    /// Block until every write queued so far has been applied. Bounded: a
+    /// wedged disk must not be able to hang shutdown, so give up after five
+    /// seconds and let whatever is still queued go down with the process.
     fn flush(&self) {
         let (ack, done) = std::sync::mpsc::channel();
-        if let Some(writes) = self.writes.as_ref() {
-            if writes.send(StoreWrite::Flush(ack)).is_ok() {
-                let _ = done.recv();
+        let Some(writes) = self.writes.as_ref() else {
+            return;
+        };
+        match writes.try_send(StoreWrite::Flush(ack)) {
+            Ok(()) => {
+                if done.recv_timeout(Duration::from_secs(5)).is_err() {
+                    warn!("Timed out draining the stats write queue");
+                }
             }
+            // A full queue at flush time means the writer is already wedged;
+            // a blocking send would just move the hang here.
+            Err(_) => warn!("Stats write queue unavailable; skipping final flush"),
         }
     }
 
@@ -523,19 +640,12 @@ impl StatsStore {
         });
     }
 
-    fn record_hashrate_snapshot(
-        &self,
-        history_ts: u64,
-        state_ts: u64,
-        rates: HashrateWindows,
-        worker_rates: &HashMap<String, HashrateWindows>,
-    ) {
-        self.enqueue(StoreWrite::Snapshot {
-            history_ts,
-            state_ts,
-            rates,
-            worker_rates: worker_rates.clone(),
-        });
+    fn record_hashrate_snapshot(&self, snapshot: SnapshotWrite) {
+        self.enqueue(StoreWrite::Snapshot(snapshot));
+    }
+
+    fn round_reset(&self, epoch: u64, since_ts: u64) {
+        self.enqueue(StoreWrite::RoundReset { epoch, since_ts });
     }
 
     fn migrate_hashrate_history(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -566,12 +676,17 @@ impl StatsStore {
     /// Discard history written by an earlier hashrate estimator.
     ///
     /// Values from a different estimator are not comparable with the current
-    /// one, and the sliding-window estimator this replaced could emit readings
+    /// one, and the estimator that wrote them could emit readings
     /// orders of magnitude too high when a lone share landed in a window — a
     /// single such sample pins the chart's y-axis and permanently poisons the
     /// all-time best-hashrate watermark. Rather than try to filter them, drop
     /// the series and start clean. Found blocks, best shares and per-worker
     /// bests are keyed elsewhere and survive.
+    ///
+    /// The line is decayed-vs-raw, not shares-vs-hashrate: `share_rate_*` comes
+    /// out of the same decay kernel and is dropped alongside, while
+    /// `share_history`'s undecayed cumulative counts mean the same thing under
+    /// any estimator and are left alone.
     fn migrate_hashrate_algo(conn: &Connection) -> Result<(), rusqlite::Error> {
         let mut stmt = conn.prepare("PRAGMA table_info(pool_stats)")?;
         let existing: std::collections::HashSet<String> = stmt
@@ -598,8 +713,10 @@ impl StatsStore {
             return Ok(());
         }
 
-        let dropped_history = conn.execute("DELETE FROM hashrate_history", [])?;
-        let dropped_state = conn.execute("DELETE FROM worker_hashrate_state", [])?;
+        let dropped_history = conn.execute("DELETE FROM hashrate_history", [])?
+            + conn.execute("DELETE FROM share_rate_history", [])?;
+        let dropped_state = conn.execute("DELETE FROM worker_hashrate_state", [])?
+            + conn.execute("DELETE FROM share_rate_state", [])?;
         conn.execute(
             "UPDATE pool_stats
              SET best_hashrate_hps = 0.0, hashrate_algo_version = ?1
@@ -616,7 +733,131 @@ impl StatsStore {
         Ok(())
     }
 
-    fn get_hashrate_history(&self, since_ts: u64, bucket_secs: u64) -> Vec<HashrateHistoryPoint> {
+    /// Add the since-last-block share counters to `pool_stats`. Runs after
+    /// `migrate_hashrate_algo` so that migration never sees columns it
+    /// predates. `stats_since_ts` marks where the totals start counting from:
+    /// set on the first boot with this schema, then moved forward by each
+    /// `RoundReset`.
+    fn migrate_share_stats(conn: &Connection) -> Result<(), rusqlite::Error> {
+        let mut stmt = conn.prepare("PRAGMA table_info(pool_stats)")?;
+        let existing: std::collections::HashSet<String> = stmt
+            .query_map([], |row| row.get(1))?
+            .filter_map(Result::ok)
+            .collect();
+        drop(stmt);
+
+        for column in [
+            "lifetime_shares_accepted",
+            "lifetime_shares_rejected",
+            "stats_since_ts",
+            "round_work",
+        ] {
+            if !existing.contains(column) {
+                conn.execute(
+                    &format!(
+                        "ALTER TABLE pool_stats ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                    ),
+                    [],
+                )?;
+            }
+        }
+
+        conn.execute(
+            "UPDATE pool_stats SET stats_since_ts = ?1 WHERE id = 1 AND stats_since_ts = 0",
+            params![PoolStats::now_secs()],
+        )?;
+        Ok(())
+    }
+
+    fn load_lifetime_stats(&self) -> Result<(ShareTotals, u64, u64), rusqlite::Error> {
+        let conn = self.read.lock();
+        conn.query_row(
+            "SELECT lifetime_shares_accepted, lifetime_shares_rejected, stats_since_ts,
+                    round_work
+             FROM pool_stats WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    ShareTotals {
+                        accepted: row.get(0)?,
+                        rejected: row.get(1)?,
+                    },
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
+            },
+        )
+    }
+
+    fn load_reject_reasons(&self) -> Result<BTreeMap<String, u64>, rusqlite::Error> {
+        let conn = self.read.lock();
+        let mut stmt = conn.prepare("SELECT reason, count FROM pool_reject_reasons")?;
+        let mut rows = stmt.query([])?;
+        let mut reasons = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            reasons.insert(row.get::<_, String>(0)?, row.get::<_, u64>(1)?);
+        }
+        Ok(reasons)
+    }
+
+    /// The pool share-rate checkpoint, or `None` before the first snapshot has
+    /// ever been written.
+    fn load_share_rate_state(
+        &self,
+    ) -> Result<Option<(u64, [f64; hashrate::WINDOW_COUNT])>, rusqlite::Error> {
+        let conn = self.read.lock();
+        conn.query_row(
+            "SELECT updated_ts, spm_1m, spm_5m, spm_10m, spm_1h, spm_3h, spm_6h, spm_24h
+             FROM share_rate_state WHERE id = 1",
+            [],
+            |row| {
+                let mut rates = [0.0; hashrate::WINDOW_COUNT];
+                rates[hashrate::W_1M] = row.get(1)?;
+                rates[hashrate::W_5M] = row.get(2)?;
+                rates[hashrate::W_10M] = row.get(3)?;
+                rates[hashrate::W_1H] = row.get(4)?;
+                rates[hashrate::W_3H] = row.get(5)?;
+                rates[hashrate::W_6H] = row.get(6)?;
+                rates[hashrate::W_24H] = row.get(7)?;
+                Ok(Some((row.get(0)?, rates)))
+            },
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+    }
+
+    fn get_share_rate_history(&self, since_ts: u64, bucket_secs: u64) -> Vec<RateHistoryPoint> {
+        let conn = self.read.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT (ts / ?2) * ?2 AS bucket_ts,
+                    AVG(spm_1m), AVG(spm_5m), AVG(spm_10m),
+                    AVG(spm_1h), AVG(spm_6h), AVG(spm_24h)
+             FROM share_rate_history
+             WHERE ts >= ?1
+             GROUP BY bucket_ts
+             ORDER BY bucket_ts ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![since_ts, bucket_secs.max(1)], |row| {
+            Ok(RateHistoryPoint {
+                ts: row.get(0)?,
+                one_minute: row.get(1)?,
+                five_minutes: row.get(2)?,
+                ten_minutes: row.get(3)?,
+                one_hour: row.get(4)?,
+                six_hours: row.get(5)?,
+                twenty_four_hours: row.get(6)?,
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    fn get_hashrate_history(&self, since_ts: u64, bucket_secs: u64) -> Vec<RateHistoryPoint> {
         let conn = self.read.lock();
         let mut stmt = match conn.prepare(
             "SELECT (ts / ?2) * ?2 AS bucket_ts,
@@ -631,7 +872,7 @@ impl StatsStore {
             Err(_) => return vec![],
         };
         stmt.query_map(params![since_ts, bucket_secs.max(1)], |row| {
-            Ok(HashrateHistoryPoint {
+            Ok(RateHistoryPoint {
                 ts: row.get(0)?,
                 one_minute: row.get(1)?,
                 five_minutes: row.get(2)?,
@@ -654,14 +895,22 @@ impl StatsStore {
 /// connection, so SQLite never sees two writers and every statement below runs
 /// off the async runtime.
 fn writer_loop(conn: Connection, rx: std::sync::mpsc::Receiver<StoreWrite>) {
+    // Epoch of the last RoundReset applied this boot. Snapshots read their
+    // epoch before their share stats, so one carrying an older epoch was
+    // assembled before that reset and its share stats must not be re-applied.
+    let mut round_epoch = 0u64;
     while let Ok(write) = rx.recv() {
-        if let Err(e) = apply_write(&conn, write) {
+        if let Err(e) = apply_write(&conn, write, &mut round_epoch) {
             warn!("Failed to persist stats update: {e}");
         }
     }
 }
 
-fn apply_write(conn: &Connection, write: StoreWrite) -> Result<(), rusqlite::Error> {
+fn apply_write(
+    conn: &Connection,
+    write: StoreWrite,
+    round_epoch: &mut u64,
+) -> Result<(), rusqlite::Error> {
     match write {
         // The `?1 > ...` guards keep the watermarks monotonic at the SQL level:
         // updates can be queued out of order, and a stale lower value must not
@@ -724,13 +973,26 @@ fn apply_write(conn: &Connection, write: StoreWrite) -> Result<(), rusqlite::Err
                 params![hash, resolution.label(), resolved_ts, BLOCK_STATUS_PENDING],
             )?;
         }
-        StoreWrite::Snapshot {
-            history_ts,
-            state_ts,
-            rates,
-            worker_rates,
-        } => write_snapshot(conn, history_ts, state_ts, rates, &worker_rates)?,
-        #[cfg(test)]
+        StoreWrite::Snapshot(snapshot) => {
+            let stale_round = snapshot.round_epoch < *round_epoch;
+            write_snapshot(conn, &snapshot, stale_round)?;
+        }
+        StoreWrite::RoundReset { epoch, since_ts } => {
+            *round_epoch = (*round_epoch).max(epoch);
+            conn.execute(
+                "UPDATE pool_stats SET
+                   lifetime_shares_accepted = 0,
+                   lifetime_shares_rejected = 0,
+                   round_work = 0,
+                   best_share_difficulty = 0,
+                   best_hashrate_hps = 0.0,
+                   stats_since_ts = ?1
+                 WHERE id = 1",
+                params![since_ts],
+            )?;
+            conn.execute("DELETE FROM pool_reject_reasons", [])?;
+            conn.execute("DELETE FROM worker_best_shares", [])?;
+        }
         StoreWrite::Flush(ack) => {
             let _ = ack.send(());
         }
@@ -740,11 +1002,20 @@ fn apply_write(conn: &Connection, write: StoreWrite) -> Result<(), rusqlite::Err
 
 fn write_snapshot(
     conn: &Connection,
-    history_ts: u64,
-    state_ts: u64,
-    rates: HashrateWindows,
-    worker_rates: &HashMap<String, HashrateWindows>,
+    snapshot: &SnapshotWrite,
+    stale_round: bool,
 ) -> Result<(), rusqlite::Error> {
+    let SnapshotWrite {
+        history_ts,
+        state_ts,
+        rates,
+        worker_rates,
+        share_totals,
+        lifetime_reject_reasons,
+        round_work,
+        round_epoch: _,
+        share_rates,
+    } = snapshot;
     {
         let tx = conn.unchecked_transaction()?;
         tx.execute(
@@ -788,6 +1059,72 @@ fn write_snapshot(
                 ])?;
             }
         }
+
+        // Share stats are round-scoped: a snapshot assembled before a round
+        // reset the writer has already applied must not re-persist them.
+        if !stale_round {
+            tx.execute(
+                "INSERT OR REPLACE INTO share_history (ts, shares_accepted, shares_rejected)
+                 VALUES (?1, ?2, ?3)",
+                params![history_ts, share_totals.accepted, share_totals.rejected],
+            )?;
+            // Scalar MAX keeps the persisted totals monotonic within a round,
+            // same idea as the watermark guards in `apply_write`: the baseline
+            // the next boot restores must never regress, whatever order queued
+            // snapshots land in.
+            tx.execute(
+                "UPDATE pool_stats SET
+                   lifetime_shares_accepted = MAX(lifetime_shares_accepted, ?1),
+                   lifetime_shares_rejected = MAX(lifetime_shares_rejected, ?2),
+                   round_work = MAX(round_work, ?3)
+                 WHERE id = 1",
+                params![share_totals.accepted, share_totals.rejected, round_work],
+            )?;
+
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO pool_reject_reasons (reason, count) VALUES (?1, ?2)
+                     ON CONFLICT(reason) DO UPDATE SET count = MAX(count, excluded.count)",
+                )?;
+                for (reason, count) in lifetime_reject_reasons {
+                    stmt.execute(params![reason, count])?;
+                }
+            }
+        }
+
+        // Share rate: the plotted series on the history grid, and the single
+        // checkpoint row the next boot resumes from. Bound by `W_*` index so
+        // the column order cannot silently drift from the window order.
+        tx.execute(
+            "INSERT OR REPLACE INTO share_rate_history (
+               ts, spm_1m, spm_5m, spm_10m, spm_1h, spm_6h, spm_24h
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                history_ts,
+                share_rates[hashrate::W_1M],
+                share_rates[hashrate::W_5M],
+                share_rates[hashrate::W_10M],
+                share_rates[hashrate::W_1H],
+                share_rates[hashrate::W_6H],
+                share_rates[hashrate::W_24H],
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO share_rate_state (
+               id, updated_ts, spm_1m, spm_5m, spm_10m, spm_1h, spm_3h, spm_6h, spm_24h
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                state_ts,
+                share_rates[hashrate::W_1M],
+                share_rates[hashrate::W_5M],
+                share_rates[hashrate::W_10M],
+                share_rates[hashrate::W_1H],
+                share_rates[hashrate::W_3H],
+                share_rates[hashrate::W_6H],
+                share_rates[hashrate::W_24H],
+            ],
+        )?;
+
         tx.commit()?;
     }
 
@@ -804,6 +1141,26 @@ fn write_snapshot(
     let cutoff = history_ts.saturating_sub(6 * 30 * 24 * 3600);
     conn.execute(
         "DELETE FROM hashrate_history WHERE ts < ?1",
+        params![cutoff],
+    )?;
+
+    // The share series lives on the same grid with the same retention. Rows
+    // are cumulative, so thinning drops resolution, not counts.
+    conn.execute(
+        "DELETE FROM share_history WHERE ts < ?1 AND ts % 60 != 0",
+        params![fine_cutoff],
+    )?;
+    conn.execute("DELETE FROM share_history WHERE ts < ?1", params![cutoff])?;
+
+    // Same grid, same retention again. Unlike `share_history` these rows are
+    // averages rather than running totals, so thinning them loses the same
+    // detail the hashrate series loses — no more.
+    conn.execute(
+        "DELETE FROM share_rate_history WHERE ts < ?1 AND ts % 60 != 0",
+        params![fine_cutoff],
+    )?;
+    conn.execute(
+        "DELETE FROM share_rate_history WHERE ts < ?1",
         params![cutoff],
     )?;
     Ok(())
@@ -831,6 +1188,38 @@ fn prune_worker_best_shares(conn: &Connection, keep: usize) {
 pub struct PoolStats {
     shares_accepted: AtomicU64,
     shares_rejected: AtomicU64,
+    /// Accepted/rejected totals carried over from previous runs. The atomics
+    /// above count this boot only; anything round-facing goes through
+    /// `lifetime_shares_accepted()`/`..rejected()` = base + atomic − round
+    /// offset. Immutable after construction, so plain integers.
+    lifetime_accepted_base: u64,
+    lifetime_rejected_base: u64,
+    /// Value of base + atomic captured at the last round reset, so the
+    /// displayed totals restart at zero while the boot counters keep serving
+    /// the session cards. Zero until a block is found this boot.
+    round_offset_accepted: AtomicU64,
+    round_offset_rejected: AtomicU64,
+    /// Accepted-share work (vardiff credit) accumulated since the pool last
+    /// found a block — the "Pool difficulty" KPI. Restored from the stats DB
+    /// at boot; zeroed by `round_reset`.
+    round_work: AtomicU64,
+    /// Round resets this boot. Snapshot writes carry it so the writer thread
+    /// can discard share stats assembled before a reset it already applied.
+    round_epoch: AtomicU64,
+    /// Unix time the current round's accounting began: DB creation, then the
+    /// last found block. Boot time when no stats DB is configured, so the
+    /// totals above still read coherently.
+    stats_since_ts: AtomicU64,
+    /// This boot's rejects by reason, pool-wide. Keys are the closed reject
+    /// label set, so cardinality is bounded; a mutex is fine because rejects
+    /// are the exception on the share path.
+    reject_reasons: Mutex<BTreeMap<&'static str, u64>>,
+    /// Rejects by reason carried over from previous runs; same baseline
+    /// arrangement as the share totals above. Immutable after construction.
+    lifetime_reject_reasons_base: BTreeMap<String, u64>,
+    /// Merged reason counts captured at the last round reset — the per-reason
+    /// analogue of `round_offset_accepted`.
+    round_offset_reject_reasons: Mutex<BTreeMap<String, u64>>,
     blocks_found: AtomicU64,
     /// Blocks we mined that were consensus-valid but lost a same-height race,
     /// so they sit on a side branch and earned nothing. Tracked apart from
@@ -853,15 +1242,6 @@ pub struct PoolStats {
     /// Estimated difficulty change (%) at the next retarget, from epoch timestamps.
     /// Stored as f64::to_bits; NaN until first polled / right after a retarget.
     est_difficulty_change_pct: AtomicU64,
-    last_block_worker: Mutex<Option<String>>,
-    last_block_payout: Mutex<Option<String>>,
-    last_block_hash: Mutex<Option<String>>,
-    last_block_ts: AtomicU64,
-    /// Where the last winning block stands with the confirmation pass:
-    /// `BLOCK_STATUS_PENDING` until it resolves, then a `BlockResolution`
-    /// label. Without it the card would keep advertising a block that has since
-    /// been reorged away.
-    last_block_status: Mutex<&'static str>,
     /// Found blocks still awaiting confirmation, keyed by display hash. This is
     /// the working set `mining::confirm` sweeps; it is mirrored to SQLite when
     /// a stats DB is configured and lives here alone when one is not.
@@ -873,6 +1253,18 @@ pub struct PoolStats {
     /// goes quiet — or drops its connection — falls off without any special
     /// case.
     session_hashrates: DashMap<String, SessionHashrate>,
+    /// Accepted shares not yet folded into `share_rate`. Counting here rather
+    /// than locking the meter keeps the share path to one relaxed add; the
+    /// hashrate ticker drains it.
+    pending_shares: AtomicU64,
+    /// Pool-wide accepted share rate, over the same decaying windows as
+    /// hashrate. Its state is per second like every `HashrateDecay`; everything
+    /// outside reads it per minute through `share_rate_windows`. One meter
+    /// rather than one per session: unlike hashrate this is not summed from
+    /// parts, and nothing displays it per worker. It is also never evicted when
+    /// idle — there is only the one, and a quiet pool should read zero rather
+    /// than disappear.
+    share_rate: Mutex<hashrate::HashrateDecay>,
     worker_protocol: DashMap<String, String>,
     worker_last_submit_ts: DashMap<String, u64>,
     worker_best_shares: DashMap<String, u64>,
@@ -922,6 +1314,14 @@ struct Persisted {
     blocks_found: u64,
     blocks_orphaned: u64,
     blocks_inconclusive: u64,
+    lifetime_share_totals: ShareTotals,
+    stats_since_ts: u64,
+    round_work: u64,
+    lifetime_reject_reasons: BTreeMap<String, u64>,
+    /// Checkpointed pool share rate: when it was written, and the per-window
+    /// shares/min at that moment. `None` when the table has no row yet, which
+    /// is every boot before this feature existed.
+    share_rate: Option<(u64, [f64; hashrate::WINDOW_COUNT])>,
 }
 
 impl Persisted {
@@ -954,6 +1354,19 @@ impl Persisted {
                 warn!("Failed to restore block counts from DB {path}: {e}");
                 (0, 0, 0)
             });
+        let (lifetime_share_totals, stats_since_ts, round_work) =
+            store.load_lifetime_stats().unwrap_or_else(|e| {
+                warn!("Failed to restore share totals from DB {path}: {e}");
+                (ShareTotals::default(), 0, 0)
+            });
+        let lifetime_reject_reasons = store.load_reject_reasons().unwrap_or_else(|e| {
+            warn!("Failed to restore reject reasons from DB {path}: {e}");
+            BTreeMap::new()
+        });
+        let share_rate = store.load_share_rate_state().unwrap_or_else(|e| {
+            warn!("Failed to restore share rate from DB {path}: {e}");
+            None
+        });
         if !pending_blocks.is_empty() {
             info!(
                 "Restored {} block(s) awaiting confirmation from {path}",
@@ -970,6 +1383,11 @@ impl Persisted {
             blocks_found,
             blocks_orphaned,
             blocks_inconclusive,
+            lifetime_share_totals,
+            stats_since_ts,
+            round_work,
+            lifetime_reject_reasons,
+            share_rate,
         }
     }
 }
@@ -994,6 +1412,11 @@ impl PoolStats {
             blocks_found,
             blocks_orphaned,
             blocks_inconclusive,
+            lifetime_share_totals,
+            stats_since_ts,
+            round_work,
+            lifetime_reject_reasons,
+            share_rate: persisted_share_rate,
         } = stats_db_path
             .filter(|p| !p.is_empty())
             .map(|path| Persisted::load(&path))
@@ -1028,9 +1451,38 @@ impl PoolStats {
             }
         }
 
+        // Resume the pool share rate from its checkpoint, decayed across the
+        // downtime, exactly as the per-worker hashrates above are. Unlike them
+        // an idle result is kept rather than dropped: there is only one meter,
+        // and it has to exist for the ticker to fold into.
+        let share_rate = match persisted_share_rate {
+            Some((updated_ts, rates)) => hashrate::HashrateDecay::restored_per_minute(
+                instant_now,
+                rates,
+                Duration::from_secs(wall_now.saturating_sub(updated_ts)),
+            ),
+            None => hashrate::HashrateDecay::new(instant_now),
+        };
+
         Arc::new(Self {
             shares_accepted: AtomicU64::new(0),
             shares_rejected: AtomicU64::new(0),
+            lifetime_accepted_base: lifetime_share_totals.accepted,
+            lifetime_rejected_base: lifetime_share_totals.rejected,
+            round_offset_accepted: AtomicU64::new(0),
+            round_offset_rejected: AtomicU64::new(0),
+            round_work: AtomicU64::new(round_work),
+            round_epoch: AtomicU64::new(0),
+            // Zero covers every no-persistence path: `Persisted::default()`
+            // and a DB the migration has not stamped yet.
+            stats_since_ts: AtomicU64::new(if stats_since_ts == 0 {
+                wall_now
+            } else {
+                stats_since_ts
+            }),
+            reject_reasons: Mutex::new(BTreeMap::new()),
+            lifetime_reject_reasons_base: lifetime_reject_reasons,
+            round_offset_reject_reasons: Mutex::new(BTreeMap::new()),
             blocks_found: AtomicU64::new(blocks_found),
             blocks_inconclusive: AtomicU64::new(blocks_inconclusive),
             blocks_orphaned: AtomicU64::new(blocks_orphaned),
@@ -1046,15 +1498,12 @@ impl PoolStats {
             network_difficulty: AtomicU64::new(f64::to_bits(0.0)),
             est_difficulty_change_pct: AtomicU64::new(f64::to_bits(f64::NAN)),
             session_hashrates,
+            pending_shares: AtomicU64::new(0),
+            share_rate: Mutex::new(share_rate),
             worker_protocol: DashMap::new(),
             worker_last_submit_ts: DashMap::new(),
             worker_best_shares,
             worker_states: DashMap::new(),
-            last_block_worker: Mutex::new(None),
-            last_block_payout: Mutex::new(None),
-            last_block_hash: Mutex::new(None),
-            last_block_ts: AtomicU64::new(0),
-            last_block_status: Mutex::new(BLOCK_STATUS_PENDING),
             pending_blocks,
             start_time: instant_now,
             store,
@@ -1081,46 +1530,121 @@ impl PoolStats {
         self.connected_miners.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub fn share_accepted(&self, difficulty: u64) {
+    /// `credit` is the share's vardiff work value and feeds the round-work
+    /// accumulator; `hash_difficulty` is the actual difficulty of the hash
+    /// and drives the best-share watermarks.
+    pub fn share_accepted(&self, credit: u64, hash_difficulty: u64) {
         self.shares_accepted.fetch_add(1, Ordering::Relaxed);
+        // Counted here, not weighted by difficulty: this is share throughput,
+        // which is exactly what the hashrate estimate divides back out.
+        self.pending_shares.fetch_add(1, Ordering::Relaxed);
+        self.round_work.fetch_add(credit, Ordering::Relaxed);
 
-        // All-time best share. `fetch_max` is the whole CAS loop: it only ever
+        // Round-best share. `fetch_max` is the whole CAS loop: it only ever
         // raises the watermark, so two racing writers cannot lose the higher
         // value. Persist only when this call is the one that raised it.
         if self
             .best_share_difficulty
-            .fetch_max(difficulty, Ordering::Relaxed)
-            < difficulty
+            .fetch_max(hash_difficulty, Ordering::Relaxed)
+            < hash_difficulty
         {
-            self.persist_best_share_difficulty(difficulty);
+            self.persist_best_share_difficulty(hash_difficulty);
         }
         self.session_best_share_difficulty
-            .fetch_max(difficulty, Ordering::Relaxed);
+            .fetch_max(hash_difficulty, Ordering::Relaxed);
     }
 
-    pub fn share_rejected(&self) {
+    /// `reason` must come from the closed reject label set
+    /// (`RejectReason::label()` or `"rate_limited"`) — it becomes a persisted
+    /// map key, so it must not be mintable from miner input.
+    pub fn share_rejected(&self, reason: &'static str) {
         self.shares_rejected.fetch_add(1, Ordering::Relaxed);
+        *self.reject_reasons.lock().entry(reason).or_insert(0) += 1;
     }
 
-    pub fn block_found(&self, worker: &str, payout: &str, hash: &str) {
+    /// Accepted shares since the last found block (pool lifetime until the
+    /// first win): persisted base plus this boot, minus the round offset.
+    fn lifetime_shares_accepted(&self) -> u64 {
+        self.lifetime_accepted_base
+            .saturating_add(self.shares_accepted.load(Ordering::Relaxed))
+            .saturating_sub(self.round_offset_accepted.load(Ordering::Relaxed))
+    }
+
+    fn lifetime_shares_rejected(&self) -> u64 {
+        self.lifetime_rejected_base
+            .saturating_add(self.shares_rejected.load(Ordering::Relaxed))
+            .saturating_sub(self.round_offset_rejected.load(Ordering::Relaxed))
+    }
+
+    /// This boot's pool-wide rejects by reason.
+    fn session_reject_reasons(&self) -> BTreeMap<String, u64> {
+        self.reject_reasons
+            .lock()
+            .iter()
+            .map(|(reason, count)| ((*reason).to_string(), *count))
+            .collect()
+    }
+
+    /// Rejects by reason since the last found block: the persisted baseline
+    /// plus this boot, minus the counts captured at the last round reset.
+    fn lifetime_reject_reasons(&self) -> BTreeMap<String, u64> {
+        let mut merged = self.lifetime_reject_reasons_base.clone();
+        for (reason, count) in self.reject_reasons.lock().iter() {
+            *merged.entry((*reason).to_string()).or_insert(0) += count;
+        }
+        let offsets = self.round_offset_reject_reasons.lock();
+        merged.retain(|reason, count| {
+            *count = count.saturating_sub(offsets.get(reason).copied().unwrap_or(0));
+            *count > 0
+        });
+        merged
+    }
+
+    /// Count a block the pool won and start a new round. The block's identity
+    /// goes to the ledger via `enroll_pending_block`, not here.
+    pub fn block_found(&self) {
         self.blocks_found.fetch_add(1, Ordering::Relaxed);
-        *self.last_block_worker.lock() = Some(worker.to_string());
-        *self.last_block_payout.lock() = Some(payout.to_string());
-        *self.last_block_hash.lock() = Some(hash.to_string());
-        // A block only just claimed has not been confirmed yet, whatever the
-        // previous occupant of this card had reached.
-        *self.last_block_status.lock() = BLOCK_STATUS_PENDING;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        self.last_block_ts.store(now, Ordering::Relaxed);
+        self.round_reset();
     }
 
-    /// A block that was valid but did not become the chain tip.
-    ///
-    /// Deliberately does not touch `last_block_*`: the dashboard's "Last block
-    /// found" card must only ever show a block that actually won.
+    /// Zero every "since the last found block" quantity, in memory and in the
+    /// store. Session counters (this boot's cards) and the Prometheus
+    /// counters, which must stay monotonic, are left alone.
+    fn round_reset(&self) {
+        let epoch = self.round_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = Self::now_secs();
+        self.round_offset_accepted.store(
+            self.lifetime_accepted_base
+                .saturating_add(self.shares_accepted.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        self.round_offset_rejected.store(
+            self.lifetime_rejected_base
+                .saturating_add(self.shares_rejected.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        {
+            let mut offsets = self.round_offset_reject_reasons.lock();
+            *offsets = self.lifetime_reject_reasons_base.clone();
+            for (reason, count) in self.reject_reasons.lock().iter() {
+                *offsets.entry((*reason).to_string()).or_insert(0) += count;
+            }
+        }
+        self.round_work.store(0, Ordering::Relaxed);
+        self.best_share_difficulty.store(0, Ordering::Relaxed);
+        self.best_hashrate_hps.store(0, Ordering::Relaxed);
+        self.stats_since_ts.store(now, Ordering::Relaxed);
+        self.worker_best_shares.clear();
+        for mut state in self.worker_states.iter_mut() {
+            state.best_share_difficulty = 0;
+        }
+        if let Some(store) = &self.store {
+            store.round_reset(epoch, now);
+        }
+    }
+
+    /// A block that was valid but did not become the chain tip. It must not
+    /// count as a find.
     pub fn block_inconclusive(&self) {
         self.blocks_inconclusive.fetch_add(1, Ordering::Relaxed);
     }
@@ -1190,22 +1714,16 @@ impl PoolStats {
                     });
             }
             // Lost its height race, then a reorg put it on the active chain
-            // after all. `block_found` also refreshes the last-block card,
-            // which is right: it is now the most recent block the pool won.
+            // after all: count the find the submit-time verdict missed.
             (false, BlockResolution::Confirmed) => {
                 let _ = self.blocks_inconclusive.fetch_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     |n| Some(n.saturating_sub(1)),
                 );
-                self.block_found(&block.worker, &block.payout, &block.hash);
+                self.block_found();
             }
             _ => {}
-        }
-
-        // Only annotate the card if it is still showing this block.
-        if self.last_block_hash.lock().as_deref() == Some(block.hash.as_str()) {
-            *self.last_block_status.lock() = resolution.label();
         }
 
         if let Some(store) = &self.store {
@@ -1299,7 +1817,24 @@ impl PoolStats {
         }
         crate::metrics::update_pool_hashrate(total.to_windows());
 
+        // The pool share-rate meter rides the same tick, so its windows decay
+        // in step with the hashrate ones and the two charts stay comparable.
+        // `add_share` ignores a zero, so an idle tick still decays correctly.
+        let pending = self.pending_shares.swap(0, Ordering::Relaxed);
+        let share_rates = {
+            let mut meter = self.share_rate.lock();
+            meter.add_share(pending as f64);
+            meter.tick(now);
+            meter.rates()
+        };
+        crate::metrics::update_pool_share_rate(share_rates);
+
         self.record_best_hashrate(total.ten_minutes);
+    }
+
+    /// Pool-wide accepted shares per minute, `hashrate::W_*`-indexed.
+    fn share_rate_windows(&self) -> [f64; hashrate::WINDOW_COUNT] {
+        self.share_rate.lock().per_minute()
     }
 
     /// Track all-time best (persistent) and session-best (since boot).
@@ -1527,23 +2062,56 @@ impl PoolStats {
             // which unsnapped timestamps would hit only by luck, thinning the
             // long-range history away to nothing.
             let history_ts = state_ts / SNAPSHOT_INTERVAL_SECS * SNAPSHOT_INTERVAL_SECS;
+            // Epoch before share stats: a reset landing in between leaves an
+            // old epoch on fresh (already-zeroed) stats, which the writer
+            // treats as stale and skips — never the reverse.
+            let round_epoch = self.round_epoch.load(Ordering::Relaxed);
             let by_worker = self.hashrates_by_worker();
             let mut total = HashrateWindows::default();
             for rates in by_worker.values() {
                 total.add(*rates);
             }
-            store.record_hashrate_snapshot(history_ts, state_ts, total, &by_worker);
+            store.record_hashrate_snapshot(SnapshotWrite {
+                history_ts,
+                state_ts,
+                rates: total,
+                worker_rates: by_worker,
+                share_totals: ShareTotals {
+                    accepted: self.lifetime_shares_accepted(),
+                    rejected: self.lifetime_shares_rejected(),
+                },
+                lifetime_reject_reasons: self.lifetime_reject_reasons(),
+                round_work: self.round_work.load(Ordering::Relaxed),
+                round_epoch,
+                share_rates: self.share_rate_windows(),
+            });
         }
     }
 
-    pub fn get_hashrate_history(
-        &self,
-        since_ts: u64,
-        bucket_secs: u64,
-    ) -> Vec<HashrateHistoryPoint> {
+    /// Final persist before process exit: one last snapshot (lifetime totals,
+    /// share series, worker-hashrate and share-rate checkpoints), then drain
+    /// the write queue.
+    /// The explicit call exists because every spawned task holds an `Arc`
+    /// clone of this struct, so the store's `Drop` flush never runs in
+    /// production.
+    pub fn shutdown_persist(&self) {
+        self.record_hashrate_snapshot();
+        if let Some(store) = &self.store {
+            store.flush();
+        }
+    }
+
+    pub fn get_hashrate_history(&self, since_ts: u64, bucket_secs: u64) -> Vec<RateHistoryPoint> {
         self.store
             .as_ref()
             .map(|s| s.get_hashrate_history(since_ts, bucket_secs))
+            .unwrap_or_default()
+    }
+
+    pub fn get_share_rate_history(&self, since_ts: u64, bucket_secs: u64) -> Vec<RateHistoryPoint> {
+        self.store
+            .as_ref()
+            .map(|s| s.get_share_rate_history(since_ts, bucket_secs))
             .unwrap_or_default()
     }
 
@@ -1589,6 +2157,7 @@ impl PoolStats {
         }
 
         let best_hashrate_hps = f64::from_bits(self.best_hashrate_hps.load(Ordering::Relaxed));
+        let share_rates = self.share_rate_windows();
 
         let mut seen = std::collections::HashSet::new();
         let mut worker_states: Vec<WorkerState> = self
@@ -1676,6 +2245,11 @@ impl PoolStats {
         StatsSnapshot {
             shares_accepted: self.shares_accepted.load(Ordering::Relaxed),
             shares_rejected: self.shares_rejected.load(Ordering::Relaxed),
+            lifetime_shares_accepted: self.lifetime_shares_accepted(),
+            lifetime_shares_rejected: self.lifetime_shares_rejected(),
+            stats_since_ts: self.stats_since_ts.load(Ordering::Relaxed),
+            reject_reasons: self.session_reject_reasons(),
+            lifetime_reject_reasons: self.lifetime_reject_reasons(),
             blocks_found: self.blocks_found.load(Ordering::Relaxed),
             blocks_inconclusive: self.blocks_inconclusive.load(Ordering::Relaxed),
             blocks_orphaned: self.blocks_orphaned.load(Ordering::Relaxed),
@@ -1699,6 +2273,12 @@ impl PoolStats {
             total_hashrate_3h: totals.three_hours,
             total_hashrate_6h: totals.six_hours,
             total_hashrate_24h: totals.twenty_four_hours,
+            shares_per_minute_1m: share_rates[hashrate::W_1M],
+            shares_per_minute_5m: share_rates[hashrate::W_5M],
+            shares_per_minute_10m: share_rates[hashrate::W_10M],
+            shares_per_minute_1h: share_rates[hashrate::W_1H],
+            shares_per_minute_6h: share_rates[hashrate::W_6H],
+            shares_per_minute_24h: share_rates[hashrate::W_24H],
             worker_hashrates,
             worker_states,
             network_hashrate_hps: f64::from_bits(self.network_hashrate_hps.load(Ordering::Relaxed)),
@@ -1710,23 +2290,7 @@ impl PoolStats {
             session_best_hashrate_hps: f64::from_bits(
                 self.session_best_hashrate_hps.load(Ordering::Relaxed),
             ),
-            last_block_worker: self
-                .last_block_worker
-                .lock()
-                .clone()
-                .unwrap_or_else(|| "—".to_string()),
-            last_block_payout: self
-                .last_block_payout
-                .lock()
-                .clone()
-                .unwrap_or_else(|| "—".to_string()),
-            last_block_hash: self
-                .last_block_hash
-                .lock()
-                .clone()
-                .unwrap_or_else(|| "—".to_string()),
-            last_block_ts: self.last_block_ts.load(Ordering::Relaxed),
-            last_block_status: (*self.last_block_status.lock()).to_string(),
+            pool_difficulty: self.round_work.load(Ordering::Relaxed),
             unsupported_rules: Vec::new(),
             rules_block_work: false,
         }
@@ -1741,6 +2305,23 @@ impl PoolStats {
 pub struct StatsSnapshot {
     pub shares_accepted: u64,
     pub shares_rejected: u64,
+    /// Totals since the pool's last found block (`stats_since_ts` onward) —
+    /// its whole recorded life until the first win; the pair above counts this
+    /// process only. Identical to that pair when no stats DB is configured.
+    pub lifetime_shares_accepted: u64,
+    pub lifetime_shares_rejected: u64,
+    /// Unix time the current round's accounting began: DB creation, then the
+    /// last found block.
+    pub stats_since_ts: u64,
+    /// This process's pool-wide rejects by reason. Unlike the per-worker
+    /// breakdowns in `worker_states`, this also counts rejects that never
+    /// attached to a known worker (pre-auth rate limiting) and survives
+    /// worker eviction.
+    pub reject_reasons: BTreeMap<String, u64>,
+    /// Rejects by reason since the last found block. Reasons were introduced
+    /// after the share totals, so their sum can trail
+    /// `lifetime_shares_rejected` on pools with older history.
+    pub lifetime_reject_reasons: BTreeMap<String, u64>,
     /// Wins that have survived so far: decremented when the confirmation pass
     /// finds one was reorged out. The Prometheus counter of the same name
     /// cannot go down, so the two differ by `blocks_orphaned`.
@@ -1768,6 +2349,18 @@ pub struct StatsSnapshot {
     pub total_hashrate_3h: f64,
     pub total_hashrate_6h: f64,
     pub total_hashrate_24h: f64,
+    /// Pool-wide accepted shares per minute, as decaying averages over the same
+    /// windows as the hashrate totals above. Share throughput rather than work
+    /// done: it moves with vardiff retargets that leave hashrate flat. Per
+    /// minute rather than per second because a pool of any realistic size sits
+    /// in the tenths otherwise. Six windows only — 3h is checkpointed but not
+    /// exposed.
+    pub shares_per_minute_1m: f64,
+    pub shares_per_minute_5m: f64,
+    pub shares_per_minute_10m: f64,
+    pub shares_per_minute_1h: f64,
+    pub shares_per_minute_6h: f64,
+    pub shares_per_minute_24h: f64,
     pub network_hashrate_hps: f64,
     pub network_difficulty: f64,
     pub est_difficulty_change_pct: f64,
@@ -1775,13 +2368,11 @@ pub struct StatsSnapshot {
     pub worker_states: Vec<WorkerState>,
     pub uptime_secs: u64,
     pub session_best_hashrate_hps: f64,
-    pub last_block_worker: String,
-    pub last_block_payout: String,
-    pub last_block_hash: String,
-    pub last_block_ts: u64,
-    /// Where the last block stands with the confirmation pass: `pending` until
-    /// it is decided, then a `BlockResolution` label.
-    pub last_block_status: String,
+    /// Accepted-share work (vardiff credit) accumulated since the pool last
+    /// found a block. The dashboard divides it by `network_difficulty` for
+    /// the "Pool difficulty" KPI; 100% of the network difficulty is one
+    /// expected block's worth of work.
+    pub pool_difficulty: u64,
     /// `!`-prefixed `getblocktemplate` rules this build does not implement.
     /// Filled by the dashboard from the TemplateEngine, like `template_version`;
     /// other snapshot consumers receive an empty list.
@@ -1851,9 +2442,9 @@ mod tests {
 
         {
             let stats = PoolStats::new_with_store(Some(db_path.clone()));
-            stats.share_accepted(1_000_000);
+            stats.share_accepted(1_000_000, 1_000_000);
             assert_eq!(stats.snapshot().best_share_difficulty, 1_000_000);
-            stats.share_accepted(1_500_000);
+            stats.share_accepted(1_500_000, 1_500_000);
             assert_eq!(stats.snapshot().best_share_difficulty, 1_500_000);
         }
 
@@ -1940,8 +2531,8 @@ mod tests {
     }
 
     /// One connection may re-authorize under a different identity. Shares after
-    /// the switch belong to the new name; before this was fixed they kept
-    /// landing on the old one for the life of the connection.
+    /// the switch belong to the new name, not to the name the connection first
+    /// authorized for the rest of its life.
     #[test]
     fn shares_follow_a_session_that_re_authorizes_under_a_new_name() {
         let stats = PoolStats::new_with_store(None);
@@ -2054,7 +2645,7 @@ mod tests {
         std::fs::remove_file(db_path).ok();
     }
 
-    /// History written by the old sliding-window estimator is not comparable
+    /// History written by a sliding-window estimator is not comparable
     /// with the decaying averages, and its spikes would pin the chart's y-axis
     /// and the all-time watermark forever. Opening such a DB must clear both.
     #[test]
@@ -2065,12 +2656,13 @@ mod tests {
             store.set_best_hashrate_hps(60.0 * TH);
             let worker_rates =
                 HashMap::from([("axe".to_string(), HashrateWindows::uniform(949.0e15))]);
-            store.record_hashrate_snapshot(
-                120,
-                120,
-                HashrateWindows::uniform(949.0e15),
-                &worker_rates,
-            );
+            store.record_hashrate_snapshot(SnapshotWrite {
+                history_ts: 120,
+                state_ts: 120,
+                rates: HashrateWindows::uniform(949.0e15),
+                worker_rates: worker_rates.clone(),
+                ..Default::default()
+            });
             // Pretend it was written before the estimator changed.
             store.flush();
             store
@@ -2105,8 +2697,18 @@ mod tests {
     fn hashrate_history_averages_samples_into_time_buckets() {
         let db_path = make_temp_db();
         let store = StatsStore::open(&db_path).unwrap();
-        store.record_hashrate_snapshot(120, 120, HashrateWindows::uniform(10.0), &HashMap::new());
-        store.record_hashrate_snapshot(150, 150, HashrateWindows::uniform(20.0), &HashMap::new());
+        store.record_hashrate_snapshot(SnapshotWrite {
+            history_ts: 120,
+            state_ts: 120,
+            rates: HashrateWindows::uniform(10.0),
+            ..Default::default()
+        });
+        store.record_hashrate_snapshot(SnapshotWrite {
+            history_ts: 150,
+            state_ts: 150,
+            rates: HashrateWindows::uniform(20.0),
+            ..Default::default()
+        });
         store.flush();
 
         let history = store.get_hashrate_history(0, 60);
@@ -2135,7 +2737,12 @@ mod tests {
         assert_eq!(base % 60, 0);
         for i in 0..12 {
             let ts = base + i * SNAPSHOT_INTERVAL_SECS;
-            store.record_hashrate_snapshot(ts, ts, HashrateWindows::uniform(10.0), &HashMap::new());
+            store.record_hashrate_snapshot(SnapshotWrite {
+                history_ts: ts,
+                state_ts: ts,
+                rates: HashrateWindows::uniform(10.0),
+                ..Default::default()
+            });
         }
         store.flush();
         assert_eq!(
@@ -2145,7 +2752,12 @@ mod tests {
 
         // A sample far enough ahead pushes them past the horizon.
         let now = base + FINE_HISTORY_RETENTION_SECS + 600;
-        store.record_hashrate_snapshot(now, now, HashrateWindows::uniform(20.0), &HashMap::new());
+        store.record_hashrate_snapshot(SnapshotWrite {
+            history_ts: now,
+            state_ts: now,
+            rates: HashrateWindows::uniform(20.0),
+            ..Default::default()
+        });
         store.flush();
 
         let kept: Vec<u64> = store
@@ -2156,6 +2768,461 @@ mod tests {
         assert_eq!(kept, vec![base, base + 60, now]);
 
         drop(store);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    #[test]
+    fn lifetime_share_totals_survive_restart() {
+        let db_path = make_temp_db();
+        {
+            let stats = PoolStats::new_with_store(Some(db_path.clone()));
+            assert!(stats.snapshot().stats_since_ts > 0);
+            for _ in 0..3 {
+                stats.share_accepted(1_000, 1_000);
+            }
+            stats.share_rejected("stale");
+            stats.share_rejected("duplicate");
+            stats.record_hashrate_snapshot_at(120);
+            // StatsStore::Drop drains the queue.
+        }
+
+        // Pin the inception stamp so the reopens below have to preserve it
+        // rather than re-stamp "now".
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE pool_stats SET stats_since_ts = 111 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+
+        {
+            let stats = PoolStats::new_with_store(Some(db_path.clone()));
+            let snap = stats.snapshot();
+            // Boot counters restart at zero; the lifetime pair carries on.
+            assert_eq!(snap.shares_accepted, 0);
+            assert_eq!(snap.shares_rejected, 0);
+            assert_eq!(snap.lifetime_shares_accepted, 3);
+            assert_eq!(snap.lifetime_shares_rejected, 2);
+            assert_eq!(snap.stats_since_ts, 111);
+            // The reason breakdown restores alongside the totals; this boot
+            // has rejected nothing yet.
+            assert!(snap.reject_reasons.is_empty());
+            assert_eq!(snap.lifetime_reject_reasons.get("stale"), Some(&1));
+            assert_eq!(snap.lifetime_reject_reasons.get("duplicate"), Some(&1));
+
+            stats.share_accepted(1_000, 1_000);
+            stats.record_hashrate_snapshot_at(130);
+        }
+
+        let stats = PoolStats::new_with_store(Some(db_path.clone()));
+        let snap = stats.snapshot();
+        assert_eq!(snap.lifetime_shares_accepted, 4);
+        assert_eq!(snap.lifetime_shares_rejected, 2);
+        assert_eq!(snap.stats_since_ts, 111);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// A DB from before the lifetime counters existed gains the columns on
+    /// open, keeps its watermarks, and gets its inception stamped.
+    #[test]
+    fn share_stats_migration_adds_columns_to_existing_db() {
+        let db_path = make_temp_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE pool_stats (
+                   id INTEGER PRIMARY KEY CHECK(id = 1),
+                   best_share_difficulty INTEGER NOT NULL,
+                   best_hashrate_hps REAL NOT NULL,
+                   hashrate_algo_version INTEGER NOT NULL DEFAULT 0
+                 )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pool_stats
+                   (id, best_share_difficulty, best_hashrate_hps, hashrate_algo_version)
+                 VALUES (1, 7, 0.0, ?1)",
+                params![HASHRATE_ALGO_VERSION],
+            )
+            .unwrap();
+        }
+
+        let before = PoolStats::now_secs();
+        let stats = PoolStats::new_with_store(Some(db_path.clone()));
+        let snap = stats.snapshot();
+        assert_eq!(snap.best_share_difficulty, 7);
+        assert_eq!(snap.lifetime_shares_accepted, 0);
+        assert_eq!(snap.lifetime_shares_rejected, 0);
+        assert!(snap.stats_since_ts >= before);
+
+        // And the new write path works against the migrated schema.
+        stats.share_accepted(1_000, 1_000);
+        stats.record_hashrate_snapshot_at(120);
+        drop(stats);
+
+        let stats = PoolStats::new_with_store(Some(db_path.clone()));
+        assert_eq!(stats.snapshot().lifetime_shares_accepted, 1);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    #[test]
+    fn share_history_records_cumulative_series_on_the_snapshot_grid() {
+        let db_path = make_temp_db();
+        let stats = PoolStats::new_with_store(Some(db_path.clone()));
+
+        stats.share_accepted(1_000, 1_000);
+        stats.share_accepted(1_000, 1_000);
+        stats.share_rejected("stale");
+        // 125 snaps to the 120 grid line, like the recorder's drifting ticks.
+        stats.record_hashrate_snapshot_at(125);
+
+        stats.share_accepted(1_000, 1_000);
+        stats.record_hashrate_snapshot_at(130);
+
+        let store = stats.store.as_ref().unwrap();
+        store.flush();
+        let rows: Vec<(u64, u64, u64)> = {
+            let conn = store.read.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ts, shares_accepted, shares_rejected FROM share_history ORDER BY ts",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            rows
+        };
+        assert_eq!(rows, vec![(120, 2, 1), (130, 3, 1)]);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    #[test]
+    fn share_history_is_thinned_alongside_hashrate_history() {
+        let db_path = make_temp_db();
+        let store = StatsStore::open(&db_path).unwrap();
+
+        let share_history_ts = |store: &StatsStore| -> Vec<u64> {
+            let conn = store.read.lock();
+            let mut stmt = conn
+                .prepare("SELECT ts FROM share_history ORDER BY ts")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            rows
+        };
+
+        // Two minutes of samples on the grid, at a minute boundary.
+        let base = 9_999_960;
+        for i in 0..12 {
+            let ts = base + i * SNAPSHOT_INTERVAL_SECS;
+            store.record_hashrate_snapshot(SnapshotWrite {
+                history_ts: ts,
+                state_ts: ts,
+                share_totals: ShareTotals {
+                    accepted: i,
+                    rejected: 0,
+                },
+                ..Default::default()
+            });
+        }
+        store.flush();
+        assert_eq!(share_history_ts(&store).len(), 12);
+
+        // A sample past the horizon thins them to the minute rows. Cumulative
+        // values make that lossless: differencing the survivors still yields
+        // the per-minute counts.
+        let now = base + FINE_HISTORY_RETENTION_SECS + 600;
+        store.record_hashrate_snapshot(SnapshotWrite {
+            history_ts: now,
+            state_ts: now,
+            share_totals: ShareTotals {
+                accepted: 12,
+                rejected: 0,
+            },
+            ..Default::default()
+        });
+        store.flush();
+        assert_eq!(share_history_ts(&store), vec![base, base + 60, now]);
+
+        drop(store);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// The estimator migration clears `hashrate_history` wholesale; the share
+    /// series and lifetime totals are not estimator artefacts and must ride
+    /// through it — the reason they live in their own table.
+    #[test]
+    fn share_history_survives_hashrate_algo_reset() {
+        let db_path = make_temp_db();
+        {
+            let stats = PoolStats::new_with_store(Some(db_path.clone()));
+            stats.share_accepted(1_000, 1_000);
+            stats.share_rejected("stale");
+            stats.record_hashrate_snapshot_at(120);
+            let store = stats.store.as_ref().unwrap();
+            store.flush();
+            // Pretend everything was written before the estimator changed.
+            store
+                .read
+                .lock()
+                .execute(
+                    "UPDATE pool_stats SET hashrate_algo_version = 0 WHERE id = 1",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let stats = PoolStats::new_with_store(Some(db_path.clone()));
+        assert!(stats.get_hashrate_history(0, 60).is_empty());
+        let snap = stats.snapshot();
+        assert_eq!(snap.lifetime_shares_accepted, 1);
+        assert_eq!(snap.lifetime_shares_rejected, 1);
+        let store = stats.store.as_ref().unwrap();
+        let rows: u64 = store
+            .read
+            .lock()
+            .query_row("SELECT COUNT(*) FROM share_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+
+        // The share *rate* is a decaying average off the same kernel, so unlike
+        // the raw counts above it is incomparable across estimators and goes
+        // with the hashrate series.
+        assert!(stats.get_share_rate_history(0, 60).is_empty());
+        assert!(store.load_share_rate_state().unwrap().is_none());
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Column order is hand-written twice (history and checkpoint) against a
+    /// `W_*`-indexed array, and a swap there would mislabel every series
+    /// silently. Also pins the grid split: history snaps to the sampling grid
+    /// so retention's `ts % 60` filter can find it, while the checkpoint keeps
+    /// the true time so the restore gap is right.
+    #[test]
+    fn share_rate_snapshot_maps_windows_to_columns() {
+        let db_path = make_temp_db();
+        let store = StatsStore::open(&db_path).unwrap();
+
+        // A distinct value per window, so a transposition cannot pass.
+        let mut rates = [0.0; hashrate::WINDOW_COUNT];
+        rates[hashrate::W_1M] = 1.0;
+        rates[hashrate::W_5M] = 2.0;
+        rates[hashrate::W_10M] = 3.0;
+        rates[hashrate::W_1H] = 4.0;
+        rates[hashrate::W_3H] = 5.0;
+        rates[hashrate::W_6H] = 6.0;
+        rates[hashrate::W_24H] = 7.0;
+
+        store.record_hashrate_snapshot(SnapshotWrite {
+            history_ts: 120,
+            state_ts: 125,
+            share_rates: rates,
+            ..Default::default()
+        });
+        store.flush();
+
+        let history = store.get_share_rate_history(0, SNAPSHOT_INTERVAL_SECS);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].ts, 120);
+        assert_eq!(history[0].one_minute, Some(1.0));
+        assert_eq!(history[0].five_minutes, Some(2.0));
+        assert_eq!(history[0].ten_minutes, Some(3.0));
+        assert_eq!(history[0].one_hour, Some(4.0));
+        assert_eq!(history[0].six_hours, Some(6.0));
+        assert_eq!(history[0].twenty_four_hours, Some(7.0));
+
+        // The checkpoint keeps all seven windows — including the 3h the chart
+        // does not plot — at the unsnapped timestamp.
+        let (updated_ts, restored) = store.load_share_rate_state().unwrap().expect("checkpoint");
+        assert_eq!(updated_ts, 125);
+        assert_eq!(restored, rates);
+
+        drop(store);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Same retention as every other series on the grid: one row a minute past
+    /// the fine horizon, so months of history stay bounded.
+    #[test]
+    fn share_rate_samples_past_the_fine_horizon_are_thinned() {
+        let db_path = make_temp_db();
+        let store = StatsStore::open(&db_path).unwrap();
+        let rates = [1.0; hashrate::WINDOW_COUNT];
+
+        let base = 9_999_960;
+        assert_eq!(base % 60, 0);
+        for i in 0..12 {
+            let ts = base + i * SNAPSHOT_INTERVAL_SECS;
+            store.record_hashrate_snapshot(SnapshotWrite {
+                history_ts: ts,
+                state_ts: ts,
+                share_rates: rates,
+                ..Default::default()
+            });
+        }
+        store.flush();
+        assert_eq!(
+            store
+                .get_share_rate_history(0, SNAPSHOT_INTERVAL_SECS)
+                .len(),
+            12
+        );
+
+        let now = base + FINE_HISTORY_RETENTION_SECS + 600;
+        store.record_hashrate_snapshot(SnapshotWrite {
+            history_ts: now,
+            state_ts: now,
+            share_rates: rates,
+            ..Default::default()
+        });
+        store.flush();
+
+        let kept: Vec<u64> = store
+            .get_share_rate_history(0, SNAPSHOT_INTERVAL_SECS)
+            .iter()
+            .map(|p| p.ts)
+            .collect();
+        assert_eq!(kept, vec![base, base + 60, now]);
+
+        drop(store);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Share rate has to come back decayed across the downtime, exactly as the
+    /// per-worker hashrates do — the whole point of checkpointing it rather
+    /// than letting a restart reset the chart to zero.
+    #[test]
+    fn share_rate_resumes_after_restart_and_decays_while_offline() {
+        let db_path = make_temp_db();
+        let saved_at = 1_000_007;
+        let restart_at = saved_at + 30;
+
+        // Twenty minutes at a steady 5 shares/sec — 300 a minute — which is
+        // long enough for the short windows to converge and leaves the long
+        // ones part-filled.
+        let saved = {
+            let now = Instant::now();
+            let stats = PoolStats::new_with_store_at(Some(db_path.clone()), saved_at, now);
+            let mut tick = now;
+            for _ in 0..600 {
+                for _ in 0..(5 * hashrate::TICK_SECS) {
+                    stats.share_accepted(1, 1);
+                }
+                tick += Duration::from_secs(hashrate::TICK_SECS);
+                stats.tick_hashrates_at(tick);
+            }
+            let saved = stats.share_rate_windows();
+            stats.record_hashrate_snapshot_at(saved_at);
+            saved
+        };
+        assert!(
+            (saved[hashrate::W_1M] - 300.0).abs() < 6.0,
+            "1m should have converged on 300/min, got {}",
+            saved[hashrate::W_1M]
+        );
+
+        let now = Instant::now();
+        let stats = PoolStats::new_with_store_at(Some(db_path.clone()), restart_at, now);
+        let expected =
+            hashrate::HashrateDecay::restored_per_minute(now, saved, Duration::from_secs(30))
+                .per_minute();
+        let snap = stats.snapshot();
+
+        assert!((snap.shares_per_minute_1m - expected[hashrate::W_1M]).abs() < 1e-9 * 300.0);
+        assert!((snap.shares_per_minute_24h - expected[hashrate::W_24H]).abs() < 1e-9 * 300.0);
+        // Half a time constant of silence bites the 1m window and barely
+        // touches the 24h one.
+        assert!(snap.shares_per_minute_1m > 0.0);
+        assert!(snap.shares_per_minute_1m < 0.8 * saved[hashrate::W_1M]);
+        assert!(snap.shares_per_minute_24h > 0.99 * saved[hashrate::W_24H]);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// "Shares per minute the pool is accepting" — a reject is not throughput,
+    /// and counting one would make the chart disagree with the accepted card.
+    #[test]
+    fn share_rate_counts_accepted_shares_only() {
+        let now = Instant::now();
+        let stats = PoolStats::new_with_store_at(None, 1_000, now);
+
+        for _ in 0..100 {
+            stats.share_rejected("stale");
+        }
+        stats.tick_hashrates_at(now + Duration::from_secs(hashrate::TICK_SECS));
+        assert_eq!(stats.snapshot().shares_per_minute_1m, 0.0);
+
+        stats.share_accepted(1, 1);
+        stats.tick_hashrates_at(now + Duration::from_secs(2 * hashrate::TICK_SECS));
+        assert!(stats.snapshot().shares_per_minute_1m > 0.0);
+    }
+
+    /// Difficulty weights the hashrate estimate, not this one: two shares are
+    /// two shares whatever they were worth.
+    #[test]
+    fn share_rate_ignores_share_difficulty() {
+        let now = Instant::now();
+        let tick = now + Duration::from_secs(hashrate::TICK_SECS);
+
+        let small = PoolStats::new_with_store_at(None, 1_000, now);
+        let large = PoolStats::new_with_store_at(None, 1_000, now);
+        for _ in 0..10 {
+            small.share_accepted(1, 1);
+            large.share_accepted(1_000_000, 1_000_000);
+        }
+        small.tick_hashrates_at(tick);
+        large.tick_hashrates_at(tick);
+
+        assert_eq!(
+            small.snapshot().shares_per_minute_1m,
+            large.snapshot().shares_per_minute_1m
+        );
+    }
+
+    /// Shutdown must not rely on `Drop`: in production every task holds an
+    /// `Arc<PoolStats>`, so the store is never dropped. `shutdown_persist`
+    /// has to leave the totals on disk while the instance is still alive.
+    #[test]
+    fn shutdown_persist_flushes_without_drop() {
+        let db_path = make_temp_db();
+        let stats = PoolStats::new_with_store(Some(db_path.clone()));
+        stats.share_accepted(1_000, 1_000);
+        stats.share_accepted(1_000, 1_000);
+        stats.share_rejected("stale");
+
+        stats.shutdown_persist();
+
+        // Read through a second connection while `stats` is still alive.
+        let (accepted, rejected): (u64, u64) = Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT lifetime_shares_accepted, lifetime_shares_rejected
+                 FROM pool_stats WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(accepted, 2);
+        assert_eq!(rejected, 1);
+
+        drop(stats);
         std::fs::remove_file(db_path).ok();
     }
 
@@ -2177,6 +3244,121 @@ mod tests {
         assert!(stats.worker_states.get("online").is_some());
         assert!(stats.worker_states.get("recent").is_some());
         assert!(stats.worker_states.get("idle").is_none());
+    }
+
+    #[test]
+    fn pool_difficulty_accumulates_credit_and_resets_when_a_block_is_found() {
+        let stats = PoolStats::new_with_store(None);
+        assert_eq!(stats.snapshot().pool_difficulty, 0);
+
+        stats.share_accepted(1_000, 5_000);
+        stats.share_accepted(2_500, 2_500);
+        assert_eq!(stats.snapshot().pool_difficulty, 3_500);
+
+        stats.block_found();
+        assert_eq!(stats.snapshot().pool_difficulty, 0);
+
+        stats.share_accepted(4_000, 4_000);
+        assert_eq!(stats.snapshot().pool_difficulty, 4_000);
+    }
+
+    #[test]
+    fn finding_a_block_starts_a_new_round_of_kpis() {
+        let stats = PoolStats::new_with_store(None);
+        stats.mark_worker_online("w", 1_000);
+        stats.share_accepted(1_000, 9_000_000);
+        stats.worker_share_accepted("w", 9_000_000);
+        stats.share_rejected("stale");
+        stats.record_best_hashrate(5.0e12);
+
+        stats.block_found();
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.blocks_found, 1);
+        assert_eq!(snap.lifetime_shares_accepted, 0);
+        assert_eq!(snap.lifetime_shares_rejected, 0);
+        assert!(snap.lifetime_reject_reasons.is_empty());
+        assert_eq!(snap.best_share_difficulty, 0);
+        assert_eq!(snap.best_hashrate_hps, 0.0);
+        assert_eq!(snap.pool_difficulty, 0);
+        let w = snap.worker_states.iter().find(|w| w.worker == "w").unwrap();
+        assert_eq!(w.best_share_difficulty, 0);
+
+        // Session counters describe this boot, not the round: they keep going.
+        assert_eq!(snap.shares_accepted, 1);
+        assert_eq!(snap.shares_rejected, 1);
+        assert_eq!(snap.session_best_share_difficulty, 9_000_000);
+        assert_eq!(snap.session_best_hashrate_hps, 5.0e12);
+
+        // The next round accumulates from zero.
+        stats.share_accepted(500, 500);
+        stats.share_rejected("duplicate");
+        let snap = stats.snapshot();
+        assert_eq!(snap.lifetime_shares_accepted, 1);
+        assert_eq!(snap.lifetime_shares_rejected, 1);
+        assert_eq!(snap.lifetime_reject_reasons.get("duplicate"), Some(&1));
+        assert_eq!(snap.lifetime_reject_reasons.get("stale"), None);
+        assert_eq!(snap.pool_difficulty, 500);
+        assert_eq!(snap.best_share_difficulty, 500);
+    }
+
+    #[test]
+    fn a_round_reset_survives_a_restart() {
+        let db_path = make_temp_db();
+        {
+            let stats = PoolStats::new_with_store(Some(db_path.clone()));
+            stats.mark_worker_online("w", 1_000);
+            stats.share_accepted(2_000, 8_000);
+            stats.worker_share_accepted("w", 8_000);
+            stats.share_rejected("stale");
+            stats.record_hashrate_snapshot_at(120);
+            stats.block_found();
+            stats.shutdown_persist();
+        }
+
+        let stats = PoolStats::new_with_store(Some(db_path.clone()));
+        let snap = stats.snapshot();
+        assert_eq!(snap.lifetime_shares_accepted, 0);
+        assert_eq!(snap.lifetime_shares_rejected, 0);
+        assert!(snap.lifetime_reject_reasons.is_empty());
+        assert_eq!(snap.best_share_difficulty, 0);
+        assert_eq!(snap.pool_difficulty, 0);
+        assert!(snap
+            .worker_states
+            .iter()
+            .all(|w| w.best_share_difficulty == 0));
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    #[test]
+    fn a_stale_snapshot_cannot_resurrect_a_reset_round() {
+        let db_path = make_temp_db();
+        let store = StatsStore::open(&db_path).unwrap();
+        store.round_reset(1, 1_000);
+        // Assembled before the reset (epoch 0), applied after it.
+        store.record_hashrate_snapshot(SnapshotWrite {
+            history_ts: 60,
+            state_ts: 60,
+            share_totals: ShareTotals {
+                accepted: 999,
+                rejected: 9,
+            },
+            round_work: 12_345,
+            round_epoch: 0,
+            ..Default::default()
+        });
+        store.flush();
+
+        let (totals, since_ts, round_work) = store.load_lifetime_stats().unwrap();
+        assert_eq!(totals.accepted, 0);
+        assert_eq!(totals.rejected, 0);
+        assert_eq!(round_work, 0);
+        assert_eq!(since_ts, 1_000);
+
+        drop(store);
+        std::fs::remove_file(db_path).ok();
     }
 
     #[test]
@@ -2253,7 +3435,7 @@ mod tests {
 
         {
             let stats = PoolStats::new_with_store(Some(db_path.clone()));
-            stats.block_found("w1", "bc1qpayout", "0000cafe");
+            stats.block_found();
             stats.enroll_pending_block(800_000, "0000cafe", "w1", "bc1qpayout", true);
             assert_eq!(stats.snapshot().blocks_pending_confirmation, 1);
         }
@@ -2286,7 +3468,7 @@ mod tests {
             for (hash, won) in [("aa", true), ("bb", true), ("cc", false)] {
                 stats.enroll_pending_block(800_000, hash, "w1", "bc1qpayout", won);
                 if won {
-                    stats.block_found("w1", "bc1qpayout", hash);
+                    stats.block_found();
                 } else {
                     stats.block_inconclusive();
                 }
@@ -2391,9 +3573,9 @@ mod tests {
         assert_eq!(back.twenty_four_hours, rates.twenty_four_hours);
     }
 
-    /// The headline bug: on a young pool every window read the same number,
-    /// because the old estimator divided by the age of the oldest share in the
-    /// window rather than by the window itself. The long windows must lag.
+    /// On a young pool the long windows must lag the short ones. Dividing by
+    /// the age of the oldest share in the window rather than by the window
+    /// itself would collapse every window to the same number.
     #[test]
     fn windows_do_not_collapse_on_a_young_pool() {
         let stats = PoolStats::new_with_store(None);
@@ -2448,9 +3630,9 @@ mod tests {
         assert!(state.hashrate_6h_hps > 0.0);
     }
 
-    /// The bug this replaces: a worker whose session was still *connected* was
-    /// exempted from decay entirely, so a rig whose hasher died kept showing
-    /// its last reading forever.
+    /// A still-*connected* worker must decay like any other; exempting
+    /// connected sessions would leave a rig whose hasher died showing its last
+    /// reading forever.
     #[test]
     fn connected_but_silent_worker_still_decays() {
         let stats = PoolStats::new_with_store(None);
@@ -2490,9 +3672,9 @@ mod tests {
         );
     }
 
-    /// Two rigs sharing one worker name must add up. The old code keyed the
-    /// hashrate map by worker name and used `insert`, so the second session
-    /// silently replaced the first and the pool total read half of reality.
+    /// Two rigs sharing one worker name must add up. Keying the hashrate map
+    /// by worker name with `insert` would let the second session silently
+    /// replace the first, reading half of reality into the pool total.
     #[test]
     fn two_sessions_under_one_worker_name_sum() {
         let stats = PoolStats::new_with_store(None);
@@ -2545,8 +3727,8 @@ mod tests {
         );
     }
 
-    /// A single share arriving microseconds before a tick cannot produce the
-    /// absurd reading the old estimator did (949 PH/s from a 2.7 TH/s Bitaxe).
+    /// A burst of shares arriving microseconds before a tick cannot spike the
+    /// pool total: the per-share ceiling bounds the sum.
     #[test]
     fn burst_of_shares_cannot_spike_the_pool_total() {
         let stats = PoolStats::new_with_store(None);

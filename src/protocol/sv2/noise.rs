@@ -30,7 +30,7 @@ use tokio::{
     net::TcpStream,
     sync::Mutex,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::messages;
 use crate::config::Sv2Config;
@@ -289,11 +289,11 @@ impl NoiseWriter {
         };
 
         if let Err(e) = self.writer.write_all(encrypted.as_ref()).await {
-            warn!("SV2 write error to {}: {e}", self.peer);
+            debug!("SV2 write error to {}: {e}", self.peer);
             return false;
         }
         if let Err(e) = self.writer.flush().await {
-            warn!("SV2 flush error to {}: {e}", self.peer);
+            debug!("SV2 flush error to {}: {e}", self.peer);
             return false;
         }
         true
