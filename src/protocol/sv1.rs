@@ -8,6 +8,7 @@
 ///   - mining.notify
 ///   - mining.set_difficulty
 ///   - mining.set_extranonce  (subscribe-extranonce extension)
+///   - mining.extranonce.subscribe (legacy capability advertisement)
 ///   - mining.configure       (stratum-extensions: version-rolling, minimum-difficulty)
 ///   - mining.submit          (with version_bits for version-rolling)
 use crate::error::PoolError;
@@ -43,6 +44,9 @@ pub enum ClientMessage {
     Submit(SubmitParams),
     Configure(ConfigureParams),
     SuggestDifficulty(SuggestDifficultyParams),
+    /// Legacy BFGMiner-style advertisement that the client accepts future
+    /// `mining.set_extranonce` notifications.
+    ExtranonceSubscribe,
     /// Any unrecognised method — we return an error
     Unknown(String),
 }
@@ -57,6 +61,7 @@ impl ClientMessage {
             "mining.suggest_difficulty" => Ok(Self::SuggestDifficulty(
                 SuggestDifficultyParams::parse(&req.params)?,
             )),
+            "mining.extranonce.subscribe" => Ok(Self::ExtranonceSubscribe),
             other => Ok(Self::Unknown(other.to_string())),
         }
     }
@@ -345,6 +350,11 @@ impl ResponseBuilder {
         Self::ok(id, Value::Object(result))
     }
 
+    /// Acknowledge the legacy subscribe-extranonce capability advertisement.
+    pub fn extranonce_subscribe(id: &Value) -> String {
+        Self::ok(id, Value::Bool(true))
+    }
+
     /// mining.set_difficulty notification (server → miner, no id)
     pub fn set_difficulty(difficulty: u64) -> String {
         serde_json::json!({
@@ -429,7 +439,7 @@ fn str_ref_at<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientMessage, StratumRequest};
+    use super::{ClientMessage, ResponseBuilder, StratumRequest};
 
     fn parse_msg(line: &str) -> ClientMessage {
         let req = StratumRequest::parse(line).expect("valid json-rpc");
@@ -462,5 +472,24 @@ mod tests {
                 "should reject: {line}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_extranonce_subscribe_is_acknowledged() {
+        let req =
+            StratumRequest::parse(r#"{"id":4,"method":"mining.extranonce.subscribe","params":[]}"#)
+                .expect("captured Bitaxe request");
+
+        assert!(matches!(
+            ClientMessage::from_request(&req).expect("supported method"),
+            ClientMessage::ExtranonceSubscribe
+        ));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ResponseBuilder::extranonce_subscribe(
+                &req.id
+            ))
+            .unwrap(),
+            serde_json::json!({"error": null, "id": 4, "result": true})
+        );
     }
 }

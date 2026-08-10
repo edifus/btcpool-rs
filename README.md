@@ -64,7 +64,7 @@ and exercised on every commit, so you can check it rather than trust it.
 | Category | Detail |
 |---|---|
 | Protocol | Stratum V1 (JSON-RPC over TCP) **and** Stratum V2 (Extended Channel, Noise-encrypted), auto-detected per connection on one port |
-| ASIC extensions | SV1: `version-rolling` (BIP320), `minimum-difficulty`, `subscribe-extranonce`, `mining.configure`. SV2: extended channel with BIP320 version rolling |
+| ASIC extensions | SV1: `version-rolling` (BIP320), `minimum-difficulty`, `subscribe-extranonce`, legacy `mining.extranonce.subscribe`, `mining.configure`. SV2: extended channel with BIP320 version rolling |
 | Auth | Bitcoin address from the SV1 worker name or SV2 user identity (`BITCOIN_ADDRESS.worker`) |
 | Difficulty | Per-miner vardiff with configurable target share time, retarget interval, and max adjustment factor |
 | Block template | `getblocktemplate` via Bitcoin RPC, ZMQ `hashblock` push (RPC poll fallback) |

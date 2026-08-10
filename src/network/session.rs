@@ -512,6 +512,9 @@ async fn handle_line(
         ClientMessage::SuggestDifficulty(params) => {
             handle_suggest_difficulty(session, &req, params)
         }
+        ClientMessage::ExtranonceSubscribe => {
+            HandleResult::Messages(vec![ResponseBuilder::extranonce_subscribe(&req.id)])
+        }
         ClientMessage::Unknown(method) => {
             debug!("Unknown method from {}: {method}", session.peer);
             HandleResult::Messages(vec![ResponseBuilder::err(

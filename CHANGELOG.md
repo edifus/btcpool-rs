@@ -10,6 +10,11 @@ everything else bumps the **patch** version.
 ## [Unreleased]
 
 ### Fixed
+- **Legacy extranonce subscription no longer fails Bitaxe setup.** The pool
+  supported `subscribe-extranonce` negotiation through `mining.configure`, but
+  rejected the equivalent standalone `mining.extranonce.subscribe` request as
+  an unknown method. It now acknowledges that legacy capability advertisement
+  with `result: true`, allowing AxeOS extranonce subscribe to remain enabled.
 - **Honouring miners were mis-flagged as ignoring `set_difficulty`, collapsing
   vardiff and halving the recorded pool hashrate.** `hash_to_difficulty`
   divided in u64 before applying the byte-position shift, quantizing every
