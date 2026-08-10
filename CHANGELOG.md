@@ -9,6 +9,17 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-09
+
+Vardiff stops chasing noise. The old controller sized a miner's difficulty from
+a share count over one 60 s window — four shares at the previous target, whose
+Poisson counting noise is ±50% — and jumped straight to that estimate, so a
+miner was handed a new difficulty about once a minute, spanning an order of
+magnitude, forever. It is rebuilt on ckpool's approach and now settles inside
+the first minute and holds for hours. Alongside it, the dashboard grows a
+shares/min chart and a pool-difficulty KPI, and every cumulative figure now
+measures since the pool's last found block rather than since process start.
+
 ### Added
 - **A Pool difficulty KPI on the dashboard overview** — accepted share work
   accumulated since the pool's last found block, shown as a percentage of the
@@ -943,7 +954,8 @@ unlinked to avoid any ambiguity with a release of the same number here.
 - Dashboard rework: worker rendering and stats mapping fixes; reject rate moved
   into the rejected card; best share keyed by vardiff difficulty.
 
-[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.4.0...HEAD
+[0.3.4]: https://github.com/edifus/btcpool-rs/compare/v0.3.0...v0.3.4
 [0.3.0]: https://github.com/edifus/btcpool-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/edifus/btcpool-rs/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/edifus/btcpool-rs/compare/v0.1.2...v0.1.3
