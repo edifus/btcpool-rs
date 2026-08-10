@@ -9,6 +9,12 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+### Added
+- **The desktop dashboard sidebar can now be collapsed.** The preference
+  survives reloads, the main column expands to use the available viewport
+  width, and both charts reflow immediately to fit. The existing mobile top
+  bar remains unchanged.
+
 ## [0.4.4] - 2026-08-10
 
 Dashboard release.

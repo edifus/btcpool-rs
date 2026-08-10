@@ -623,9 +623,25 @@ nav a.active { color: var(--text); background: var(--surface2); border-left-colo
 #theme-toggle:hover { color: var(--text); border-color: var(--muted); }
 .rail-foot a { color: var(--muted); text-decoration: none; }
 .rail-foot a:hover { color: var(--text); }
+/* Collapse control: rides the brand row's right edge when open, and is all
+   that remains beside the mark once collapsed. Hidden below 880px, where the
+   rail is already a top bar with its own burger. */
+#rail-collapse {
+  margin-left: auto; cursor: pointer; font: inherit; font-size: 0.85rem; line-height: 1;
+  color: var(--muted); background: none; border: 1px solid var(--border);
+  border-radius: 5px; padding: 0.15rem 0.35rem;
+}
+#rail-collapse:hover { color: var(--text); border-color: var(--muted); }
+.rail.collapsed { width: 56px; padding-left: 0.5rem; padding-right: 0.5rem; }
+.rail.collapsed .brand { flex-direction: column; gap: 0.7rem; padding: 0; }
+.rail.collapsed .brand .name, .rail.collapsed #net-badge,
+.rail.collapsed nav, .rail.collapsed .rail-foot { display: none; }
+.rail.collapsed #rail-collapse { margin-left: 0; }
 
 /* ── Main column ── */
-main { flex: 1; min-width: 0; max-width: 1240px; padding: 1.7rem 2.1rem 2.5rem; }
+/* Uncapped: the right edge stays at the viewport, so collapsing the rail
+   widens the dashboard leftward instead of moving where it ends. */
+main { flex: 1; min-width: 0; padding: 1.7rem 2.1rem 2.5rem; }
 section { margin-bottom: 1.4rem; scroll-margin-top: 1.2rem; }
 .sec-title {
   font-size: 0.66rem; font-weight: 600; text-transform: uppercase;
@@ -831,6 +847,12 @@ tr:last-child td { border-bottom: none; }
     flex-wrap: wrap; align-items: center; gap: 0.9rem; padding: 0.7rem 1rem;
     border-right: none; border-bottom: 1px solid var(--border);
   }
+  /* The rail is a top bar here; collapsing it sideways has no meaning, and
+     the collapsed width must not leak in from a desktop session. */
+  #rail-collapse { display: none; }
+  .rail.collapsed { width: 100%; padding: 0.7rem 1rem; }
+  .rail.collapsed .brand { flex-direction: row; gap: 0.5rem; padding: 0 0.6rem; }
+  .rail.collapsed .brand .name, .rail.collapsed #net-badge { display: inline; }
   #nav-burger {
     display: block; margin-left: auto; cursor: pointer;
     font-size: 1.15rem; line-height: 1; color: var(--muted);
@@ -874,7 +896,7 @@ tr:last-child td { border-bottom: none; }
 <div class="shell">
 
 <aside class="rail">
-  <div class="brand"><img id="brand-logo" class="mark" src="/logo-dark.svg" alt="btcpool-rs logo" width="64" height="64"><span class="name">btcpool-rs</span><span id="net-badge" hidden></span></div>
+  <div class="brand"><img id="brand-logo" class="mark" src="/logo-dark.svg" alt="btcpool-rs logo" width="64" height="64"><span class="name">btcpool-rs</span><span id="net-badge" hidden></span><button type="button" id="rail-collapse" aria-label="Collapse sidebar" aria-expanded="true" title="Collapse sidebar">&laquo;</button></div>
   <button type="button" id="nav-burger" aria-label="Toggle menu" aria-expanded="false">&#9776;</button>
   <nav id="rail-nav">
     <a href="#overview" data-section="overview" class="active">Overview</a>
@@ -1249,23 +1271,28 @@ function applyResponsiveLayout(panel, options) {
   return options;
 }
 
+// Re-measure both charts against their container's current size. ECharts does
+// not track CSS size on its own, so anything that changes the main column's
+// width or the viewport height has to call this.
+function relayoutCharts() {
+  PANELS.forEach(panel => {
+    panel.chart.resize();
+    if (!panel.options) return;
+    // Carry the user's current legend toggles across the merge, or this would
+    // re-apply whichever ones were live when the chart was last fetched.
+    const shown = panelLegend(panel);
+    if (shown && panel.options.legend) panel.options.legend.selected = shown;
+    panel.chart.setOption(applyResponsiveLayout(panel, panel.options));
+  });
+}
+
 let resizeTimer = null;
 window.addEventListener('resize', () => {
   // Debounced: a drag-resize fires continuously, and each pass re-lays out the
   // whole chart. The CSS height is viewport-relative, so this is also what
-  // makes the canvas follow it — ECharts does not track CSS size on its own.
+  // makes the canvas follow it.
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => {
-    PANELS.forEach(panel => {
-      panel.chart.resize();
-      if (!panel.options) return;
-      // Carry the user's current legend toggles across the merge, or this would
-      // re-apply whichever ones were live when the chart was last fetched.
-      const shown = panelLegend(panel);
-      if (shown && panel.options.legend) panel.options.legend.selected = shown;
-      panel.chart.setOption(applyResponsiveLayout(panel, panel.options));
-    });
-  }, 150);
+  resizeTimer = setTimeout(relayoutCharts, 150);
 });
 
 document.getElementById('theme-toggle').addEventListener('click', () => {
@@ -1286,6 +1313,32 @@ document.getElementById('rail-nav').addEventListener('click', () => {
   railEl.classList.remove('nav-open');
   burgerEl.setAttribute('aria-expanded', 'false');
 });
+
+// ── Sidebar collapse ─────────────────────────────────────────────────────────
+// Persisted like the theme. The charts need an explicit re-layout: the main
+// column's width changes without a window resize to trigger one.
+const RAIL_KEY = 'railCollapsed';
+const railCollapseEl = document.getElementById('rail-collapse');
+function railCollapsed() {
+  try { return localStorage.getItem(RAIL_KEY) === '1'; } catch (_) { return false; }
+}
+function applyRailCollapsed(collapsed, relayout) {
+  try { localStorage.setItem(RAIL_KEY, collapsed ? '1' : '0'); } catch (_) {}
+  railEl.classList.toggle('collapsed', collapsed);
+  railCollapseEl.textContent = collapsed ? '»' : '«';
+  railCollapseEl.title = collapsed ? 'Expand sidebar' : 'Collapse sidebar';
+  railCollapseEl.setAttribute('aria-label', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
+  railCollapseEl.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  if (relayout) relayoutCharts();
+}
+railCollapseEl.addEventListener('click', () => {
+  applyRailCollapsed(!railEl.classList.contains('collapsed'), true);
+});
+// The relayout matters most on this first pass: `echarts.init` measured the
+// column while the rail was still expanded, and `setOption` alone never
+// re-measures — a restored collapsed rail would leave both charts drawing at
+// the narrower width, with the label density computed from it too.
+applyRailCollapsed(railCollapsed(), true);
 
 // ── Chart collapse toggles ───────────────────────────────────────────────────
 // Persisted per panel like the theme choice; while collapsed the periodic fetch
