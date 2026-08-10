@@ -633,10 +633,11 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
 
 /* ── Hero ── */
 .hero {
-  display: flex; flex-wrap: wrap; gap: 1.6rem 2.4rem; align-items: stretch;
+  display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 1fr); align-items: stretch;
   background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-  padding: 1.4rem 1.7rem; margin-bottom: 1.4rem;
+  padding: 1.4rem 0; margin-bottom: 1.4rem;
 }
+.hero-main { min-width: 0; padding: 0 1.7rem; }
 .hero .label, .kpi .label {
   font-size: 0.62rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: 0.11em; color: var(--muted); margin-bottom: 0.4rem;
@@ -647,18 +648,25 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
 }
 .hero-sub { display: flex; flex-wrap: wrap; gap: 0.35rem 1.2rem; margin-top: 0.5rem; font-size: 0.76rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 .hero-side {
-  margin-left: auto; display: flex; flex-direction: column; justify-content: center;
-  gap: 0.32rem; padding-left: 2.2rem; border-left: 1px solid var(--border);
+  min-width: 0; display: flex; flex-direction: column; justify-content: center;
+  gap: 0.32rem; padding: 0 1.3rem; border-left: 1px solid var(--border);
   font-size: 0.78rem; font-variant-numeric: tabular-nums;
 }
 .hero-side .label { margin-bottom: 0.2rem; }
+.odds-primary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.15rem 0.45rem; }
+.odds-value { padding-right: 0.15rem; font-size: 1.5rem; font-weight: 650; line-height: 1.1; color: var(--accent); }
+.odds-comparison { font-size: 0.8rem; color: var(--muted); }
+.odds-periods { display: flex; flex-direction: column; gap: 0.2rem; color: var(--muted); font-size: 0.72rem; }
+.odds-info { cursor: help; }
 
 /* ── KPI strip ── */
 .kpis {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
-  gap: 1.1rem 1.5rem; margin-bottom: 1.4rem;
+  margin-bottom: 1.4rem; padding: 1.1rem 0;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
 }
-.kpi { border-left: 1px solid var(--border); padding-left: 0.9rem; min-width: 0; }
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 0; }
+.kpi { padding: 0 1.3rem; min-width: 0; }
+.kpi + .kpi { border-left: 1px solid var(--border); }
 .kpi .val { font-size: 1.06rem; font-weight: 650; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
 .kpi .sub { font-size: 0.72rem; color: var(--muted); margin-top: 0.15rem; font-variant-numeric: tabular-nums; }
 .kpi .sub.trunc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -823,7 +831,8 @@ tr:last-child td { border-bottom: none; }
   }
   .rail-foot .hide-sm { display: none; }
   main { padding: 1.2rem 1rem 2rem; }
-  .hero-side { margin-left: 0; padding-left: 0; border-left: none; }
+  .hero { grid-template-columns: 1fr; gap: 1.6rem; }
+  .hero-side { padding: 0 1.7rem; border-left: none; }
 }
 
 /* Phone: the 15-column workers table can't fit; retain the 10m operational
@@ -872,21 +881,27 @@ tr:last-child td { border-bottom: none; }
 
 <section id="overview">
   <div class="hero">
-    <div>
+    <div class="hero-main">
       <div class="label">Pool hashrate &middot; 10m</div>
       <div class="hero-value" id="v-reported-current">&mdash;</div>
       <div class="hero-sub"><span id="v-reported-1m">1m: &mdash;</span><span id="v-reported-1h">1h: &mdash;</span><span id="v-reported-6h">6h: &mdash;</span><span id="v-reported-24h">24h: &mdash;</span></div>
     </div>
     <div class="hero-side">
-      <div class="label">Block odds</div>
-      <span id="v-prob-daily">Daily: &mdash;</span>
-      <span id="v-prob-monthly">Monthly: &mdash;</span>
-      <span id="v-prob-yearly">Yearly: &mdash;</span>
-      <span id="v-prob-powerball" style="color:var(--muted);">vs Powerball: &mdash;</span>
+      <div class="label">Odds vs Powerball <span class="odds-info" id="powerball-odds-info" aria-label="Current Powerball jackpot odds">&#9432;</span></div>
+      <div class="odds-primary">
+        <span class="odds-value" id="v-prob-powerball">&mdash;</span>
+        <span class="odds-comparison" id="v-prob-powerball-copy">x better</span>
+      </div>
+      <div class="odds-periods">
+        <span id="v-prob-daily">daily: &mdash;</span>
+        <span id="v-prob-monthly">monthly: &mdash;</span>
+        <span id="v-prob-yearly">yearly: &mdash;</span>
+      </div>
     </div>
   </div>
 
   <div class="kpis">
+    <div class="kpi-grid">
     <div class="kpi">
       <div class="label">Accepted</div>
       <div class="val" id="v-accepted">&mdash;</div>
@@ -901,7 +916,7 @@ tr:last-child td { border-bottom: none; }
     <div class="kpi">
       <div class="label">Best share</div>
       <div class="val accent" id="v-best-share">&mdash;</div>
-      <div class="sub">session: <span id="v-session-best-share">&mdash;</span> &middot; <span id="v-best-over-network" title="Has the all-time best share met current network difficulty?">&mdash;</span> vs net</div>
+      <div class="sub">session: <span id="v-session-best-share">&mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Best hashrate</div>
@@ -918,6 +933,7 @@ tr:last-child td { border-bottom: none; }
       <div class="label">Pool difficulty</div>
       <div class="val" id="v-pool-diff" title="Accepted share work since the pool's last found block, as a share of the current network difficulty. 100% is one expected block's worth of work.">&mdash;</div>
       <div class="sub" id="v-pool-diff-work" title="Accepted share difficulty accumulated since the last found block; finding a block starts it over">work: &mdash;</div>
+    </div>
     </div>
   </div>
 
@@ -952,7 +968,6 @@ tr:last-child td { border-bottom: none; }
 </section>
 
 <section id="workers">
-  <div class="sec-title">Workers</div>
   <div class="panel">
   <table>
     <thead>
@@ -982,8 +997,8 @@ tr:last-child td { border-bottom: none; }
 </section>
 
 <section id="network">
-  <div class="sec-title">Network</div>
   <div class="kpis">
+    <div class="kpi-grid">
     <div class="kpi">
       <div class="label">Network hashrate</div>
       <div class="val" id="v-net-hashrate">&mdash;</div>
@@ -1019,6 +1034,7 @@ tr:last-child td { border-bottom: none; }
       </div>
       <div class="val" id="v-btc-price" style="font-size:0.92rem;">BTC <span id="v-btc-price-num">&mdash;</span></div>
       <div class="sub" id="v-btc-change">24h: &mdash;</div>
+    </div>
     </div>
   </div>
 </section>
@@ -1522,7 +1538,6 @@ async function refresh() {
     document.getElementById('v-pool-diff-work').textContent = 'work: ' + fmtDiff(roundWork);
     document.getElementById('v-best-share').textContent = fmtDiff(d.best_share_difficulty);
     document.getElementById('v-session-best-share').textContent = fmtDiff(d.session_best_share_difficulty);
-    document.getElementById('v-best-over-network').textContent = d.best_share_difficulty >= Math.ceil(d.network_difficulty) ? 'YES' : 'no';
 
     // Network section (human-readable hashrate + difficulty + next-adjustment ETA)
     document.getElementById('v-net-hashrate').textContent = fmtHr(d.network_hashrate_hps || 0, false);
@@ -1581,7 +1596,7 @@ async function refresh() {
     document.getElementById('v-session-accepted').textContent = d.shares_accepted.toLocaleString();
     // Current throughput under the two totals: the same 1m window the chart's
     // fastest line plots.
-    document.getElementById('v-shares-per-min').textContent = fmtSpm(d.shares_per_minute_1m, false);
+    document.getElementById('v-shares-per-min').textContent = 'shares/min: ' + fmtSpm(d.shares_per_minute_1m, true);
     const rejectEl = document.getElementById('v-reject-rate');
     rejectEl.textContent = `${lifeRej.toLocaleString()} (${lifePct}%)`;
     rejectEl.title = reasonTooltip('rejects since last block', d.lifetime_reject_reasons);
@@ -1684,13 +1699,18 @@ function fmtOdds(p) {
   return '1 in ' + inv.toLocaleString();
 }
 
+const POWERBALL_JACKPOT_ODDS = 292201338;
+document.getElementById('powerball-odds-info').title =
+  'Powerball jackpot odds: 1 in ' + POWERBALL_JACKPOT_ODDS.toLocaleString();
+
 function updateProbability(ourHps, netHps) {
   const el = id => document.getElementById(id);
   if (!ourHps || !netHps || netHps === 0) {
-    el('v-prob-daily').textContent   = 'Daily: —';
-    el('v-prob-monthly').textContent = 'Monthly: —';
-    el('v-prob-yearly').textContent  = 'Yearly: —';
-    el('v-prob-powerball').textContent = 'vs Powerball: —';
+    el('v-prob-daily').textContent   = 'daily: —';
+    el('v-prob-monthly').textContent = 'monthly: —';
+    el('v-prob-yearly').textContent  = 'yearly: —';
+    el('v-prob-powerball').textContent = '—';
+    el('v-prob-powerball-copy').textContent = 'x better';
     return;
   }
   // Probability of finding a block per block (~10 min)
@@ -1703,17 +1723,17 @@ function updateProbability(ourHps, netHps) {
   const pDaily   = 1 - Math.pow(1 - pBlock, blocksPerDay);
   const pMonthly = 1 - Math.pow(1 - pBlock, blocksPerMonth);
   const pYearly  = 1 - Math.pow(1 - pBlock, blocksPerYear);
-  // Powerball jackpot: 1 in 292,201,338 per ticket
-  const pPowerball = 1 / 292201338;
+  const pPowerball = 1 / POWERBALL_JACKPOT_ODDS;
   const ratio = pDaily / pPowerball;
-  const vsText = ratio >= 1
-    ? (ratio.toFixed(1) + '× better than Powerball')
-    : ((1 / ratio).toFixed(1) + '× worse than Powerball');
+  const better = ratio >= 1;
+  const multiplier = better ? ratio : 1 / ratio;
+  const multiplierText = multiplier >= 100 ? Math.round(multiplier).toLocaleString() : multiplier.toFixed(1);
 
-  el('v-prob-daily').textContent   = 'Daily: '   + fmtOdds(pDaily);
-  el('v-prob-monthly').textContent = 'Monthly: ' + fmtOdds(pMonthly);
-  el('v-prob-yearly').textContent  = 'Yearly: '  + fmtOdds(pYearly);
-  el('v-prob-powerball').textContent = vsText;
+  el('v-prob-daily').textContent   = 'daily: '   + fmtOdds(pDaily);
+  el('v-prob-monthly').textContent = 'monthly: ' + fmtOdds(pMonthly);
+  el('v-prob-yearly').textContent  = 'yearly: '  + fmtOdds(pYearly);
+  el('v-prob-powerball').textContent = multiplierText;
+  el('v-prob-powerball-copy').textContent = better ? 'x better' : 'x worse';
 }
 
 function attachTimeframeSelector() {
