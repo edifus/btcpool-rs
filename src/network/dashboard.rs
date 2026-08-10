@@ -173,12 +173,14 @@ const LOGO_LIGHT_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox
 async fn stats_json(State(state): State<DashState>) -> Json<crate::stats::StatsSnapshot> {
     let mut snapshot = state.stats.snapshot();
     // Template version comes from the engine so the signal remains live even
-    // when no miners are connected. Bit 4 drives the BIP110/RDTS card.
+    // when no miners are connected. Its version bits drive the BIP signal
+    // tags on the Bitcoin-node card.
     if let Some(template) = state.engine.current_template().await {
         snapshot.template_version = template.version;
     }
     snapshot.unsupported_rules = state.engine.unsupported_rules().await;
     snapshot.rules_block_work = state.engine.is_blocked_on_rules().await;
+    snapshot.template_fresh = state.engine.is_template_fresh();
     Json(snapshot)
 }
 
@@ -619,7 +621,6 @@ nav a.active { color: var(--text); background: var(--surface2); border-left-colo
   padding: 0.3rem 0.6rem;
 }
 #theme-toggle:hover { color: var(--text); border-color: var(--muted); }
-.rail-led { margin-right: 0.4rem; }
 .rail-foot a { color: var(--muted); text-decoration: none; }
 .rail-foot a:hover { color: var(--text); }
 
@@ -639,20 +640,20 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
 }
 .hero-main { min-width: 0; padding: 0 1.7rem; }
 .hero .label, .kpi .label {
-  font-size: 0.62rem; font-weight: 600; text-transform: uppercase;
+  font-size: 0.78rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: 0.11em; color: var(--muted); margin-bottom: 0.4rem;
 }
 .hero-value {
   font-size: 3.1rem; font-weight: 740; line-height: 1.04; letter-spacing: -0.045em;
   color: var(--accent); font-variant-numeric: tabular-nums;
 }
-.hero-sub { display: flex; flex-wrap: wrap; gap: 0.35rem 1.2rem; margin-top: 0.5rem; font-size: 0.76rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.hero-sub { display: flex; flex-wrap: wrap; gap: 0.35rem 1.2rem; margin-top: 0.5rem; font-size: 0.68rem; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; }
 .hero-side {
   min-width: 0; display: flex; flex-direction: column; justify-content: center;
   gap: 0.32rem; padding: 0 1.3rem; border-left: 1px solid var(--border);
   font-size: 0.78rem; font-variant-numeric: tabular-nums;
 }
-.hero-side .label { margin-bottom: 0.2rem; }
+.hero-side .label { margin-bottom: 0.2rem; font-size: 0.62rem; }
 .odds-primary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.15rem 0.45rem; }
 .odds-value { padding-right: 0.15rem; font-size: 1.5rem; font-weight: 650; line-height: 1.1; color: var(--accent); }
 .odds-comparison { font-size: 0.8rem; color: var(--muted); }
@@ -670,6 +671,17 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
 .kpi .val { font-size: 1.06rem; font-weight: 650; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
 .kpi .sub { font-size: 0.72rem; color: var(--muted); margin-top: 0.15rem; font-variant-numeric: tabular-nums; }
 .kpi .sub.trunc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* BIP signal tags on the Bitcoin-node KPI, riding the card's title row —
+   present only while the node's templates signal the bit, with the
+   version-bit detail in each tag's tooltip. The row wraps, so a crowd of
+   signal tags flows onto following lines instead of clipping. */
+.kpi .label.with-tags { display: flex; align-items: center; flex-wrap: wrap; gap: 0.25rem 0.35rem; }
+#v-node-bips { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 0.25rem 0.35rem; }
+.bip-tag {
+  display: inline-block; font-size: 0.58rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.1em; color: var(--accent); border: 1px solid var(--accent);
+  border-radius: 4px; padding: 0.1rem 0.35rem; cursor: help;
+}
 .ok  { color: var(--ok); }
 .bad { color: var(--bad); }
 .accent { color: var(--accent); }
@@ -679,8 +691,18 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
 /* A too-wide table scrolls inside its panel instead of stretching the page
    (which pushed every other card off-balance on narrow screens). */
 #workers .panel { overflow-x: auto; }
-.panel-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.65rem; margin-bottom: 0.7rem; }
-.panel-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 0.7rem; }
+/* The head-to-chart gap lives on the chart (margin-top below), not here: a
+   collapsed chart is display:none, so its margin vanishes with it and both
+   collapsed sections shrink to the same height. */
+.panel-head { display: flex; flex-wrap: wrap; align-items: center; }
+/* Fixed title column so the two graphs' Hide/Show toggles sit at the same x
+   whatever each title measures; the shared range selector rides the right
+   edge. */
+.panel-head .panel-title { flex: 0 0 11.5rem; }
+.panel-head .timeframe-tabs { margin-left: auto; }
+/* Subtle break between the two graphs sharing the panel — the same 1px
+   border the KPI and network grids divide their cells with. */
+.panel-head-split { border-top: 1px solid var(--border); margin-top: 1.15rem; padding-top: 1.15rem; }
 .panel-toggle {
   display: inline-grid; place-items: center;
   cursor: pointer; font: inherit; font-size: 0.72rem; color: var(--muted);
@@ -690,7 +712,7 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
 .panel-toggle::before, .panel-toggle-label { grid-area: 1 / 1; }
 .panel-toggle::before { content: "Show"; visibility: hidden; }
 .panel-toggle:hover { color: var(--text); border-color: var(--muted); }
-.panel-title { font-size: 0.66rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.13em; color: var(--muted); }
+.panel-title { font-size: 0.78rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.13em; color: var(--muted); }
 .timeframe-tabs { display: flex; flex-wrap: wrap; align-items: center; }
 .timeframe-btn {
   cursor: pointer; font: inherit; font-size: 0.7rem; color: var(--muted);
@@ -705,11 +727,8 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
    push the workers table below the fold. ECharts does not track CSS size on
    its own — the debounced resize handler is what makes this take effect.
    vh, not dvh: dvh follows the mobile URL bar and would re-lay-out on scroll. */
-#hashrate-chart { height: clamp(280px, 40vh, 420px); width: 100%; }
-#sharerate-chart { height: clamp(220px, 28vh, 320px); width: 100%; }
-/* The share-rate panel reads as a companion to the hashrate one above it, so
-   they sit closer together than the section's default rhythm. */
-#sharerate-panel { margin-top: 1.1rem; }
+#hashrate-chart { height: clamp(280px, 40vh, 420px); width: 100%; margin-top: 0.7rem; }
+#sharerate-chart { height: clamp(220px, 28vh, 320px); width: 100%; margin-top: 0.7rem; }
 table { width: 100%; border-collapse: collapse; font-size: 0.84rem; font-variant-numeric: tabular-nums; }
 th {
   text-align: left; color: var(--muted); font-weight: 500; padding: 0.34rem 0.55rem;
@@ -866,7 +885,6 @@ tr:last-child td { border-bottom: none; }
   </nav>
   <div class="rail-foot">
     <button id="theme-toggle" title="Toggle light/dark theme">&#9681; Theme</button>
-    <span class="hide-sm"><span id="conn-led" class="led led-off rail-led" title="Connecting&hellip;"></span>Block <span id="rail-height">&mdash;</span></span>
     <span id="server-uptime" title="How long this pool process has been running">Uptime &mdash;</span>
     <span id="last-updated" class="hide-sm">Loading&hellip;</span>
     <span class="hide-sm">v"##,
@@ -905,8 +923,7 @@ tr:last-child td { border-bottom: none; }
     <div class="kpi">
       <div class="label">Accepted</div>
       <div class="val" id="v-accepted">&mdash;</div>
-      <div class="sub">session: <span id="v-session-accepted">&mdash;</span></div>
-      <div class="sub" id="v-shares-per-min" title="Accepted shares per minute, averaged over the last minute">&mdash;</div>
+      <div class="sub">session: <span id="v-session-accepted">&mdash;</span> &middot; <span id="v-shares-per-min" title="Accepted shares per minute, averaged over the last minute">per min: &mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Rejected</div>
@@ -915,7 +932,7 @@ tr:last-child td { border-bottom: none; }
     </div>
     <div class="kpi">
       <div class="label">Best share</div>
-      <div class="val accent" id="v-best-share">&mdash;</div>
+      <div class="val" id="v-best-share">&mdash;</div>
       <div class="sub">session: <span id="v-session-best-share">&mdash;</span></div>
     </div>
     <div class="kpi">
@@ -926,8 +943,7 @@ tr:last-child td { border-bottom: none; }
     <div class="kpi">
       <div class="label">Miners</div>
       <div class="val" id="v-miners">&mdash;</div>
-      <div class="sub"><span id="v-workers-online">online: &mdash;</span> &middot; <span id="v-workers-degraded">degraded: &mdash;</span></div>
-      <div class="sub" id="v-workers-offline">offline: &mdash;</div>
+      <div class="sub"><span id="v-workers-degraded">degraded: &mdash;</span> &middot; <span id="v-workers-offline">offline: &mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Pool difficulty</div>
@@ -939,29 +955,22 @@ tr:last-child td { border-bottom: none; }
 
   <div class="panel">
     <div class="panel-head">
-      <div class="panel-title">Hashrate averages <span title="Rolling hashrate averages sampled every minute; long ranges use time-bucket averages" style="cursor:help;">&#9432;</span></div>
-      <div class="panel-controls">
-        <div id="chart-window-label" class="timeframe-tabs" role="group" aria-label="Chart range">
-          <button type="button" class="timeframe-btn active" data-window="1h">1h</button>
-          <button type="button" class="timeframe-btn" data-window="6h">6h</button>
-          <button type="button" class="timeframe-btn" data-window="24h">24h</button>
-          <button type="button" class="timeframe-btn" data-window="1w">1w</button>
-          <button type="button" class="timeframe-btn" data-window="30d">30d</button>
-          <button type="button" class="timeframe-btn" data-window="180d">180d</button>
-          <button type="button" class="timeframe-btn" data-window="all">All</button>
-        </div>
-        <button id="chart-toggle" class="panel-toggle" title="Hide or show the hashrate chart"><span class="panel-toggle-label">Hide</span></button>
+      <div class="panel-title">Hashrate averages</div>
+      <button id="chart-toggle" class="panel-toggle" title="Hide or show the hashrate chart"><span class="panel-toggle-label">Hide</span></button>
+      <div id="chart-window-label" class="timeframe-tabs" role="group" aria-label="Chart range">
+        <button type="button" class="timeframe-btn active" data-window="1h">1h</button>
+        <button type="button" class="timeframe-btn" data-window="6h">6h</button>
+        <button type="button" class="timeframe-btn" data-window="24h">24h</button>
+        <button type="button" class="timeframe-btn" data-window="1w">1w</button>
+        <button type="button" class="timeframe-btn" data-window="30d">30d</button>
+        <button type="button" class="timeframe-btn" data-window="180d">180d</button>
+        <button type="button" class="timeframe-btn" data-window="all">All</button>
       </div>
     </div>
     <div id="hashrate-chart"></div>
-  </div>
-
-  <div class="panel" id="sharerate-panel">
-    <div class="panel-head">
-      <div class="panel-title">Shares per minute <span title="Accepted shares per minute, averaged over the last minute; long ranges use time-bucket averages" style="cursor:help;">&#9432;</span></div>
-      <div class="panel-controls">
-        <button id="sharerate-chart-toggle" class="panel-toggle" title="Hide or show the share rate chart"><span class="panel-toggle-label">Hide</span></button>
-      </div>
+    <div class="panel-head panel-head-split">
+      <div class="panel-title">Shares per minute</div>
+      <button id="sharerate-chart-toggle" class="panel-toggle" title="Hide or show the share rate chart"><span class="panel-toggle-label">Hide</span></button>
     </div>
     <div id="sharerate-chart"></div>
   </div>
@@ -1002,23 +1011,22 @@ tr:last-child td { border-bottom: none; }
     <div class="kpi">
       <div class="label">Network hashrate</div>
       <div class="val" id="v-net-hashrate">&mdash;</div>
-      <div class="sub" id="v-net-diff">Diff: &mdash;</div>
+      <div class="sub" id="v-net-diff">diff: &mdash;</div>
     </div>
     <div class="kpi">
       <div class="label">Next adjustment</div>
       <div class="val" id="v-net-next-adj" style="font-size:0.92rem;" title="Estimated time until the next difficulty adjustment (2016-block epochs, ~10 min/block)">&mdash;</div>
-      <div class="sub" id="v-net-adj-pct" title="Estimated difficulty change at the next retarget, from actual block timestamps in the current 2016-block epoch. Clamped to the protocol's [-75%, +300%] range.">Est. move: &mdash;</div>
+      <div class="sub" id="v-net-adj-pct" title="Estimated difficulty change at the next retarget, from actual block timestamps in the current 2016-block epoch. Clamped to the protocol's [-75%, +300%] range.">est. move: &mdash;</div>
     </div>
     <div class="kpi">
       <div class="label">Chain tip</div>
       <div class="val" id="v-height" title="Height of current best chain tip">&mdash;</div>
-      <div class="sub"><span id="v-block-transaction-count">Txs: &mdash;</span></div>
-      <div class="sub" id="v-block-reward">Reward: &mdash;</div>
+      <div class="sub"><span id="v-block-transaction-count">txs: &mdash;</span> &middot; <span id="v-block-reward" style="cursor:help;">reward: &mdash;</span></div>
     </div>
     <div class="kpi">
-      <div class="label">BIP110 / RDTS</div>
-      <div class="val" id="v-bip110" style="font-size:0.92rem;" title="Whether block templates from your Bitcoin node signal the BIP110 (RDTS) soft fork proposal by setting version bit 4. The pool copies the block version from your node, so this is decided by your node software, not by the pool.">&mdash;</div>
-      <div class="sub">signal &middot; version bit 4, from your node</div>
+      <div class="label with-tags">Bitcoin node<span id="v-node-bips"></span></div>
+      <div class="val" id="v-node" style="font-size:0.92rem;">&mdash;</div>
+      <div class="sub" id="v-node-rpc" style="cursor:help;"><span id="v-node-rpc-led" class="led led-off" style="margin-right:0.3rem;"></span><span id="v-node-rpc-text">rpc: &mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label" style="display:flex; justify-content:space-between; align-items:center;">Market
@@ -1155,26 +1163,6 @@ function workerLed(w, nowSec) {
   }
   return { cls: 'led-on', title: 'Online' };
 }
-// Timestamp (ms) of the last successful /stats refresh. Drives the rail
-// connectivity LED: green while updates are landing, grey once they go stale.
-let lastStatsOk = 0;
-
-function updateConnLed() {
-  const led = document.getElementById('conn-led');
-  if (!led) return;
-  const ageMs = lastStatsOk ? Date.now() - lastStatsOk : Infinity;
-  // Refresh runs every 10s; tolerate one missed beat before flagging stale.
-  if (ageMs < 25000) {
-    led.classList.add('led-on'); led.classList.remove('led-off');
-    led.title = 'Live — updated ' + Math.round(ageMs / 1000) + 's ago';
-  } else {
-    led.classList.add('led-off'); led.classList.remove('led-on');
-    led.title = lastStatsOk
-      ? 'Connection lost — no update for ' + Math.round(ageMs / 1000) + 's'
-      : 'Connecting…';
-  }
-}
-
 // ── Chart panels ─────────────────────────────────────────────────────────────
 // Two panels — hashrate and shares/min — over one implementation. They differ
 // only in the endpoint they poll, the unit their values carry, and where their
@@ -1396,6 +1384,73 @@ function fmtPct(pct) {
   return '<0.0001%';
 }
 
+// ── Bitcoin node card ────────────────────────────────────────────────────────
+
+// Version-bit signals this build can name. Rendered as tags on the node card;
+// the bit number itself only appears in each tag's tooltip.
+const KNOWN_BIPS = [{ bit: 4, name: 'BIP110', desc: 'RDTS' }];
+
+// Implementation + version from getnetworkinfo's user agent, BIP signal tags
+// from the template version bits, and the RPC-status LED. The pool copies the
+// block version from the node, so signaling is the node's decision, not the
+// pool's.
+function renderNodeCard(d) {
+  const nodeEl = document.getElementById('v-node');
+  const nodeText = ((d.node_implementation || '') + ' ' + (d.node_version || '')).trim();
+  nodeEl.textContent = nodeText || '—';
+  nodeEl.title = nodeText ? 'User agent: ' + d.node_subversion : '';
+
+  // Signal tags ride the title row, one per version bit the node's templates
+  // actually set — a bit KNOWN_BIPS can name gets its BIP tag, any other a
+  // generic "bit N" so no signal is swallowed. A non-signaling node (or no
+  // template yet) shows no tags at all.
+  const holder = document.getElementById('v-node-bips');
+  const version = d.template_version || 0;
+  holder.textContent = '';
+  const names = new Map(KNOWN_BIPS.map(b => [b.bit, b]));
+  const provenance = ' in block templates from your Bitcoin node. The pool copies the'
+    + ' block version from your node, so this is decided by your node software,'
+    + ' not by the pool.';
+  for (let bit = 0; bit <= 28; bit++) {
+    if (!(version & (1 << bit))) continue;
+    const knownBip = names.get(bit);
+    const tag = document.createElement('span');
+    tag.className = 'bip-tag';
+    if (knownBip) {
+      tag.textContent = knownBip.name;
+      tag.title = knownBip.name + ' (' + knownBip.desc + '): signaling — version bit '
+        + bit + ' is set' + provenance;
+    } else {
+      tag.textContent = 'bit ' + bit;
+      tag.title = 'Unrecognized version-bit signal: bit ' + bit + ' is set' + provenance;
+    }
+    holder.appendChild(tag);
+  }
+
+  // RPC status, with the worker-table LED classes. Green wants both halves
+  // healthy — the node answering the 30s info poll *and* a fresh template —
+  // because a node that answers while serving stale work is degraded, not
+  // connected.
+  const age = d.node_rpc_last_ok_secs;
+  let led, text, title;
+  if (age == null) {
+    led = 'led-off'; text = 'rpc: connecting';
+    title = 'No successful node RPC poll yet (polled every 30 s)';
+  } else if (age > 90) {
+    led = 'led-off'; text = 'rpc: disconnected';
+    title = 'No successful node RPC poll for ' + fmtUptime(age) + ' — check bitcoind and its RPC settings';
+  } else if (!d.template_fresh) {
+    led = 'led-warn'; text = 'rpc: degraded';
+    title = 'The node answers RPC but the block template has gone stale — the pool may be serving frozen work';
+  } else {
+    led = 'led-on'; text = 'rpc: connected';
+    title = 'Node RPC healthy — last successful poll ' + (age > 0 ? fmtUptime(age) + ' ago' : 'just now');
+  }
+  document.getElementById('v-node-rpc-led').className = 'led ' + led;
+  document.getElementById('v-node-rpc-text').textContent = text;
+  document.getElementById('v-node-rpc').title = title;
+}
+
 // ── Chart ────────────────────────────────────────────────────────────────────
 
 // Which series the user currently has toggled on, or null before the chart has
@@ -1511,8 +1566,6 @@ async function refresh() {
 
     updateProbability(d.total_hashrate_10m || 0, d.network_hashrate_hps || 0);
 
-    document.getElementById('v-miners').textContent = d.connected_miners;
-
     // Flash on new block height
     if (d.current_height !== lastBlockHeight) {
       const heightEl = document.getElementById('v-height');
@@ -1523,13 +1576,19 @@ async function refresh() {
       lastBlockHeight = d.current_height;
     }
     document.getElementById('v-height').textContent = d.current_height.toLocaleString();
-    document.getElementById('rail-height').textContent = d.current_height.toLocaleString();
     if (d.current_block_transaction_count != null) {
-      document.getElementById('v-block-transaction-count').textContent = 'Txs: ' + d.current_block_transaction_count.toLocaleString();
+      document.getElementById('v-block-transaction-count').textContent = 'txs: ' + d.current_block_transaction_count.toLocaleString();
     }
     if (d.current_coinbase_value) {
       const btc = d.current_coinbase_value / 1e8;
-      document.getElementById('v-block-reward').textContent = 'Reward: ' + btc.toFixed(8) + ' BTC';
+      const rewardEl = document.getElementById('v-block-reward');
+      // Four decimals keeps the shared sub line compact while still moving
+      // with fees; trailing zeros are trimmed so a bare subsidy reads
+      // "3.125", and the sat-exact figure rides the tooltip.
+      rewardEl.textContent = 'reward: '
+        + btc.toFixed(4).replace(/0+$/, '').replace(/\.$/, '') + ' BTC';
+      rewardEl.title = btc.toFixed(8) + ' BTC ('
+        + d.current_coinbase_value.toLocaleString() + ' sats)';
     }
     const roundWork = d.pool_difficulty || 0;
     const netDiffForPool = d.network_difficulty || 0;
@@ -1541,22 +1600,13 @@ async function refresh() {
 
     // Network section (human-readable hashrate + difficulty + next-adjustment ETA)
     document.getElementById('v-net-hashrate').textContent = fmtHr(d.network_hashrate_hps || 0, false);
-    document.getElementById('v-net-diff').textContent = 'Diff: ' + fmtDiff(d.network_difficulty || 0);
+    document.getElementById('v-net-diff').textContent = 'diff: ' + fmtDiff(d.network_difficulty || 0);
     document.getElementById('v-net-next-adj').textContent = fmtNextAdjustment(d.current_height || 0);
     const adj = fmtAdjustmentPct(d.est_difficulty_change_pct);
     const adjEl = document.getElementById('v-net-adj-pct');
-    adjEl.textContent = 'Est. move: ' + adj.text;
+    adjEl.textContent = 'est. move: ' + adj.text;
     adjEl.style.color = adj.color;
-    // BIP110/RDTS: bit 4 of the template version. Zero means no template yet.
-    const bipEl = document.getElementById('v-bip110');
-    if (d.template_version) {
-      const signaling = (d.template_version & (1 << 4)) !== 0;
-      bipEl.textContent = signaling ? 'Signaling' : 'Not signaling';
-      bipEl.style.color = signaling ? 'var(--accent)' : '';
-    } else {
-      bipEl.textContent = '—';
-      bipEl.style.color = '';
-    }
+    renderNodeCard(d);
     // Unimplemented `!` template rules: a soft fork activated that this build
     // predates, so the coinbase it constructs may no longer be consensus-valid.
     const rulesEl = document.getElementById('rules-banner');
@@ -1594,9 +1644,9 @@ async function refresh() {
     const lifePct = lifeTotal > 0 ? (lifeRej / lifeTotal * 100).toFixed(2) : '0.00';
     document.getElementById('v-accepted').textContent = lifeAcc.toLocaleString();
     document.getElementById('v-session-accepted').textContent = d.shares_accepted.toLocaleString();
-    // Current throughput under the two totals: the same 1m window the chart's
-    // fastest line plots.
-    document.getElementById('v-shares-per-min').textContent = 'shares/min: ' + fmtSpm(d.shares_per_minute_1m, true);
+    // Current throughput beside the session total: the same 1m window the
+    // chart's fastest line plots.
+    document.getElementById('v-shares-per-min').textContent = 'per min: ' + fmtSpm(d.shares_per_minute_1m, true);
     const rejectEl = document.getElementById('v-reject-rate');
     rejectEl.textContent = `${lifeRej.toLocaleString()} (${lifePct}%)`;
     rejectEl.title = reasonTooltip('rejects since last block', d.lifetime_reject_reasons);
@@ -1610,9 +1660,11 @@ async function refresh() {
     const nowSecKpi = Math.floor(Date.now() / 1000);
     const degradedCount = workers.filter(w => isDegraded(w, nowSecKpi)).length;
 
-    document.getElementById('v-workers-online').textContent = 'online: ' + onlineCount;
-    document.getElementById('v-workers-offline').textContent = 'offline: ' + offlineCount;
+    // The KPI counts workers currently online, not every worker the pool
+    // remembers — the remembered-but-quiet ones are the offline figure.
+    document.getElementById('v-miners').textContent = onlineCount;
     document.getElementById('v-workers-degraded').textContent = 'degraded: ' + degradedCount;
+    document.getElementById('v-workers-offline').textContent = 'offline: ' + offlineCount;
 
     // Workers table
     const tbody = document.getElementById('workers-tbody');
@@ -1652,11 +1704,9 @@ async function refresh() {
     }
 
     document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
-    lastStatsOk = Date.now();
   } catch (e) {
     console.error('Dashboard refresh error:', e);
   }
-  updateConnLed();
 }
 
 const REJECT_LABELS = {
@@ -1895,13 +1945,9 @@ PANELS.forEach(panel => {
   if (panelCollapsed(panel)) applyPanelCollapsed(panel, true);
   else loadChart(panel, selectedWindow);
 });
-updateConnLed();
 refresh();
 fetchBtcPrice();
 setInterval(refresh, 10000);
-// Re-evaluate the connectivity LED between refreshes so it goes stale on its
-// own even if refresh() stops landing (server down, tab throttled, etc.).
-setInterval(updateConnLed, 5000);
 // Matches the pool's snapshot interval, so the charts gain a point as soon as
 // one exists rather than up to a minute later.
 setInterval(() => {

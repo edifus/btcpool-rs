@@ -123,6 +123,14 @@ async fn main() -> Result<()> {
                     Ok(pct) => stats.set_est_difficulty_change_pct(pct),
                     Err(e) => tracing::warn!("Failed to estimate difficulty change: {e}"),
                 }
+                match rpc.network_info().await {
+                    Ok(info) => stats.set_node_info(
+                        info.implementation(),
+                        info.display_version(),
+                        info.subversion,
+                    ),
+                    Err(e) => tracing::warn!("Failed to poll node info: {e}"),
+                }
                 tokio::time::sleep(interval).await;
             }
         });

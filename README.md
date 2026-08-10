@@ -25,7 +25,7 @@ solo daemons don't:
 - **SV1 + SV2 on one port.** The protocol is auto-detected from the first byte of each connection. Legacy SV1 ASICs and modern Noise-encrypted SV2 firmware (e.g. NerdQAxe++) share the *same* host:port. No proxy, no second listener.
 - **True solo.** `getblocktemplate` → the miner identity's Bitcoin address. No shares database, no PPLNS, no operator fee.
 - **Self-contained.** A single Rust binary plus your Bitcoin node. Cookie auth, ZMQ block notifications, RPC-poll fallback.
-- **Observable.** A live HTML dashboard (1m/5m/10m/1h/6h/24h hashrate averages, per-worker table, network difficulty + estimated next-retarget move, BIP110/RDTS signaling, probability) and a Prometheus endpoint.
+- **Observable.** A live HTML dashboard (1m/5m/10m/1h/6h/24h hashrate averages, per-worker table, network difficulty + estimated next-retarget move, Bitcoin node info with BIP signaling tags, probability) and a Prometheus endpoint.
 
 ---
 
@@ -423,7 +423,7 @@ With `prometheus_addr` set (default `0.0.0.0:9090`), an HTTP server exposes:
 
 | Route | Description |
 |---|---|
-| `GET /` | HTML dashboard: rolling hashrate and shares/min averages with 1h-180d ranges, workers, network difficulty + estimated next-retarget move, BIP110/RDTS signal, market data, probability, uptime (auto-refreshes) |
+| `GET /` | HTML dashboard: rolling hashrate and shares/min averages with 1h-180d ranges, workers, network difficulty + estimated next-retarget move, Bitcoin node info (implementation, version, BIP signaling tags), market data, probability, uptime (auto-refreshes) |
 | `GET /stats` | JSON snapshot of current pool state |
 | `GET /history` | Legacy 10-minute hashrate history (`?since=<unix-ts>`) |
 | `GET /chart` | Hashrate ECharts option data (`?window=1h\|6h\|24h\|1w\|30d\|180d\|all`) |

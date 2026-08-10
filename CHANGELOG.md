@@ -9,6 +9,20 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-08-10
+
+Dashboard release.
+
+### Changed
+- **The "BIP110 / RDTS" dashboard card is now a "Bitcoin node" card.**
+  Display node type and version, full agent on mouseover. RPC status LED
+  to display pool connection status.
+  `/stats` gains `node_implementation`, `node_version`, `node_subversion`,
+  `node_rpc_last_ok_secs`, and `template_fresh`.
+- **KPI strip cleanups.** KPI's and Network cards normalized in appearance.
+- **Both charts share one card.** Hashrate averages and shares/min sit in a
+  single panel.
+
 ## [0.4.3] - 2026-08-09
 
 ### Fixed
@@ -1003,7 +1017,11 @@ unlinked to avoid any ambiguity with a release of the same number here.
 - Dashboard rework: worker rendering and stats mapping fixes; reject rate moved
   into the rejected card; best share keyed by vardiff difficulty.
 
-[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/edifus/btcpool-rs/compare/v0.4.3...v0.4.4
+[0.4.3]: https://github.com/edifus/btcpool-rs/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/edifus/btcpool-rs/compare/v0.4.0...v0.4.2
+[0.4.0]: https://github.com/edifus/btcpool-rs/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/edifus/btcpool-rs/compare/v0.3.0...v0.3.4
 [0.3.0]: https://github.com/edifus/btcpool-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/edifus/btcpool-rs/compare/v0.1.3...v0.2.0

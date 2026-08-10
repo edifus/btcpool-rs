@@ -115,6 +115,62 @@ pub enum BlockChainPosition {
     Unknown,
 }
 
+/// Identity of the connected node, from `getnetworkinfo`.
+#[derive(Debug, Clone)]
+pub struct NodeInfo {
+    /// BIP14 user agent, e.g. "/Satoshi:29.0.0/" (Core) or
+    /// "/Satoshi:28.1.0/Knots:20250305/" (Knots).
+    pub subversion: String,
+}
+
+impl NodeInfo {
+    /// The `(name, version)` segments of the user agent. BIP14 stacks agents
+    /// outermost-last, so "/Satoshi:28.1.0/Knots:20250305/" is Knots built on
+    /// a Core base.
+    fn segments(&self) -> Vec<(&str, &str)> {
+        self.subversion
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|seg| seg.split_once(':').unwrap_or((seg, "")))
+            .collect()
+    }
+
+    fn satoshi_version(&self) -> Option<&str> {
+        self.segments()
+            .iter()
+            .find(|(name, _)| *name == "Satoshi")
+            .map(|(_, ver)| *ver)
+    }
+
+    /// Human name of the implementation: "Bitcoin Knots" when a `Knots`
+    /// segment is present, "Bitcoin Core" for a plain `Satoshi` agent,
+    /// otherwise the outermost segment's name as reported (e.g. "btcd").
+    /// Empty when the user agent has no segments at all.
+    pub fn implementation(&self) -> String {
+        let segments = self.segments();
+        if segments.iter().any(|(name, _)| *name == "Knots") {
+            return "Bitcoin Knots".to_owned();
+        }
+        match segments.last() {
+            Some(("Satoshi", _)) => "Bitcoin Core".to_owned(),
+            Some((name, _)) => (*name).to_owned(),
+            None => String::new(),
+        }
+    }
+
+    /// Version to display next to [`implementation`](Self::implementation):
+    /// the `Satoshi` segment's version when one exists (Knots reports its Core
+    /// base version there), otherwise the outermost segment's. Any BIP14
+    /// `(uacomment)` suffix is dropped.
+    pub fn display_version(&self) -> String {
+        let ver = self
+            .satoshi_version()
+            .or_else(|| self.segments().last().map(|(_, ver)| *ver))
+            .unwrap_or("");
+        ver.split('(').next().unwrap_or("").trim().to_owned()
+    }
+}
+
 struct Inner {
     client: Client,
     /// Cookie contents (user, password) we built `client` with, if cookie auth is in use.
@@ -205,6 +261,29 @@ impl RpcClient {
             .ok_or_else(|| {
                 PoolError::Other(anyhow::anyhow!(
                     "getblockchaininfo response missing 'chain'"
+                ))
+            })
+    }
+
+    /// Identity of the connected node, per `getnetworkinfo`. Polled rather
+    /// than cached: the answer changes when the node is upgraded under a
+    /// running pool, and the RPC is trivial.
+    pub async fn network_info(self: &Arc<Self>) -> Result<NodeInfo, PoolError> {
+        let this = self.clone();
+        spawn_rpc("getnetworkinfo", move || this.network_info_blocking()).await
+    }
+
+    fn network_info_blocking(&self) -> Result<NodeInfo, PoolError> {
+        let info: Value =
+            self.call_with_refresh(|c| c.call("getnetworkinfo", &[]).map_err(PoolError::Rpc))?;
+        info.get("subversion")
+            .and_then(Value::as_str)
+            .map(|s| NodeInfo {
+                subversion: s.to_owned(),
+            })
+            .ok_or_else(|| {
+                PoolError::Other(anyhow::anyhow!(
+                    "getnetworkinfo response missing 'subversion'"
                 ))
             })
     }
@@ -621,5 +700,52 @@ mod tests {
         assert_eq!(BlockSubmitOutcome::Accepted.label(), "accepted");
         assert_eq!(BlockSubmitOutcome::Duplicate.label(), "duplicate");
         assert_eq!(BlockSubmitOutcome::Inconclusive.label(), "inconclusive");
+    }
+
+    fn node(subversion: &str) -> NodeInfo {
+        NodeInfo {
+            subversion: subversion.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_plain_satoshi_agent_is_bitcoin_core() {
+        let info = node("/Satoshi:29.0.0/");
+        assert_eq!(info.implementation(), "Bitcoin Core");
+        assert_eq!(info.display_version(), "29.0.0");
+    }
+
+    #[test]
+    fn a_knots_segment_wins_over_its_satoshi_base() {
+        let info = node("/Satoshi:28.1.0/Knots:20250305/");
+        assert_eq!(info.implementation(), "Bitcoin Knots");
+        // The Core base version, not the Knots build date — it is the number
+        // users recognise; the full agent stays visible in the raw string.
+        assert_eq!(info.display_version(), "28.1.0");
+    }
+
+    #[test]
+    fn other_agents_report_their_outermost_segment() {
+        let info = node("/btcwire:0.5.0/btcd:0.24.0/");
+        assert_eq!(info.implementation(), "btcd");
+        assert_eq!(info.display_version(), "0.24.0");
+    }
+
+    #[test]
+    fn uacomments_are_stripped_from_the_display_version() {
+        let info = node("/Satoshi:29.0.0(FutureBit-Apollo-Node)/");
+        assert_eq!(info.implementation(), "Bitcoin Core");
+        assert_eq!(info.display_version(), "29.0.0");
+    }
+
+    #[test]
+    fn an_unparseable_agent_degrades_without_panicking() {
+        let info = node("garbage");
+        assert_eq!(info.implementation(), "garbage");
+        assert_eq!(info.display_version(), "");
+
+        let empty = node("");
+        assert_eq!(empty.implementation(), "");
+        assert_eq!(empty.display_version(), "");
     }
 }

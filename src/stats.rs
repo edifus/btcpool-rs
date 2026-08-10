@@ -1242,6 +1242,13 @@ pub struct PoolStats {
     /// Estimated difficulty change (%) at the next retarget, from epoch timestamps.
     /// Stored as f64::to_bits; NaN until first polled / right after a retarget.
     est_difficulty_change_pct: AtomicU64,
+    /// Identity of the connected Bitcoin node, display-ready. Polled from
+    /// `getnetworkinfo`; empty strings until the first successful poll.
+    node_info: Mutex<NodeInfoDisplay>,
+    /// Seconds after pool start when the node-info poll last succeeded;
+    /// `u64::MAX` until it first does. Uptime-relative rather than wall-clock
+    /// so the RPC-status age is immune to clock steps.
+    node_info_ok_at_secs: AtomicU64,
     /// Found blocks still awaiting confirmation, keyed by display hash. This is
     /// the working set `mining::confirm` sweeps; it is mirrored to SQLite when
     /// a stats DB is configured and lives here alone when one is not.
@@ -1271,6 +1278,18 @@ pub struct PoolStats {
     worker_states: DashMap<String, WorkerState>,
     start_time: Instant,
     store: Option<StatsStore>,
+}
+
+/// Identity of the connected Bitcoin node, parsed from its BIP14 user agent.
+/// Replaced whole on each poll so a reader never sees a mixed generation.
+#[derive(Clone, Default)]
+struct NodeInfoDisplay {
+    /// e.g. "Bitcoin Core", "Bitcoin Knots".
+    implementation: String,
+    /// e.g. "29.0.0".
+    version: String,
+    /// The raw user agent, e.g. "/Satoshi:28.1.0/Knots:20250305/".
+    subversion: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -1497,6 +1516,8 @@ impl PoolStats {
             network_hashrate_hps: AtomicU64::new(0),
             network_difficulty: AtomicU64::new(f64::to_bits(0.0)),
             est_difficulty_change_pct: AtomicU64::new(f64::to_bits(f64::NAN)),
+            node_info: Mutex::new(NodeInfoDisplay::default()),
+            node_info_ok_at_secs: AtomicU64::new(u64::MAX),
             session_hashrates,
             pending_shares: AtomicU64::new(0),
             share_rate: Mutex::new(share_rate),
@@ -2130,6 +2151,16 @@ impl PoolStats {
             .store(pct.to_bits(), Ordering::Relaxed);
     }
 
+    pub fn set_node_info(&self, implementation: String, version: String, subversion: String) {
+        *self.node_info.lock() = NodeInfoDisplay {
+            implementation,
+            version,
+            subversion,
+        };
+        self.node_info_ok_at_secs
+            .store(self.start_time.elapsed().as_secs(), Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> StatsSnapshot {
         let by_worker = self.hashrates_by_worker();
         let worker_hashrates: Vec<WorkerHashrate> = by_worker
@@ -2242,6 +2273,13 @@ impl PoolStats {
             });
         }
 
+        let node_info = self.node_info.lock().clone();
+        let uptime_secs = self.start_time.elapsed().as_secs();
+        let node_rpc_last_ok_secs = match self.node_info_ok_at_secs.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            at => Some(uptime_secs.saturating_sub(at)),
+        };
+
         StatsSnapshot {
             shares_accepted: self.shares_accepted.load(Ordering::Relaxed),
             shares_rejected: self.shares_rejected.load(Ordering::Relaxed),
@@ -2286,7 +2324,12 @@ impl PoolStats {
             est_difficulty_change_pct: f64::from_bits(
                 self.est_difficulty_change_pct.load(Ordering::Relaxed),
             ),
-            uptime_secs: self.start_time.elapsed().as_secs(),
+            node_implementation: node_info.implementation,
+            node_version: node_info.version,
+            node_subversion: node_info.subversion,
+            node_rpc_last_ok_secs,
+            template_fresh: false,
+            uptime_secs,
             session_best_hashrate_hps: f64::from_bits(
                 self.session_best_hashrate_hps.load(Ordering::Relaxed),
             ),
@@ -2364,6 +2407,19 @@ pub struct StatsSnapshot {
     pub network_hashrate_hps: f64,
     pub network_difficulty: f64,
     pub est_difficulty_change_pct: f64,
+    /// Identity of the connected Bitcoin node, parsed from `getnetworkinfo`'s
+    /// BIP14 user agent. Empty strings until the first successful poll.
+    pub node_implementation: String,
+    pub node_version: String,
+    /// The raw user agent, e.g. "/Satoshi:28.1.0/Knots:20250305/".
+    pub node_subversion: String,
+    /// Seconds since the node-info RPC poll last succeeded; `null` before the
+    /// first success. Drives the dashboard's RPC-status LED.
+    pub node_rpc_last_ok_secs: Option<u64>,
+    /// Whether the engine's current template is fresh. Filled by the dashboard
+    /// from the TemplateEngine, like `template_version`; other snapshot
+    /// consumers receive `false`.
+    pub template_fresh: bool,
     pub worker_hashrates: Vec<WorkerHashrate>,
     pub worker_states: Vec<WorkerState>,
     pub uptime_secs: u64,
