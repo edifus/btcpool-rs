@@ -108,8 +108,7 @@ impl ShareCredit {
         let meets_effective = hash_difficulty as f64 >= effective as f64 * BELOW_TOLERANCE;
 
         if self.honors_assigned {
-            if !meets_effective
-                && now.saturating_duration_since(self.assigned_at) > RETARGET_GRACE
+            if !meets_effective && now.saturating_duration_since(self.assigned_at) > RETARGET_GRACE
             {
                 self.below_assigned += 1;
                 if self.below_assigned >= EVIDENCE_SHARES {
@@ -236,7 +235,10 @@ mod tests {
         let (mut credit, now) = settled(Instant::now());
         // hash_to_difficulty truncates: a share on the nose can read one under.
         for _ in 0..(EVIDENCE_SHARES * 2) {
-            assert_eq!(credit.credit(ASSIGNED, ASSIGNED, ASSIGNED - 1, now), ASSIGNED);
+            assert_eq!(
+                credit.credit(ASSIGNED, ASSIGNED, ASSIGNED - 1, now),
+                ASSIGNED
+            );
         }
         assert!(credit.honors_assigned());
     }
