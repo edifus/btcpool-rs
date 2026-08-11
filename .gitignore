@@ -31,5 +31,7 @@
 !/packaging/systemd/*.service
 !/src/**/*.rs
 !/src/network/favicon.ico
+!/src/network/InterVariable.woff2
+!/src/network/InterVariable-LICENSE.txt
 !/tests/**/*.rs
 !/tests/fixtures/*.json
