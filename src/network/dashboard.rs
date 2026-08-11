@@ -97,6 +97,7 @@ pub async fn start(
     let app = Router::new()
         .route("/", get(dashboard_html))
         .route("/favicon.ico", get(favicon))
+        .route("/fonts/inter.woff2", get(font_inter))
         .route("/logo-dark.svg", get(logo_dark))
         .route("/logo-light.svg", get(logo_light))
         .route("/stats", get(stats_json))
@@ -131,6 +132,24 @@ async fn favicon() -> impl IntoResponse {
     (
         [(axum::http::header::CONTENT_TYPE, "image/x-icon")],
         include_bytes!("favicon.ico").as_slice(),
+    )
+}
+
+/// Inter (variable, SIL OFL — licence alongside the file), embedded so every
+/// browser renders the dashboard with the same metrics. The system stacks
+/// disagree enough to change where text wraps, and the fractional weights the
+/// CSS uses (650, 740) only exist in a variable font. Cached hard: the bytes
+/// only change with the binary.
+async fn font_inter() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "font/woff2"),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        include_bytes!("InterVariable.woff2").as_slice(),
     )
 }
 
@@ -545,8 +564,18 @@ const DASHBOARD_HTML: &str = concat!(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="icon" href="/favicon.ico" type="image/x-icon">
 <title>btcpool-rs</title>
+<link rel="preload" href="/fonts/inter.woff2" as="font" type="font/woff2" crossorigin>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 <style>
+/* Embedded so desktop and mobile render with identical metrics; the system
+   stacks below are only the flash-of-fallback and the escape hatch. */
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/inter.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
 :root {
   --bg: #0a0a0b;
   --surface: #131316;
@@ -623,10 +652,32 @@ nav a.active { color: var(--text); background: var(--surface2); border-left-colo
 #theme-toggle:hover { color: var(--text); border-color: var(--muted); }
 .rail-foot a { color: var(--muted); text-decoration: none; }
 .rail-foot a:hover { color: var(--text); }
+/* Collapse control: rides the brand row's right edge when open, and is all
+   that remains beside the mark once collapsed. Hidden below 880px, where the
+   rail is already a top bar with its own burger. */
+#rail-collapse {
+  margin-left: auto; cursor: pointer; font: inherit; font-size: 0.85rem; line-height: 1;
+  color: var(--muted); background: none; border: 1px solid var(--border);
+  border-radius: 5px; padding: 0.15rem 0.35rem;
+}
+#rail-collapse:hover { color: var(--text); border-color: var(--muted); }
+/* Desktop-only: the class persists at every width, but below 881px the rail
+   is a top bar where sideways collapse means nothing — and forcing display
+   back on there would override the net badge's `hidden` attribute, painting
+   an empty pill. */
+@media (min-width: 881px) {
+  .rail.collapsed { width: 56px; padding-left: 0.5rem; padding-right: 0.5rem; }
+  .rail.collapsed .brand { flex-direction: column; gap: 0.7rem; padding: 0; }
+  .rail.collapsed .brand .name, .rail.collapsed #net-badge,
+  .rail.collapsed nav, .rail.collapsed .rail-foot { display: none; }
+  .rail.collapsed #rail-collapse { margin-left: 0; }
+}
 
 /* ── Main column ── */
-main { flex: 1; min-width: 0; max-width: 1240px; padding: 1.7rem 2.1rem 2.5rem; }
-section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
+/* Uncapped: the right edge stays at the viewport, so collapsing the rail
+   widens the dashboard leftward instead of moving where it ends. */
+main { flex: 1; min-width: 0; padding: 1.7rem 2.1rem 2.5rem; }
+section { margin-bottom: 1.4rem; scroll-margin-top: 1.2rem; }
 .sec-title {
   font-size: 0.66rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: 0.13em; color: var(--muted); margin-bottom: 0.9rem;
@@ -647,6 +698,7 @@ section { margin-bottom: 2.4rem; scroll-margin-top: 1.2rem; }
   font-size: 3.1rem; font-weight: 740; line-height: 1.04; letter-spacing: -0.045em;
   color: var(--accent); font-variant-numeric: tabular-nums;
 }
+.hero-value .hero-unit { font-size: 1.15rem; font-weight: 650; letter-spacing: -0.01em; margin-left: 0.4rem; }
 .hero-sub { display: flex; flex-wrap: wrap; gap: 0.35rem 1.2rem; margin-top: 0.5rem; font-size: 0.68rem; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; }
 .hero-side {
   min-width: 0; display: flex; flex-direction: column; justify-content: center;
@@ -821,6 +873,24 @@ tr:last-child td { border-bottom: none; }
 .modal-x:hover { color: var(--text); }
 .modal-actions { display: flex; align-items: center; margin-top: 0.4rem; }
 
+/* ── Wrapped KPI rows ── */
+/* Once the strip is too narrow for one row, auto-fit would wrap it with the
+   rows packed flush and nothing between them. Explicit column counts make
+   "first card in a row" addressable, so wrapped rows get the same hairline
+   the columns already use, plus room to breathe. */
+@media (max-width: 1240px) {
+  .kpi-grid { grid-template-columns: repeat(3, 1fr); }
+  .kpis { padding: 0.3rem 0; }
+  .kpi { padding-top: 0.8rem; padding-bottom: 0.8rem; }
+  .kpi + .kpi { border-left: none; }
+  .kpi:not(:nth-child(3n+1)) { border-left: 1px solid var(--border); }
+  .kpi:nth-child(n+4) { border-top: 1px solid var(--border); }
+  /* A short last row stretches its final card over the leftover columns, so
+     the row separator runs the full strip instead of dying at a dead cell. */
+  .kpi:last-child:nth-child(3n+2) { grid-column: span 2; }
+  .kpi:last-child:nth-child(3n+1):not(:first-child) { grid-column: span 3; }
+}
+
 /* ── Narrow screens: rail becomes a top bar ── */
 @media (max-width: 880px) {
   .shell { flex-direction: column; }
@@ -831,6 +901,9 @@ tr:last-child td { border-bottom: none; }
     flex-wrap: wrap; align-items: center; gap: 0.9rem; padding: 0.7rem 1rem;
     border-right: none; border-bottom: 1px solid var(--border);
   }
+  /* The rail is a top bar here; collapsing it sideways has no meaning. The
+     collapsed styles themselves are desktop-scoped above. */
+  #rail-collapse { display: none; }
   #nav-burger {
     display: block; margin-left: auto; cursor: pointer;
     font-size: 1.15rem; line-height: 1; color: var(--muted);
@@ -850,8 +923,11 @@ tr:last-child td { border-bottom: none; }
   }
   .rail-foot .hide-sm { display: none; }
   main { padding: 1.2rem 1rem 2rem; }
-  .hero { grid-template-columns: 1fr; gap: 1.6rem; }
-  .hero-side { padding: 0 1.7rem; border-left: none; }
+  /* The small unit leaves room for the odds card to keep sharing the top
+     row rather than stacking below the hashrate. */
+  .hero { grid-template-columns: minmax(0, 1fr) auto; }
+  .hero-main { padding: 0 1.2rem; }
+  .hero-side { padding: 0 1.2rem; }
 }
 
 /* Phone: the 15-column workers table can't fit; retain the 10m operational
@@ -867,6 +943,20 @@ tr:last-child td { border-bottom: none; }
   #workers th:nth-child(10), #workers td:nth-child(10),
   #workers th:nth-child(13), #workers td:nth-child(13),
   #workers th:nth-child(15), #workers td:nth-child(15) { display: none; }
+  /* The hero's four averages sit at the width where whether they fit on one
+     line depends on the device's font metrics; a phone renders them ragged
+     (three up, one wrapped). A deliberate 2x2 grid instead of the raggedness
+     roulette. */
+  .hero-sub { display: grid; grid-template-columns: repeat(2, auto); justify-content: start; }
+  /* The range tabs take a full row of their own: squeezed beside the toggle
+     they crumple into the head instead of wrapping below it. */
+  .panel-head .timeframe-tabs { flex-basis: 100%; margin-left: 0; }
+  /* Two KPI columns; the 3-column row/divider maths above re-drawn for it. */
+  .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+  .kpi:nth-child(odd) { border-left: none; }
+  .kpi:nth-child(even) { border-left: 1px solid var(--border); }
+  .kpi:nth-child(n+3) { border-top: 1px solid var(--border); }
+  .kpi:last-child:nth-child(odd):not(:first-child) { grid-column: span 2; }
 }
 </style>
 </head>
@@ -874,7 +964,7 @@ tr:last-child td { border-bottom: none; }
 <div class="shell">
 
 <aside class="rail">
-  <div class="brand"><img id="brand-logo" class="mark" src="/logo-dark.svg" alt="btcpool-rs logo" width="64" height="64"><span class="name">btcpool-rs</span><span id="net-badge" hidden></span></div>
+  <div class="brand"><img id="brand-logo" class="mark" src="/logo-dark.svg" alt="btcpool-rs logo" width="64" height="64"><span class="name">btcpool-rs</span><span id="net-badge" hidden></span><button type="button" id="rail-collapse" aria-label="Collapse sidebar" aria-expanded="true" title="Collapse sidebar">&laquo;</button></div>
   <button type="button" id="nav-burger" aria-label="Toggle menu" aria-expanded="false">&#9776;</button>
   <nav id="rail-nav">
     <a href="#overview" data-section="overview" class="active">Overview</a>
@@ -901,7 +991,7 @@ tr:last-child td { border-bottom: none; }
   <div class="hero">
     <div class="hero-main">
       <div class="label">Pool hashrate &middot; 10m</div>
-      <div class="hero-value" id="v-reported-current">&mdash;</div>
+      <div class="hero-value"><span id="v-reported-num">&mdash;</span><span class="hero-unit" id="v-reported-unit"></span></div>
       <div class="hero-sub"><span id="v-reported-1m">1m: &mdash;</span><span id="v-reported-1h">1h: &mdash;</span><span id="v-reported-6h">6h: &mdash;</span><span id="v-reported-24h">24h: &mdash;</span></div>
     </div>
     <div class="hero-side">
@@ -923,32 +1013,32 @@ tr:last-child td { border-bottom: none; }
     <div class="kpi">
       <div class="label">Accepted</div>
       <div class="val" id="v-accepted">&mdash;</div>
-      <div class="sub">session: <span id="v-session-accepted">&mdash;</span> &middot; <span id="v-shares-per-min" title="Accepted shares per minute, averaged over the last minute">per min: &mdash;</span></div>
+      <div class="sub">since restart: <span id="v-session-accepted">&mdash;</span> &middot; <span id="v-shares-per-min" title="Accepted shares per minute, averaged over the last minute">per min: &mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Rejected</div>
       <div class="val" id="v-reject-rate" style="cursor:help;">&mdash;</div>
-      <div class="sub">session: <span id="v-session-rejects" style="cursor:help;">&mdash;</span></div>
-    </div>
-    <div class="kpi">
-      <div class="label">Best share</div>
-      <div class="val" id="v-best-share">&mdash;</div>
-      <div class="sub">session: <span id="v-session-best-share">&mdash;</span></div>
+      <div class="sub">since restart: <span id="v-session-rejects" style="cursor:help;">&mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Best hashrate</div>
       <div class="val" id="v-best-hashrate">&mdash;</div>
-      <div class="sub">session: <span id="v-session-best-hashrate">&mdash;</span></div>
+      <div class="sub">since restart: <span id="v-session-best-hashrate">&mdash;</span></div>
     </div>
     <div class="kpi">
-      <div class="label">Miners</div>
-      <div class="val" id="v-miners">&mdash;</div>
-      <div class="sub"><span id="v-workers-degraded">degraded: &mdash;</span> &middot; <span id="v-workers-offline">offline: &mdash;</span></div>
+      <div class="label">Best share</div>
+      <div class="val" id="v-best-share">&mdash;</div>
+      <div class="sub">since restart: <span id="v-session-best-share">&mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Pool difficulty</div>
       <div class="val" id="v-pool-diff" title="Accepted share work since the pool's last found block, as a share of the current network difficulty. 100% is one expected block's worth of work.">&mdash;</div>
       <div class="sub" id="v-pool-diff-work" title="Accepted share difficulty accumulated since the last found block; finding a block starts it over">work: &mdash;</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Miners</div>
+      <div class="val" id="v-miners">&mdash;</div>
+      <div class="sub"><span id="v-workers-degraded">degraded: &mdash;</span> &middot; <span id="v-workers-offline">offline: &mdash;</span></div>
     </div>
     </div>
   </div>
@@ -1009,6 +1099,16 @@ tr:last-child td { border-bottom: none; }
   <div class="kpis">
     <div class="kpi-grid">
     <div class="kpi">
+      <div class="label with-tags">Bitcoin node<span id="v-node-bips"></span></div>
+      <div class="val" id="v-node" style="font-size:0.92rem;">&mdash;</div>
+      <div class="sub" id="v-node-rpc" style="cursor:help;"><span id="v-node-rpc-led" class="led led-off" style="margin-right:0.3rem;"></span><span id="v-node-rpc-text">rpc: &mdash;</span></div>
+    </div>
+    <div class="kpi">
+      <div class="label">Chain tip</div>
+      <div class="val" id="v-height" title="Height of current best chain tip">&mdash;</div>
+      <div class="sub"><span id="v-block-transaction-count">txs: &mdash;</span> &middot; <span id="v-block-reward" style="cursor:help;">reward: &mdash;</span></div>
+    </div>
+    <div class="kpi">
       <div class="label">Network hashrate</div>
       <div class="val" id="v-net-hashrate">&mdash;</div>
       <div class="sub" id="v-net-diff">diff: &mdash;</div>
@@ -1017,16 +1117,6 @@ tr:last-child td { border-bottom: none; }
       <div class="label">Next adjustment</div>
       <div class="val" id="v-net-next-adj" style="font-size:0.92rem;" title="Estimated time until the next difficulty adjustment (2016-block epochs, ~10 min/block)">&mdash;</div>
       <div class="sub" id="v-net-adj-pct" title="Estimated difficulty change at the next retarget, from actual block timestamps in the current 2016-block epoch. Clamped to the protocol's [-75%, +300%] range.">est. move: &mdash;</div>
-    </div>
-    <div class="kpi">
-      <div class="label">Chain tip</div>
-      <div class="val" id="v-height" title="Height of current best chain tip">&mdash;</div>
-      <div class="sub"><span id="v-block-transaction-count">txs: &mdash;</span> &middot; <span id="v-block-reward" style="cursor:help;">reward: &mdash;</span></div>
-    </div>
-    <div class="kpi">
-      <div class="label with-tags">Bitcoin node<span id="v-node-bips"></span></div>
-      <div class="val" id="v-node" style="font-size:0.92rem;">&mdash;</div>
-      <div class="sub" id="v-node-rpc" style="cursor:help;"><span id="v-node-rpc-led" class="led led-off" style="margin-right:0.3rem;"></span><span id="v-node-rpc-text">rpc: &mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label" style="display:flex; justify-content:space-between; align-items:center;">Market
@@ -1249,23 +1339,28 @@ function applyResponsiveLayout(panel, options) {
   return options;
 }
 
+// Re-measure both charts against their container's current size. ECharts does
+// not track CSS size on its own, so anything that changes the main column's
+// width or the viewport height has to call this.
+function relayoutCharts() {
+  PANELS.forEach(panel => {
+    panel.chart.resize();
+    if (!panel.options) return;
+    // Carry the user's current legend toggles across the merge, or this would
+    // re-apply whichever ones were live when the chart was last fetched.
+    const shown = panelLegend(panel);
+    if (shown && panel.options.legend) panel.options.legend.selected = shown;
+    panel.chart.setOption(applyResponsiveLayout(panel, panel.options));
+  });
+}
+
 let resizeTimer = null;
 window.addEventListener('resize', () => {
   // Debounced: a drag-resize fires continuously, and each pass re-lays out the
   // whole chart. The CSS height is viewport-relative, so this is also what
-  // makes the canvas follow it — ECharts does not track CSS size on its own.
+  // makes the canvas follow it.
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => {
-    PANELS.forEach(panel => {
-      panel.chart.resize();
-      if (!panel.options) return;
-      // Carry the user's current legend toggles across the merge, or this would
-      // re-apply whichever ones were live when the chart was last fetched.
-      const shown = panelLegend(panel);
-      if (shown && panel.options.legend) panel.options.legend.selected = shown;
-      panel.chart.setOption(applyResponsiveLayout(panel, panel.options));
-    });
-  }, 150);
+  resizeTimer = setTimeout(relayoutCharts, 150);
 });
 
 document.getElementById('theme-toggle').addEventListener('click', () => {
@@ -1286,6 +1381,32 @@ document.getElementById('rail-nav').addEventListener('click', () => {
   railEl.classList.remove('nav-open');
   burgerEl.setAttribute('aria-expanded', 'false');
 });
+
+// ── Sidebar collapse ─────────────────────────────────────────────────────────
+// Persisted like the theme. The charts need an explicit re-layout: the main
+// column's width changes without a window resize to trigger one.
+const RAIL_KEY = 'railCollapsed';
+const railCollapseEl = document.getElementById('rail-collapse');
+function railCollapsed() {
+  try { return localStorage.getItem(RAIL_KEY) === '1'; } catch (_) { return false; }
+}
+function applyRailCollapsed(collapsed, relayout) {
+  try { localStorage.setItem(RAIL_KEY, collapsed ? '1' : '0'); } catch (_) {}
+  railEl.classList.toggle('collapsed', collapsed);
+  railCollapseEl.textContent = collapsed ? '»' : '«';
+  railCollapseEl.title = collapsed ? 'Expand sidebar' : 'Collapse sidebar';
+  railCollapseEl.setAttribute('aria-label', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
+  railCollapseEl.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  if (relayout) relayoutCharts();
+}
+railCollapseEl.addEventListener('click', () => {
+  applyRailCollapsed(!railEl.classList.contains('collapsed'), true);
+});
+// The relayout matters most on this first pass: `echarts.init` measured the
+// column while the rail was still expanded, and `setOption` alone never
+// re-measures — a restored collapsed rail would leave both charts drawing at
+// the narrower width, with the label density computed from it too.
+applyRailCollapsed(railCollapsed(), true);
 
 // ── Chart collapse toggles ───────────────────────────────────────────────────
 // Persisted per panel like the theme choice; while collapsed the periodic fetch
@@ -1558,7 +1679,11 @@ async function refresh() {
 
     const reported10m = d.total_hashrate_10m || 0;
 
-    document.getElementById('v-reported-current').textContent = fmtHr(reported10m, false);
+    // Number and unit split so the unit can render smaller than the figure.
+    const heroHr = fmtHr(reported10m, false);
+    const heroCut = heroHr.lastIndexOf(' ');
+    document.getElementById('v-reported-num').textContent = heroHr.slice(0, heroCut);
+    document.getElementById('v-reported-unit').textContent = heroHr.slice(heroCut + 1);
     document.getElementById('v-reported-1m').textContent = '1m: ' + fmtHr(d.total_hashrate_60s || 0, false);
     document.getElementById('v-reported-1h').textContent = '1h: ' + fmtHr(d.total_hashrate_1h || 0, false);
     document.getElementById('v-reported-6h').textContent = '6h: ' + fmtHr(d.total_hashrate_6h || 0, false);

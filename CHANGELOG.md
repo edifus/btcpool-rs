@@ -9,6 +9,39 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-08-10
+
+Dashboard polish: a collapsible sidebar, an embedded webfont, and a mobile
+layout pass.
+
+### Added
+- **The desktop dashboard sidebar can now be collapsed.** The preference
+  survives reloads, the main column expands to use the available viewport
+  width, and both charts reflow immediately to fit. The existing mobile top
+  bar remains unchanged.
+
+### Changed
+- **Inter is embedded and served at `/fonts/inter.woff2`** (SIL OFL, +344 KB
+  in the binary), so desktop and mobile render with identical metrics
+  instead of per-device fallback fonts.
+- **The hero hashrate renders its unit smaller than the figure**, and the
+  Odds-vs-Powerball card shares the top row on phone widths instead of
+  stacking below it.
+- **Card order.** Network cards read node, tip, hashrate, adjustment,
+  market; the KPI strip reads accepted, rejected, hashrate, share,
+  difficulty, miners.
+
+### Fixed
+- **Wrapped KPI and network card rows were packed flush on narrow screens.**
+  Rows now separate with the same hairline the columns use, a short last
+  row stretches its final card so the separators run the full strip, and
+  the hero averages lay out 2x2 on phones instead of wrapping ragged.
+- **The chart range tabs no longer crumple into the Hide toggle on phones**;
+  they take a full row of their own below the title.
+- **A collapsed sidebar no longer paints an empty network-badge pill in the
+  mobile top bar.** The collapse styles are desktop-scoped, so the badge's
+  `hidden` attribute holds below 881px.
+
 ## [0.4.4] - 2026-08-10
 
 Dashboard release.
@@ -1017,11 +1050,9 @@ unlinked to avoid any ambiguity with a release of the same number here.
 - Dashboard rework: worker rendering and stats mapping fixes; reject rate moved
   into the rejected card; best share keyed by vardiff difficulty.
 
-[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.4.4...HEAD
-[0.4.4]: https://github.com/edifus/btcpool-rs/compare/v0.4.3...v0.4.4
-[0.4.3]: https://github.com/edifus/btcpool-rs/compare/v0.4.2...v0.4.3
-[0.4.2]: https://github.com/edifus/btcpool-rs/compare/v0.4.0...v0.4.2
-[0.4.0]: https://github.com/edifus/btcpool-rs/compare/v0.3.4...v0.4.0
+[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/edifus/btcpool-rs/compare/v0.4.4...v0.4.5
+[0.4.4]: https://github.com/edifus/btcpool-rs/releases/tag/v0.4.4
 [0.3.4]: https://github.com/edifus/btcpool-rs/compare/v0.3.0...v0.3.4
 [0.3.0]: https://github.com/edifus/btcpool-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/edifus/btcpool-rs/compare/v0.1.3...v0.2.0
