@@ -945,22 +945,22 @@ tr:last-child td { border-bottom: none; }
     <div class="kpi">
       <div class="label">Accepted</div>
       <div class="val" id="v-accepted">&mdash;</div>
-      <div class="sub">session: <span id="v-session-accepted">&mdash;</span> &middot; <span id="v-shares-per-min" title="Accepted shares per minute, averaged over the last minute">per min: &mdash;</span></div>
+      <div class="sub">since restart: <span id="v-session-accepted">&mdash;</span> &middot; <span id="v-shares-per-min" title="Accepted shares per minute, averaged over the last minute">per min: &mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Rejected</div>
       <div class="val" id="v-reject-rate" style="cursor:help;">&mdash;</div>
-      <div class="sub">session: <span id="v-session-rejects" style="cursor:help;">&mdash;</span></div>
+      <div class="sub">since restart: <span id="v-session-rejects" style="cursor:help;">&mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Best share</div>
       <div class="val" id="v-best-share">&mdash;</div>
-      <div class="sub">session: <span id="v-session-best-share">&mdash;</span></div>
+      <div class="sub">since restart: <span id="v-session-best-share">&mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Best hashrate</div>
       <div class="val" id="v-best-hashrate">&mdash;</div>
-      <div class="sub">session: <span id="v-session-best-hashrate">&mdash;</span></div>
+      <div class="sub">since restart: <span id="v-session-best-hashrate">&mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Miners</div>
