@@ -698,19 +698,23 @@ section { margin-bottom: 1.4rem; scroll-margin-top: 1.2rem; }
   font-size: 3.1rem; font-weight: 740; line-height: 1.04; letter-spacing: -0.045em;
   color: var(--accent); font-variant-numeric: tabular-nums;
 }
-.hero-value .hero-unit { font-size: 1.15rem; font-weight: 650; letter-spacing: -0.01em; margin-left: 0.4rem; }
+/* nowrap on both halves: 'TH/s' contains a slash, which is a break
+   opportunity, so a tight column would otherwise split the unit itself. */
+.hero-value .hero-unit { font-size: 1.15rem; font-weight: 650; letter-spacing: -0.01em; margin-left: 0.4rem; white-space: nowrap; }
+.hero-value { white-space: nowrap; }
 .hero-sub { display: flex; flex-wrap: wrap; gap: 0.35rem 1.2rem; margin-top: 0.5rem; font-size: 0.68rem; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; }
+.hero-sub > span { white-space: nowrap; }
+/* Top-aligned, not centred: its label shares the hero's first line, so the
+   two card titles read as one row. */
 .hero-side {
-  min-width: 0; display: flex; flex-direction: column; justify-content: center;
+  min-width: 0; display: flex; flex-direction: column; justify-content: flex-start;
   gap: 0.32rem; padding: 0 1.3rem; border-left: 1px solid var(--border);
   font-size: 0.78rem; font-variant-numeric: tabular-nums;
 }
-.hero-side .label { margin-bottom: 0.2rem; font-size: 0.62rem; }
-.odds-primary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.15rem 0.45rem; }
+.odds-primary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.15rem 0.45rem; cursor: help; }
 .odds-value { padding-right: 0.15rem; font-size: 1.5rem; font-weight: 650; line-height: 1.1; color: var(--accent); }
 .odds-comparison { font-size: 0.8rem; color: var(--muted); }
 .odds-periods { display: flex; flex-direction: column; gap: 0.2rem; color: var(--muted); font-size: 0.72rem; }
-.odds-info { cursor: help; }
 
 /* ── KPI strip ── */
 .kpis {
@@ -995,8 +999,8 @@ tr:last-child td { border-bottom: none; }
       <div class="hero-sub"><span id="v-reported-1m">1m: &mdash;</span><span id="v-reported-1h">1h: &mdash;</span><span id="v-reported-6h">6h: &mdash;</span><span id="v-reported-24h">24h: &mdash;</span></div>
     </div>
     <div class="hero-side">
-      <div class="label">Odds vs Powerball <span class="odds-info" id="powerball-odds-info" aria-label="Current Powerball jackpot odds">&#9432;</span></div>
-      <div class="odds-primary">
+      <div class="label">Odds vs Powerball</div>
+      <div class="odds-primary" id="powerball-odds-info">
         <span class="odds-value" id="v-prob-powerball">&mdash;</span>
         <span class="odds-comparison" id="v-prob-powerball-copy">x better</span>
       </div>
@@ -1875,6 +1879,7 @@ function fmtOdds(p) {
 }
 
 const POWERBALL_JACKPOT_ODDS = 292201338;
+// On the figure itself rather than an icon beside the title.
 document.getElementById('powerball-odds-info').title =
   'Powerball jackpot odds: 1 in ' + POWERBALL_JACKPOT_ODDS.toLocaleString();
 

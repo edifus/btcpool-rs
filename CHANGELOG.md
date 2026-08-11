@@ -9,6 +9,18 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+### Changed
+- **The Odds vs Powerball card reads as a peer of the hero.** Its title now
+  matches the other card titles and sits on the same line as the pool
+  hashrate title, and the jackpot-odds tooltip moved from a `?` icon beside
+  that title onto the odds figure itself.
+
+### Fixed
+- **The hero hashrate could break its unit across lines**, rendering `TH/`
+  above a lone `s`, because the slash in a hashrate unit is a line-break
+  opportunity. The hero figure and each rolling average now keep their unit
+  intact and wrap between items instead.
+
 ## [0.4.5] - 2026-08-10
 
 Dashboard polish: a collapsible sidebar, an embedded webfont, and a mobile
