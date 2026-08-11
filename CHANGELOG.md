@@ -16,9 +16,8 @@ everything else bumps the **patch** version.
   chain tip, market, odds.
 - **The Bitcoin node card was restructured.** RPC status is a pip in the
   card title, the implementation name leads with its BIP signal tags beside
-  it, and the version shares one secondary line with the RPC state
-  (`version: 29.1.0 · rpc: connected`). Signal tags render as filled chips
-  rather than outlines.
+  it, and the version shares one secondary line with the RPC state. Signal
+  tags render as filled chips rather than outlines.
 - **The odds card shows the flat Powerball jackpot odds** as its secondary
   line; the per-period chances of finding a block (daily, monthly, yearly)
   moved onto the hover, which also keeps the card the same height as its
@@ -27,12 +26,24 @@ everything else bumps the **patch** version.
   expected work", its work figure drops the trailing clause, and the odds
   hover lists the periods without a lead-in.
 - **The workers table reads Accept / Reject** rather than Acc / Rej.
+- **The Accepted card drops its per-minute figure**, leaving the lifetime
+  total over the since-restart count.
 
 ### Fixed
 - **The hero hashrate could break its unit across lines**, rendering `TH/`
   above a lone `s`, because the slash in a hashrate unit is a line-break
   opportunity. The hero figure and each rolling average now keep their unit
   intact and wrap between items instead.
+- **The hero overflowed its divider on phones.** A phone browser lays out
+  at roughly 410 CSS pixels — narrower than a desktop window can be made —
+  and against that the fixed-size hashrate, the two-column averages, and an
+  `auto`-sized node column all wanted more room than the half-width hero
+  had. The figure now scales with the viewport up to its previous size, the
+  averages fit as many columns as the space allows (at most two), and the
+  hero's halves share the width evenly.
+- **The node card's secondary line broke mid-status**, stranding
+  `connected` on its own line. Each half is now atomic, so the line can
+  only break between the version and the RPC status.
 
 ## [0.4.5] - 2026-08-10
 

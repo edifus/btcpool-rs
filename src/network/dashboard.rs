@@ -694,13 +694,17 @@ section { margin-bottom: 1.4rem; scroll-margin-top: 1.2rem; }
   font-size: 0.78rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: 0.11em; color: var(--muted); margin-bottom: 0.4rem;
 }
+/* Fluid rather than a fixed 3.1rem: the figure cannot wrap (a hashrate unit
+   would split at its slash), so on a ~410px phone viewport a fixed size
+   overflows the column and runs through the divider. vw-scaled with a
+   desktop cap, so it fits any width without another breakpoint. */
 .hero-value {
-  font-size: 3.1rem; font-weight: 740; line-height: 1.04; letter-spacing: -0.045em;
-  color: var(--accent); font-variant-numeric: tabular-nums;
+  font-size: clamp(1.85rem, 7vw, 3.1rem); font-weight: 740; line-height: 1.04;
+  letter-spacing: -0.045em; color: var(--accent); font-variant-numeric: tabular-nums;
 }
 /* nowrap on both halves: 'TH/s' contains a slash, which is a break
    opportunity, so a tight column would otherwise split the unit itself. */
-.hero-value .hero-unit { font-size: 1.15rem; font-weight: 650; letter-spacing: -0.01em; margin-left: 0.4rem; white-space: nowrap; }
+.hero-value .hero-unit { font-size: clamp(0.8rem, 2.6vw, 1.15rem); font-weight: 650; letter-spacing: -0.01em; margin-left: 0.4rem; white-space: nowrap; }
 .hero-value { white-space: nowrap; }
 .hero-sub { display: flex; flex-wrap: wrap; gap: 0.35rem 1.2rem; margin-top: 0.5rem; font-size: 0.68rem; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; }
 .hero-sub > span { white-space: nowrap; }
@@ -717,7 +721,14 @@ section { margin-bottom: 1.4rem; scroll-margin-top: 1.2rem; }
   display: flex; align-items: center; flex-wrap: wrap; gap: 0.25rem 0.5rem;
   font-size: 1.15rem; font-weight: 650; letter-spacing: -0.01em;
 }
-.hero-node-rpc { font-size: 0.72rem; color: var(--muted); }
+/* Each half is atomic — without this the status breaks at its own space
+   ("rpc:" / "connected"). Flex so a narrow column drops the whole `rpc:`
+   segment to the next line, with the gap standing in for the separator. */
+.hero-node-rpc {
+  display: flex; flex-wrap: wrap; gap: 0 0.45rem;
+  font-size: 0.72rem; color: var(--muted);
+}
+.hero-node-rpc > span { white-space: nowrap; }
 .odds-primary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.15rem 0.45rem; cursor: help; }
 .odds-value { padding-right: 0.15rem; font-size: 1.5rem; font-weight: 650; line-height: 1.1; color: var(--accent); }
 /* Sized to its row-mates now that the card lives in the network strip. */
@@ -938,7 +949,18 @@ tr:last-child td { border-bottom: none; }
   main { padding: 1.2rem 1rem 2rem; }
   /* The small unit leaves room for the odds card to keep sharing the top
      row rather than stacking below the hashrate. */
-  .hero { grid-template-columns: minmax(0, 1fr) auto; }
+  /* Even halves, both allowed to shrink: an `auto` side column sizes to the
+     node card's longest line and starves the hashrate beside it. */
+  .hero { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  /* The averages can't wrap inside an item (their unit would split), so the
+     column count has to follow the space that's actually there. The 45%
+     floor caps it at two columns — three would need 135% — and auto-fit
+     drops to one as soon as two no longer fit, which is what a phone's
+     half-width hero gets. */
+  .hero-sub {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(max(6.5rem, 45%), 1fr));
+    gap: 0.3rem 0.8rem;
+  }
   .hero-main { padding: 0 1.2rem; }
   .hero-side { padding: 0 1.2rem; }
 }
@@ -956,11 +978,6 @@ tr:last-child td { border-bottom: none; }
   #workers th:nth-child(10), #workers td:nth-child(10),
   #workers th:nth-child(13), #workers td:nth-child(13),
   #workers th:nth-child(15), #workers td:nth-child(15) { display: none; }
-  /* The hero's four averages sit at the width where whether they fit on one
-     line depends on the device's font metrics; a phone renders them ragged
-     (three up, one wrapped). A deliberate 2x2 grid instead of the raggedness
-     roulette. */
-  .hero-sub { display: grid; grid-template-columns: repeat(2, auto); justify-content: start; }
   /* The range tabs take a full row of their own: squeezed beside the toggle
      they crumple into the head instead of wrapping below it. */
   .panel-head .timeframe-tabs { flex-basis: 100%; margin-left: 0; }
@@ -1010,7 +1027,7 @@ tr:last-child td { border-bottom: none; }
     <div class="hero-side">
       <div class="label with-tags">Bitcoin node<span id="v-node-rpc-led" class="led led-off"></span></div>
       <div class="hero-node"><span id="v-node">&mdash;</span><span id="v-node-bips"></span></div>
-      <div class="hero-node-rpc">version: <span id="v-node-version">&mdash;</span> &middot; <span id="v-node-rpc-text" style="cursor:help;">rpc: &mdash;</span></div>
+      <div class="hero-node-rpc"><span>version: <span id="v-node-version">&mdash;</span></span> <span id="v-node-rpc-text" style="cursor:help;">rpc: &mdash;</span></div>
     </div>
   </div>
 
@@ -1019,7 +1036,7 @@ tr:last-child td { border-bottom: none; }
     <div class="kpi">
       <div class="label">Accepted</div>
       <div class="val" id="v-accepted">&mdash;</div>
-      <div class="sub">since restart: <span id="v-session-accepted">&mdash;</span> &middot; <span id="v-shares-per-min" title="Accepted shares per minute, averaged over the last minute">per min: &mdash;</span></div>
+      <div class="sub">since restart: <span id="v-session-accepted">&mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Rejected</div>
@@ -1783,9 +1800,6 @@ async function refresh() {
     const lifePct = lifeTotal > 0 ? (lifeRej / lifeTotal * 100).toFixed(2) : '0.00';
     document.getElementById('v-accepted').textContent = lifeAcc.toLocaleString();
     document.getElementById('v-session-accepted').textContent = d.shares_accepted.toLocaleString();
-    // Current throughput beside the session total: the same 1m window the
-    // chart's fastest line plots.
-    document.getElementById('v-shares-per-min').textContent = 'per min: ' + fmtSpm(d.shares_per_minute_1m, true);
     const rejectEl = document.getElementById('v-reject-rate');
     rejectEl.textContent = `${lifeRej.toLocaleString()} (${lifePct}%)`;
     rejectEl.title = reasonTooltip('rejects since last block', d.lifetime_reject_reasons);
