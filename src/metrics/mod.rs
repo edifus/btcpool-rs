@@ -68,6 +68,17 @@ pub fn share_rejected(reason: &str, worker: &str) {
     .increment(1);
 }
 
+/// A message dropped by the per-connection rate limiter. Its own series, not a
+/// reject reason: the limiter fires on any message type, and folding it into
+/// the share-reject counters made reject ratios unreadable.
+pub fn rate_limited(worker: &str) {
+    counter!(
+        "pool_rate_limited_messages_total",
+        "worker" => worker.to_string()
+    )
+    .increment(1);
+}
+
 pub fn share_validation_time(duration_ms: f64) {
     histogram!("pool_share_validation_duration_ms").record(duration_ms);
 }

@@ -10,11 +10,17 @@ pub struct PayoutDescriptor {
 
 /// The identity authorized by a miner.
 ///
-/// The full identity remains the worker key used by statistics, while the part
-/// before the first dot is the Bitcoin address placed in that miner's jobs.
+/// The part before the first dot is the Bitcoin address placed in that miner's
+/// jobs. `full_name` is the string as the miner typed it, kept for protocol
+/// echoes; `canonical_name` is what every statistic, metric label, and ledger
+/// row is keyed on — bech32 is case-insensitive, so without canonicalization
+/// one wallet could split into several permanent identities by spelling alone.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MinerIdentity {
     pub full_name: String,
+    /// Network-checked address in its canonical spelling, plus the label:
+    /// `address` or `address.label`.
+    pub canonical_name: String,
     pub payout: PayoutDescriptor,
     pub worker_label: Option<String>,
 }
@@ -45,10 +51,16 @@ impl MinerIdentity {
             ))
         })?;
 
+        let address = checked.to_string();
+        let canonical_name = match &worker_label {
+            Some(label) => format!("{address}.{label}"),
+            None => address.clone(),
+        };
         Ok(Self {
             full_name: raw.to_string(),
+            canonical_name,
             payout: PayoutDescriptor {
-                address: checked.to_string(),
+                address,
                 script_pubkey: checked.script_pubkey(),
             },
             worker_label,
@@ -110,6 +122,23 @@ mod tests {
         assert_eq!(worker.full_name, raw);
         assert_eq!(worker.payout.address, address);
         assert_eq!(worker.worker_label.as_deref(), Some("bitaxe.01"));
+    }
+
+    /// BIP173 allows all-uppercase bech32 (QR efficiency), and it decodes to
+    /// the same destination. One wallet, one canonical identity — whatever the
+    /// firmware's spelling — or per-user totals silently split.
+    #[test]
+    fn case_variants_canonicalize_to_one_name() {
+        let address = addr_for(Network::Bitcoin);
+        let shouted = format!("{}.rig", address.to_uppercase());
+        let typed = format!("{address}.rig");
+
+        let a = MinerIdentity::parse(&shouted, Network::Bitcoin, 128).unwrap();
+        let b = MinerIdentity::parse(&typed, Network::Bitcoin, 128).unwrap();
+        assert_eq!(a.canonical_name, b.canonical_name);
+        assert_eq!(a.canonical_name, typed);
+        // The raw spelling is preserved for protocol echoes.
+        assert_eq!(a.full_name, shouted);
     }
 
     #[test]

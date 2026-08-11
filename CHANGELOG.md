@@ -9,6 +9,107 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+### Added
+- **A share ledger: exact per-worker work sums, kept long term.** Every
+  accepted share's credited difficulty is summed into a one-minute row per
+  worker (`share_intervals`), dimensioned by device and by payout address
+  (`workers`, `users`). `SUM(work) × 2³² / seconds` recovers the average
+  hashrate implied by that work over any span — computed exactly, additive
+  across workers into users into the pool, and unaffected by estimator
+  changes. Minute rows are kept eight days and rolled up into exact hourly
+  totals after that; the rollup is summation, so it costs resolution and
+  nothing else.
+- **`GET /work`** serves that record: `?window=` over the existing ranges,
+  scoped with `?worker=<address.label>` or `?user=<address>`, returning
+  bucket timestamps with `span_secs`, hashrate, work, and accepted/rejected
+  counts. Passing both `user` and `worker`, or an address that is not valid
+  for the pool's network, is a 400 instead of a silently empty series.
+- **Ledger, block, and round writes are now lossless while the process
+  lives.** The stats write queue no longer drops on overflow, and a durable
+  write that fails (locked file, transient disk error) is parked and retried
+  until it lands instead of being discarded with a log line. A block
+  resolution that outruns its parked block insert waits for it rather than
+  vanishing as a zero-row update; a snapshot can never merge round totals
+  ahead of the round reset they belong to; and a reset lost to an unclean
+  shutdown is re-derived at boot from `found_blocks`, so a finished round's
+  totals cannot leak into the next round as its baseline. Watermarks and
+  display caches keep their best-effort behavior.
+- **`rate_limited_drops` in `/stats` and a `pool_rate_limited_messages_total`
+  metric** count messages dropped by the per-connection rate limiter, which
+  previously polluted the share-reject counts (see Changed).
+- **`--check-config`** parses and validates a config file, then exits — with
+  the config keys now a closed set, a stale key is fatal at startup, so the
+  NixOS unit validates as an `ExecStartPre` and reports the offending key
+  before the pool binds a port or opens the stats DB.
+
+### Changed
+- **The default share target dropped from 5s to 3s.** Share arrivals are the
+  pool's only sampling signal, so estimator noise scales as the square root
+  of the target: at 3s a 1-minute hashrate reading carries roughly a quarter
+  less noise, and a per-device reading noticeably less. Existing configs keep
+  their value; deployments that want the old pace can set it back.
+- **Every statistic now keys on the canonical worker identity.** The
+  network-checked payout address (plus label) replaces the raw authorized
+  string in stats maps, Prometheus labels, `found_blocks.worker`, and the
+  ledger — bech32 is case-insensitive, so `BC1Q…` and `bc1q…` are the same
+  wallet and now the same worker everywhere, rather than two dashboard rows,
+  two metric series, and a split user total. Re-authorization is judged on
+  the canonical identity too, so a spelling variant of the same wallet cannot
+  burn the per-session authorization budget. The raw spelling remains what
+  the protocol echoes back to the miner.
+- **The share that wins a block is credited to the round it ended**, not
+  seeded into the next one as an unbeatable first best — and it is credited
+  even when `submitblock` errors, where it previously vanished from every
+  counter. Also closed: a race that could let a snapshot resurrect the
+  finished round's totals on disk.
+- **Rate-limited messages are no longer counted as rejected shares.** The
+  limiter fires on any message type, so a dropped `mining.configure` was
+  inflating worker reject ratios and the ledger's rejected column. The
+  `reason="rate_limited"` Prometheus series is gone with it.
+- **Chart ranges of 24h and longer are drawn from the ledger** as a single
+  `avg` series per bucket, replacing six decaying-average lines that all
+  converged to the same curve at that scale. The 1h and 6h ranges keep the
+  decaying windows, which is what a live view is for. Ledger buckets carry
+  the span they actually cover — rolled-up hours no longer read 60× high on
+  `/history`, a partially-elapsed trailing bucket is no longer served as a
+  false dip, and the range start snaps to the bucket grid.
+- **`hashrate_history` and `share_rate_history` are now 48-hour caches.**
+  They back only the two live ranges, so they are dropped past that horizon
+  rather than thinned to one row a minute and kept six months.
+- **Round state is named for what it is.** Everything a found block resets
+  now says so: `pool_stats` → `round_stats`, `worker_best_shares` →
+  `round_worker_best_shares`, `pool_reject_reasons` → `round_reject_reasons`,
+  and in `/stats` `lifetime_shares_accepted`/`lifetime_shares_rejected`/
+  `stats_since_ts`/`lifetime_reject_reasons` → `round_shares_accepted`/
+  `round_shares_rejected`/`round_since_ts`/`round_reject_reasons`. The
+  "lifetime" names were lies — a found block zeroed them. Schema creation is
+  one transaction ending with the version stamp, and the tables carry CHECK
+  constraints (non-negative counts, grid-aligned ledger timestamps, closed
+  block-status set).
+- **A configured stats DB that cannot be opened now stops boot** with the
+  operator-facing error, instead of one warning and a process lifetime of
+  recording nothing. No configured path still means no persistence; an empty
+  string is now a config error rather than a silent opt-out.
+- **Unknown config keys are rejected.** Typos and stale keys fail the load
+  with serde naming the field, and a `BTCPOOL_*` override into a section that
+  does not exist fails naming the variable.
+
+### Removed
+- **Every schema migration path.** The stats DB carries a version stamp
+  (`PRAGMA user_version`); a file written by any other version is refused and
+  boot stops with instructions. Deleting the file is the upgrade procedure.
+  This drops the three `ALTER TABLE` backfills and the separate
+  hashrate-estimator version column, which between them existed only to
+  understand shapes the schema used to have. **Existing stats databases must
+  be deleted or moved aside.**
+- **The `share_history` table.** Its cumulative counts were never read back,
+  and being round-scoped they reset on every block found, which made them
+  unusable as a record. The ledger supersedes it.
+- **`[pool] coinbase_address`.** The key had been unused since payouts moved
+  to the miner username; all that remained was a config field kept to raise a
+  migration error. With unknown keys now rejected, a config still carrying it
+  fails the load like any other stale key.
+
 ### Changed
 - **The Bitcoin node card and Odds vs Powerball traded places.** Node
   identity now sits beside the pool hashrate in the hero, and the odds card

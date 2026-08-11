@@ -740,7 +740,6 @@ mod tests {
         );
         let pool_cfg = PoolConfig {
             listen_addr: "127.0.0.1:0".into(),
-            coinbase_address: None,
             coinbase_tag: "/test/".into(),
             initial_difficulty: 1,
             extranonce1_size: 4,

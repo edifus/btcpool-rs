@@ -4,7 +4,7 @@
 ///   1. Load config.toml
 ///   2. Initialise tracing (structured or plain)
 ///   3. Start Prometheus metrics endpoint
-///   4. Connect to Bitcoin Knots RPC (cookie auth)
+///   4. Connect to Bitcoin RPC (cookie auth)
 ///   5. Start ZMQ block-notification listener (or RPC poll fallback)
 ///   6. Bootstrap the template engine and build first job
 ///   7. Start the TCP accept loop
@@ -29,19 +29,46 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 use tracing::info;
 
+struct Cli {
+    config_path: String,
+    /// Validate the config and exit without starting the pool.
+    check_only: bool,
+}
+
+fn parse_args(args: impl Iterator<Item = String>) -> Cli {
+    let mut config_path = None;
+    let mut check_only = false;
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--check-config" => check_only = true,
+            "--config" => config_path = args.next(),
+            _ => config_path = Some(arg),
+        }
+    }
+    Cli {
+        config_path: config_path.unwrap_or_else(|| "config.toml".to_string()),
+        check_only,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // ── Config ────────────────────────────────────────────────────────────────
-    let mut args = std::env::args().skip(1);
-    let cfg_path = match args.next() {
-        Some(a) if a == "--config" => args.next().unwrap_or_else(|| "config.toml".to_string()),
-        Some(a) => a,
-        None => "config.toml".to_string(),
-    };
+    let Cli {
+        config_path: cfg_path,
+        check_only,
+    } = parse_args(std::env::args().skip(1));
 
     let config = Arc::new(
         config::load(&cfg_path).with_context(|| format!("Loading config from '{cfg_path}'"))?,
     );
+
+    // Static validation only; everything past this point needs the node.
+    if check_only {
+        println!("{cfg_path}: OK");
+        return Ok(());
+    }
 
     // ── Logging ───────────────────────────────────────────────────────────────
     init_tracing(&config.logging);
@@ -56,8 +83,14 @@ async fn main() -> Result<()> {
     let prometheus_handle = metrics::init(&config.metrics.prometheus_addr);
 
     // ── Pool stats (HTTP dashboard snapshot + in-memory state)
-    // Supports optional SQLite persistence for all-time best values.
-    let stats = PoolStats::new_with_store(config.metrics.stats_db_path.clone());
+    // A configured stats DB must open, or boot stops: the ledger is the pool's
+    // accounting record, and running without it while looking healthy is worse
+    // than not starting. No path means no persistence, deliberately.
+    let stats = match config.metrics.stats_db_path.clone() {
+        Some(path) => PoolStats::open_recording(&path)
+            .with_context(|| format!("Opening stats DB '{path}'"))?,
+        None => PoolStats::new_with_store(None),
+    };
 
     // ── Bitcoin RPC ───────────────────────────────────────────────────────────
     let rpc =
@@ -338,5 +371,43 @@ where
             .with_writer(writer)
             .with_ansi(false)
             .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    fn parse(args: &[&str]) -> super::Cli {
+        parse_args(args.iter().map(|a| a.to_string()))
+    }
+
+    /// The flag composes with both the bare-path and `--config` forms.
+    #[test]
+    fn the_config_path_and_check_flag_parse_in_any_order() {
+        let cli = parse(&[]);
+        assert_eq!(cli.config_path, "config.toml");
+        assert!(!cli.check_only);
+
+        assert_eq!(parse(&["/etc/pool.toml"]).config_path, "/etc/pool.toml");
+        assert_eq!(
+            parse(&["--config", "/etc/pool.toml"]).config_path,
+            "/etc/pool.toml"
+        );
+
+        for args in [
+            &["--check-config", "/etc/pool.toml"][..],
+            &["/etc/pool.toml", "--check-config"][..],
+            &["--check-config", "--config", "/etc/pool.toml"][..],
+        ] {
+            let cli = parse(args);
+            assert!(cli.check_only, "{args:?} should request a check");
+            assert_eq!(cli.config_path, "/etc/pool.toml", "{args:?}");
+        }
+
+        // Checking the default path takes no argument at all.
+        let cli = parse(&["--check-config"]);
+        assert!(cli.check_only);
+        assert_eq!(cli.config_path, "config.toml");
     }
 }

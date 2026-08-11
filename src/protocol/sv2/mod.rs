@@ -75,6 +75,8 @@ struct Sv2Session {
     /// Unique per-connection id, so two rigs authorising under the same worker
     /// name keep separate hashrate state in `PoolStats`.
     session_id: String,
+    /// The user identity exactly as the device opened its channel with, for
+    /// protocol echoes and logs. Everything recorded keys on `stats_worker()`.
     worker: Option<String>,
     identity: Option<Arc<MinerIdentity>>,
 
@@ -114,6 +116,12 @@ struct Sv2Session {
 }
 
 impl Sv2Session {
+    /// The canonical worker identity every statistic, metric label, and ledger
+    /// row is keyed on (mirrors the SV1 session). `None` until a channel opens.
+    fn stats_worker(&self) -> Option<&str> {
+        self.identity.as_deref().map(|i| i.canonical_name.as_str())
+    }
+
     fn new(
         peer: SocketAddr,
         cfg: &Config,
@@ -302,7 +310,7 @@ pub async fn run(
                 match handle_message(&mut session, &mut writer, msg_type, &mut payload, &engine, &ban_list).await {
                     Flow::Continue => {}
                     Flow::Disconnect(reason) => {
-                        if let Some(worker) = &session.worker {
+                        if let Some(worker) = session.stats_worker() {
                             metrics::miner_disconnect(&reason, worker);
                         }
                         info!("Disconnecting SV2 {peer}: {reason}");
@@ -352,7 +360,7 @@ pub async fn run(
     metrics::miner_disconnected();
     session.stats.miner_disconnected();
     let uptime = session.connect_time.elapsed().as_secs() as f64;
-    if let Some(worker) = &session.worker {
+    if let Some(worker) = session.stats_worker() {
         session.stats.mark_worker_offline(worker);
         metrics::connection_duration(worker, uptime);
     }
@@ -383,7 +391,7 @@ async fn apply_retarget(session: &mut Sv2Session, writer: &mut NoiseWriter) -> b
 
     let old_diff = session.difficulty;
     session.difficulty = new_diff;
-    if let Some(worker) = &session.worker {
+    if let Some(worker) = session.stats_worker() {
         metrics::vardiff_retarget(worker, old_diff, new_diff);
         session.stats.update_worker_vardiff(worker, new_diff);
     }
@@ -424,7 +432,7 @@ async fn handle_message(
     // are as cheap to send as shares and feed the same per-message stats work,
     // so they share the same bucket (mirrors the SV1 dispatch).
     if !session.guard.share_rate.try_consume() {
-        accounting::record_rate_limited(&session.stats, session.worker.as_deref());
+        accounting::record_rate_limited(&session.stats, session.stats_worker());
         ban_list.ban(session.peer.ip(), "message rate exceeded");
         return Flow::Disconnect("rate limited".into());
     }
@@ -557,14 +565,20 @@ async fn handle_open_extended(
     }
 
     // Only a *new* identity counts against the cap or touches the stats maps
-    // (mirrors the SV1 authorize path).
-    let is_new_identity = session.worker.as_deref() != Some(open.user_identity.as_str());
+    // (mirrors the SV1 authorize path). Compared canonically, so a case
+    // variant of the same address cannot burn the authorization budget.
+    let is_new_identity = session
+        .identity
+        .as_deref()
+        .map(|i| i.canonical_name.as_str())
+        != Some(identity.canonical_name.as_str());
     if is_new_identity {
         if !session.guard.record_new_authorization() {
             return Flow::Disconnect("too many worker identities".into());
         }
-        if let Some(prev) = session.worker.take() {
-            session.stats.mark_worker_offline(&prev);
+        session.worker.take();
+        if let Some(prev) = session.identity.take() {
+            session.stats.mark_worker_offline(&prev.canonical_name);
         }
     }
 
@@ -607,6 +621,7 @@ async fn handle_open_extended(
     let channel_id = CHANNEL_ID.fetch_add(1, Ordering::Relaxed);
     session.channel_id = channel_id;
     session.worker = Some(open.user_identity.clone());
+    let canonical = identity.canonical_name.clone();
     session.identity = Some(identity);
 
     // Target from current difficulty, clamped to be no easier than the device's
@@ -623,10 +638,8 @@ async fn handle_open_extended(
     if is_new_identity {
         session
             .stats
-            .mark_worker_online(&open.user_identity, session.difficulty);
-        session
-            .stats
-            .set_worker_protocol(&open.user_identity, "sv2");
+            .mark_worker_online(&canonical, session.difficulty);
+        session.stats.set_worker_protocol(&canonical, "sv2");
     }
     info!(peer = %session.peer, worker = %open.user_identity, channel_id, "SV2 extended channel opened");
 
@@ -690,7 +703,7 @@ async fn handle_submit(
         Ok(s) => s,
         Err(e) => return Flow::Disconnect(format!("bad SubmitSharesExtended: {e}")),
     };
-    let worker = session.worker.clone().unwrap_or_else(|| "?".to_string());
+    let worker = session.stats_worker().unwrap_or("?").to_string();
 
     // The device must send exactly the granted extranonce size; the coinbase
     // splice depends on it. Guard so a malformed length is a clean reject, not a
@@ -814,7 +827,7 @@ async fn handle_submit(
         }) => {
             metrics::share_validation_time(validation_start.elapsed().as_millis() as f64);
             let block_hash_hex = validator::block_hash_display(&hash);
-            match engine
+            let submit_result = engine
                 .submit_found_block(
                     job_entry.job.height,
                     &block_hash_hex,
@@ -823,8 +836,15 @@ async fn handle_submit(
                     &job_payout,
                     session.stats.clone(),
                 )
-                .await
-            {
+                .await;
+            // Credited before the outcome is recorded, whatever the node said:
+            // the miner produced a valid block-difficulty share, losing a
+            // same-height race is not its fault, and a submit error does not
+            // unmake the work. Ordering matters — a win resets the round, and
+            // the share that ended a round belongs in it, not seeded into the
+            // next one as an unbeatable first best.
+            accept_share(session, &worker, hash_difficulty, job_entry.difficulty);
+            match submit_result {
                 Ok(outcome) => {
                     accounting::record_block_outcome(
                         &session.stats,
@@ -834,10 +854,6 @@ async fn handle_submit(
                         &job_payout,
                         &block_hash_hex,
                     );
-                    // Credited and acked either way: the miner produced a valid
-                    // block-difficulty share, and losing a same-height race is
-                    // not its fault.
-                    accept_share(session, &worker, hash_difficulty, job_entry.difficulty);
                     if outcome.is_win() {
                         info!("🏆 Block submitted (SV2)! worker={worker} hash={block_hash_hex}");
                     } else {
@@ -847,20 +863,13 @@ async fn handle_submit(
                              nothing"
                         );
                     }
-                    accept(session, writer, submit.sequence_number).await
                 }
                 Err(e) => {
                     metrics::block_submission_failure(e.submit_failure_label());
                     error!("SV2 submitblock failed: {e}");
-                    reject(
-                        session,
-                        writer,
-                        submit.sequence_number,
-                        "block-submit-failed",
-                    )
-                    .await
                 }
             }
+            accept(session, writer, submit.sequence_number).await
         }
 
         Err(e) => {
@@ -906,7 +915,7 @@ fn accept_share(
 /// exceeding its invalid-share budget.
 fn reject_share(session: &mut Sv2Session, reason: RejectReason) -> bool {
     session.shares_rejected += 1;
-    let worker = session.worker.clone().unwrap_or_else(|| "?".to_string());
+    let worker = session.stats_worker().unwrap_or("?").to_string();
     accounting::record_rejected(&session.stats, &mut session.guard, &worker, reason)
 }
 
