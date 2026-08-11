@@ -711,10 +711,18 @@ section { margin-bottom: 1.4rem; scroll-margin-top: 1.2rem; }
   gap: 0.32rem; padding: 0 1.3rem; border-left: 1px solid var(--border);
   font-size: 0.78rem; font-variant-numeric: tabular-nums;
 }
+/* Node identity in the hero's side column: the KPI val/sub pair, restated
+   here because those rules are scoped to .kpi. */
+.hero-node {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 0.25rem 0.5rem;
+  font-size: 1.15rem; font-weight: 650; letter-spacing: -0.01em;
+}
+.hero-node-rpc { font-size: 0.72rem; color: var(--muted); }
 .odds-primary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.15rem 0.45rem; cursor: help; }
 .odds-value { padding-right: 0.15rem; font-size: 1.5rem; font-weight: 650; line-height: 1.1; color: var(--accent); }
+/* Sized to its row-mates now that the card lives in the network strip. */
+.kpi .odds-value { font-size: 1.06rem; }
 .odds-comparison { font-size: 0.8rem; color: var(--muted); }
-.odds-periods { display: flex; flex-direction: column; gap: 0.2rem; color: var(--muted); font-size: 0.72rem; }
 
 /* ── KPI strip ── */
 .kpis {
@@ -727,16 +735,17 @@ section { margin-bottom: 1.4rem; scroll-margin-top: 1.2rem; }
 .kpi .val { font-size: 1.06rem; font-weight: 650; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
 .kpi .sub { font-size: 0.72rem; color: var(--muted); margin-top: 0.15rem; font-variant-numeric: tabular-nums; }
 .kpi .sub.trunc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* BIP signal tags on the Bitcoin-node KPI, riding the card's title row —
-   present only while the node's templates signal the bit, with the
-   version-bit detail in each tag's tooltip. The row wraps, so a crowd of
-   signal tags flows onto following lines instead of clipping. */
-.kpi .label.with-tags { display: flex; align-items: center; flex-wrap: wrap; gap: 0.25rem 0.35rem; }
+/* BIP signal tags beside the node name — present only while the node's
+   templates signal the bit, with the version-bit detail in each tag's
+   tooltip. The row wraps, so a crowd of signal tags flows onto following
+   lines instead of clipping. Filled rather than outlined: at this size a
+   1px outline reads as noise where a solid chip reads as a badge. */
+.label.with-tags { display: flex; align-items: center; flex-wrap: wrap; gap: 0.25rem 0.4rem; }
 #v-node-bips { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 0.25rem 0.35rem; }
 .bip-tag {
   display: inline-block; font-size: 0.58rem; font-weight: 700; text-transform: uppercase;
-  letter-spacing: 0.1em; color: var(--accent); border: 1px solid var(--accent);
-  border-radius: 4px; padding: 0.1rem 0.35rem; cursor: help;
+  letter-spacing: 0.1em; color: var(--bg); background: var(--accent);
+  border-radius: 4px; padding: 0.12rem 0.4rem; cursor: help;
 }
 .ok  { color: var(--ok); }
 .bad { color: var(--bad); }
@@ -999,16 +1008,9 @@ tr:last-child td { border-bottom: none; }
       <div class="hero-sub"><span id="v-reported-1m">1m: &mdash;</span><span id="v-reported-1h">1h: &mdash;</span><span id="v-reported-6h">6h: &mdash;</span><span id="v-reported-24h">24h: &mdash;</span></div>
     </div>
     <div class="hero-side">
-      <div class="label">Odds vs Powerball</div>
-      <div class="odds-primary" id="powerball-odds-info">
-        <span class="odds-value" id="v-prob-powerball">&mdash;</span>
-        <span class="odds-comparison" id="v-prob-powerball-copy">x better</span>
-      </div>
-      <div class="odds-periods">
-        <span id="v-prob-daily">daily: &mdash;</span>
-        <span id="v-prob-monthly">monthly: &mdash;</span>
-        <span id="v-prob-yearly">yearly: &mdash;</span>
-      </div>
+      <div class="label with-tags">Bitcoin node<span id="v-node-rpc-led" class="led led-off"></span></div>
+      <div class="hero-node"><span id="v-node">&mdash;</span><span id="v-node-bips"></span></div>
+      <div class="hero-node-rpc">version: <span id="v-node-version">&mdash;</span> &middot; <span id="v-node-rpc-text" style="cursor:help;">rpc: &mdash;</span></div>
     </div>
   </div>
 
@@ -1036,8 +1038,8 @@ tr:last-child td { border-bottom: none; }
     </div>
     <div class="kpi">
       <div class="label">Pool difficulty</div>
-      <div class="val" id="v-pool-diff" title="Accepted share work since the pool's last found block, as a share of the current network difficulty. 100% is one expected block's worth of work.">&mdash;</div>
-      <div class="sub" id="v-pool-diff-work" title="Accepted share difficulty accumulated since the last found block; finding a block starts it over">work: &mdash;</div>
+      <div class="val" id="v-pool-diff" title="100% is one block's worth of expected work">&mdash;</div>
+      <div class="sub" id="v-pool-diff-work" title="Accepted share difficulty accumulated since the last found block">work: &mdash;</div>
     </div>
     <div class="kpi">
       <div class="label">Miners</div>
@@ -1085,8 +1087,8 @@ tr:last-child td { border-bottom: none; }
         <th class="col-rate" title="1-hour average hashrate" aria-label="1-hour average hashrate">1h Avg</th>
         <th class="col-rate" title="6-hour average hashrate" aria-label="6-hour average hashrate">6h Avg</th>
         <th class="col-rate" title="24-hour average hashrate" aria-label="24-hour average hashrate">24h Avg</th>
-        <th class="col-count" title="Accepted shares" aria-label="Accepted shares">Acc</th>
-        <th class="col-count" title="Rejected shares" aria-label="Rejected shares">Rej</th>
+        <th class="col-count" title="Accepted shares" aria-label="Accepted shares">Accept</th>
+        <th class="col-count" title="Rejected shares" aria-label="Rejected shares">Reject</th>
         <th>Best</th>
         <th>Last</th>
         <th>Uptime</th>
@@ -1103,16 +1105,6 @@ tr:last-child td { border-bottom: none; }
   <div class="kpis">
     <div class="kpi-grid">
     <div class="kpi">
-      <div class="label with-tags">Bitcoin node<span id="v-node-bips"></span></div>
-      <div class="val" id="v-node" style="font-size:0.92rem;">&mdash;</div>
-      <div class="sub" id="v-node-rpc" style="cursor:help;"><span id="v-node-rpc-led" class="led led-off" style="margin-right:0.3rem;"></span><span id="v-node-rpc-text">rpc: &mdash;</span></div>
-    </div>
-    <div class="kpi">
-      <div class="label">Chain tip</div>
-      <div class="val" id="v-height" title="Height of current best chain tip">&mdash;</div>
-      <div class="sub"><span id="v-block-transaction-count">txs: &mdash;</span> &middot; <span id="v-block-reward" style="cursor:help;">reward: &mdash;</span></div>
-    </div>
-    <div class="kpi">
       <div class="label">Network hashrate</div>
       <div class="val" id="v-net-hashrate">&mdash;</div>
       <div class="sub" id="v-net-diff">diff: &mdash;</div>
@@ -1121,6 +1113,11 @@ tr:last-child td { border-bottom: none; }
       <div class="label">Next adjustment</div>
       <div class="val" id="v-net-next-adj" style="font-size:0.92rem;" title="Estimated time until the next difficulty adjustment (2016-block epochs, ~10 min/block)">&mdash;</div>
       <div class="sub" id="v-net-adj-pct" title="Estimated difficulty change at the next retarget, from actual block timestamps in the current 2016-block epoch. Clamped to the protocol's [-75%, +300%] range.">est. move: &mdash;</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Chain tip</div>
+      <div class="val" id="v-height" title="Height of current best chain tip">&mdash;</div>
+      <div class="sub"><span id="v-block-transaction-count">txs: &mdash;</span> &middot; <span id="v-block-reward" style="cursor:help;">reward: &mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label" style="display:flex; justify-content:space-between; align-items:center;">Market
@@ -1136,6 +1133,14 @@ tr:last-child td { border-bottom: none; }
       </div>
       <div class="val" id="v-btc-price" style="font-size:0.92rem;">BTC <span id="v-btc-price-num">&mdash;</span></div>
       <div class="sub" id="v-btc-change">24h: &mdash;</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Odds vs Powerball</div>
+      <div class="odds-primary" id="powerball-odds-info">
+        <span class="odds-value" id="v-prob-powerball">&mdash;</span>
+        <span class="odds-comparison" id="v-prob-powerball-copy">x better</span>
+      </div>
+      <div class="sub" id="v-prob-baseline">than: 1 in &mdash;</div>
     </div>
     </div>
   </div>
@@ -1520,10 +1525,11 @@ const KNOWN_BIPS = [{ bit: 4, name: 'BIP110', desc: 'RDTS' }];
 // block version from the node, so signaling is the node's decision, not the
 // pool's.
 function renderNodeCard(d) {
+  // Name leads; the version rides the secondary line with the RPC status.
   const nodeEl = document.getElementById('v-node');
-  const nodeText = ((d.node_implementation || '') + ' ' + (d.node_version || '')).trim();
-  nodeEl.textContent = nodeText || '—';
-  nodeEl.title = nodeText ? 'User agent: ' + d.node_subversion : '';
+  nodeEl.textContent = d.node_implementation || '—';
+  nodeEl.title = d.node_implementation ? 'User agent: ' + d.node_subversion : '';
+  document.getElementById('v-node-version').textContent = d.node_version || '—';
 
   // Signal tags ride the title row, one per version bit the node's templates
   // actually set — a bit KNOWN_BIPS can name gets its BIP tag, any other a
@@ -1571,9 +1577,13 @@ function renderNodeCard(d) {
     led = 'led-on'; text = 'rpc: connected';
     title = 'Node RPC healthy — last successful poll ' + (age > 0 ? fmtUptime(age) + ' ago' : 'just now');
   }
-  document.getElementById('v-node-rpc-led').className = 'led ' + led;
-  document.getElementById('v-node-rpc-text').textContent = text;
-  document.getElementById('v-node-rpc').title = title;
+  // The pip sits in the card title, so it carries the status tooltip too.
+  const ledEl = document.getElementById('v-node-rpc-led');
+  ledEl.className = 'led ' + led;
+  ledEl.title = title;
+  const rpcTextEl = document.getElementById('v-node-rpc-text');
+  rpcTextEl.textContent = text;
+  rpcTextEl.title = title;
 }
 
 // ── Chart ────────────────────────────────────────────────────────────────────
@@ -1879,18 +1889,17 @@ function fmtOdds(p) {
 }
 
 const POWERBALL_JACKPOT_ODDS = 292201338;
-// On the figure itself rather than an icon beside the title.
-document.getElementById('powerball-odds-info').title =
-  'Powerball jackpot odds: 1 in ' + POWERBALL_JACKPOT_ODDS.toLocaleString();
+// The card carries the flat jackpot odds it compares against; the per-period
+// chances of finding a block ride the hover, where they cost no height.
+const POWERBALL_ODDS_TEXT = 'than: 1 in ' + POWERBALL_JACKPOT_ODDS.toLocaleString();
+document.getElementById('v-prob-baseline').textContent = POWERBALL_ODDS_TEXT;
 
 function updateProbability(ourHps, netHps) {
   const el = id => document.getElementById(id);
   if (!ourHps || !netHps || netHps === 0) {
-    el('v-prob-daily').textContent   = 'daily: —';
-    el('v-prob-monthly').textContent = 'monthly: —';
-    el('v-prob-yearly').textContent  = 'yearly: —';
     el('v-prob-powerball').textContent = '—';
     el('v-prob-powerball-copy').textContent = 'x better';
+    el('powerball-odds-info').title = 'No hashrate reported yet';
     return;
   }
   // Probability of finding a block per block (~10 min)
@@ -1909,9 +1918,10 @@ function updateProbability(ourHps, netHps) {
   const multiplier = better ? ratio : 1 / ratio;
   const multiplierText = multiplier >= 100 ? Math.round(multiplier).toLocaleString() : multiplier.toFixed(1);
 
-  el('v-prob-daily').textContent   = 'daily: '   + fmtOdds(pDaily);
-  el('v-prob-monthly').textContent = 'monthly: ' + fmtOdds(pMonthly);
-  el('v-prob-yearly').textContent  = 'yearly: '  + fmtOdds(pYearly);
+  el('powerball-odds-info').title =
+    'daily: '       + fmtOdds(pDaily)
+    + '\nmonthly: ' + fmtOdds(pMonthly)
+    + '\nyearly: '  + fmtOdds(pYearly);
   el('v-prob-powerball').textContent = multiplierText;
   el('v-prob-powerball-copy').textContent = better ? 'x better' : 'x worse';
 }

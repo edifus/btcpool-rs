@@ -10,10 +10,23 @@ everything else bumps the **patch** version.
 ## [Unreleased]
 
 ### Changed
-- **The Odds vs Powerball card reads as a peer of the hero.** Its title now
-  matches the other card titles and sits on the same line as the pool
-  hashrate title, and the jackpot-odds tooltip moved from a `?` icon beside
-  that title onto the odds figure itself.
+- **The Bitcoin node card and Odds vs Powerball traded places.** Node
+  identity now sits beside the pool hashrate in the hero, and the odds card
+  joined the network row, which reads network hashrate, next adjustment,
+  chain tip, market, odds.
+- **The Bitcoin node card was restructured.** RPC status is a pip in the
+  card title, the implementation name leads with its BIP signal tags beside
+  it, and the version shares one secondary line with the RPC state
+  (`version: 29.1.0 · rpc: connected`). Signal tags render as filled chips
+  rather than outlines.
+- **The odds card shows the flat Powerball jackpot odds** as its secondary
+  line; the per-period chances of finding a block (daily, monthly, yearly)
+  moved onto the hover, which also keeps the card the same height as its
+  row-mates.
+- **Shorter tooltips.** Pool difficulty reads "100% is one block's worth of
+  expected work", its work figure drops the trailing clause, and the odds
+  hover lists the periods without a lead-in.
+- **The workers table reads Accept / Reject** rather than Acc / Rej.
 
 ### Fixed
 - **The hero hashrate could break its unit across lines**, rendering `TH/`
