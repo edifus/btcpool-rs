@@ -36,6 +36,16 @@ everything else bumps the **patch** version.
   longer has to give the ranges a row of their own to keep them from
   crumpling, so both heads read the same at every width.
 
+### Fixed
+- **A chart range now draws the span it advertises, however little history
+  stands behind it.** The x-axis was left to scale itself around whatever rows
+  came back, so a range wider than the pool's uptime described its data instead
+  of its range: on a first run the 3d graph fitted a two-day axis around its
+  single bucket and labelled a day of it in the future. Both graphs pin the
+  axis to the window they queried, and sparse data sits where it actually falls
+  inside it. A range holding one bucket still draws no line — one point is not
+  a line — but the axis around it is now the one asked for.
+
 ### Removed
 - **`hashrate_history.hashrate_hps` is no longer `NOT NULL`** — it holds the
   10m window under the operational name, and the retention pass empties it like

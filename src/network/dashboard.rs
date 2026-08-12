@@ -521,7 +521,7 @@ async fn rate_chart_response(
         Vec::new()
     };
 
-    let chart = build_chart_option(&history, &exact, kind, window.duration_secs);
+    let chart = build_chart_option(&history, &exact, kind, since, now);
 
     let body = serde_json::to_string(&chart).unwrap_or_else(|_| "{}".to_string());
     (
@@ -777,12 +777,18 @@ fn draws_exact_series(duration_secs: u64) -> bool {
 
 /// One range's chart: the window family it can still draw, plus the exact
 /// series where the range is wide enough to carry it.
+///
+/// Takes the range as the two instants the history was queried between rather
+/// than as a width, so the axis it pins and the rows it plots cannot describe
+/// different windows.
 fn build_chart_option(
     history: &[RateHistoryPoint],
     exact: &[WorkHistoryPoint],
     kind: ChartKind,
-    duration_secs: u64,
+    since: u64,
+    now: u64,
 ) -> serde_json::Value {
+    let duration_secs = now.saturating_sub(since);
     let mut legend: Vec<serde_json::Value> = plotted_series(duration_secs)
         .rev()
         .map(|series| json!(series.name))
@@ -821,7 +827,7 @@ fn build_chart_option(
         series.push(dashed(make_series(EXACT_SERIES, data, 2.0)));
     }
 
-    chart_frame(json!(legend), json!(selected), series)
+    chart_frame(json!(legend), json!(selected), series, since, now)
 }
 
 /// Everything both charts agree on. Unit-agnostic — the hashrate and shares/min
@@ -830,6 +836,8 @@ fn chart_frame(
     legend_data: serde_json::Value,
     legend_selected: serde_json::Value,
     series: Vec<serde_json::Value>,
+    since: u64,
+    now: u64,
 ) -> serde_json::Value {
     json!({
         "backgroundColor": "transparent",
@@ -843,6 +851,14 @@ fn chart_frame(
         "xAxis": {
             "type": "time",
             "boundaryGap": false,
+            // Pinned to the window the history was queried over, not left to
+            // fit whatever rows came back. A range holding less history than it
+            // asks for — a pool minutes into its first run, every range past
+            // the uptime — would otherwise get an axis scaled around its
+            // handful of points: a 3d view drew two days centred on one bucket
+            // and labelled a day of them in the future.
+            "min": since.saturating_mul(1_000),
+            "max": now.saturating_mul(1_000),
             "splitLine": { "show": true },
             // The client sets `splitNumber` from the rendered width. hideOverlap
             // is the backstop: whatever tick interval ECharts settles on, it must
@@ -2589,7 +2605,7 @@ mod tests {
         // An entry is a bare name, or an object when it overrides how its icon
         // is drawn.
         let legend_of = |duration: u64| -> Vec<String> {
-            build_chart_option(&[], &[], ChartKind::Hashrate, duration)["legend"]["data"]
+            build_chart_option(&[], &[], ChartKind::Hashrate, 0, duration)["legend"]["data"]
                 .as_array()
                 .expect("legend.data")
                 .iter()
@@ -2626,7 +2642,7 @@ mod tests {
     fn long_ranges_draw_the_exact_series_beside_the_averages() {
         let names = |range: &str| -> Vec<String> {
             let duration = chart_window(Some(range)).duration_secs;
-            build_chart_option(&[], &[], ChartKind::Hashrate, duration)["series"]
+            build_chart_option(&[], &[], ChartKind::Hashrate, 0, duration)["series"]
                 .as_array()
                 .expect("series array")
                 .iter()
@@ -2652,7 +2668,7 @@ mod tests {
         // Told apart by its line, not by its colour: the six windows own a hue
         // ramp, and a seventh hue beside them is the weakest cue on the chart.
         let week = chart_window(Some("1w")).duration_secs;
-        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, week);
+        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, 0, week);
         let series = chart["series"].as_array().expect("series array");
         let exact = series.last().expect("exact series");
         assert_eq!(exact["lineStyle"]["type"], "dashed");
@@ -2689,7 +2705,7 @@ mod tests {
         ];
         let week = chart_window(Some("1w")).duration_secs;
         let drawn = |kind: ChartKind| -> Vec<serde_json::Value> {
-            let chart = build_chart_option(&[], &points, kind, week);
+            let chart = build_chart_option(&[], &points, kind, 0, week);
             let series = chart["series"].as_array().expect("series array").clone();
             let exact = series.last().expect("exact series").clone();
             assert_eq!(exact["name"], "avg");
@@ -2785,7 +2801,7 @@ mod tests {
     /// them into agreement.
     #[test]
     fn chart_draws_short_windows_over_long_ones() {
-        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, 0);
+        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, 0, 0);
 
         let drawn: Vec<&str> = chart["series"]
             .as_array()
@@ -2835,7 +2851,7 @@ mod tests {
     /// shrinks. The two settings are only correct together.
     #[test]
     fn chart_grid_does_not_double_count_axis_label_space() {
-        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, 0);
+        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, 0, 0);
         let grid = &chart["grid"];
 
         assert_eq!(
@@ -2859,12 +2875,53 @@ mod tests {
         }
     }
 
+    /// A range has to show the span it advertises even when the history behind
+    /// it does not fill it. Left unpinned, ECharts scales a time axis to the
+    /// rows it was handed: on a pool minutes into its first run the 3d chart
+    /// held one bucket and drew a two-day axis around it, a day of it in the
+    /// future. Every range past the pool's uptime has the same problem.
+    #[test]
+    fn chart_axis_spans_the_requested_range_whatever_the_history_holds() {
+        for range in ["1h", "6h", "24h", "3d", "1w", "30d"] {
+            let duration = chart_window(Some(range)).duration_secs;
+            let now = 1_700_000_000;
+            let since = now - duration;
+
+            // No history at all: the emptiest a range can be, and the case that
+            // has nothing of its own to scale an axis from.
+            let chart = build_chart_option(&[], &[], ChartKind::Hashrate, since, now);
+            assert_eq!(
+                chart["xAxis"]["min"],
+                since * 1_000,
+                "range {range} must start one range back, in ms"
+            );
+            assert_eq!(
+                chart["xAxis"]["max"],
+                now * 1_000,
+                "range {range} must end at the request, in ms"
+            );
+        }
+    }
+
+    /// The client patches the server's axis for things only it can measure. It
+    /// must not touch the bounds: re-deriving them from the rendered chart is
+    /// how the axis drifts back to fitting its data.
+    #[test]
+    fn client_leaves_the_pinned_axis_bounds_alone() {
+        for assignment in ["xAxis.min", "xAxis.max"] {
+            assert!(
+                !DASHBOARD_HTML.contains(&format!("{assignment} =")),
+                "the client must not set {assignment}; the server pins the range"
+            );
+        }
+    }
+
     /// The x-axis rendered ~12 colliding time labels on a phone. Density is set
     /// from the rendered width client-side (the server cannot know it), with
     /// `hideOverlap` as the backstop.
     #[test]
     fn chart_axis_labels_adapt_to_the_rendered_width() {
-        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, 0);
+        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, 0, 0);
         assert_eq!(chart["xAxis"]["axisLabel"]["hideOverlap"], true);
         assert_eq!(chart["yAxis"]["axisLabel"]["hideOverlap"], true);
 

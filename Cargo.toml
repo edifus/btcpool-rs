@@ -1,6 +1,6 @@
 [package]
 name = "btcpool-rs"
-version = "0.6.0-alpha1"
+version = "0.6.0-alpha2"
 edition = "2021"
 rust-version = "1.75.0"
 authors = []
