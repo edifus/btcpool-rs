@@ -403,6 +403,22 @@ in
           rustc
           rustfmt
           nixfmt
+
+          # tools/preview_dashboard.py serves the embedded dashboard against
+          # mock data over python's stdlib http.server; curl and jq read the
+          # chart payloads it and the pool itself return. The charts are ECharts
+          # drawing to a canvas, so whether a series or an empty-state notice
+          # actually rendered is a question only a browser can answer. Anything
+          # python beyond the stdlib — playwright to drive that browser — lives
+          # in a uv venv rather than here:
+          #
+          #   uv venv && uv pip install playwright
+          #   uv run playwright install chromium
+          #   uv run python tools/preview_dashboard.py
+          curl
+          jq
+          python3
+          uv
         ];
       };
     };
