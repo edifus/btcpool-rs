@@ -1014,35 +1014,29 @@ section { margin-bottom: 1.4rem; scroll-margin-top: 1.2rem; }
 /* The head-to-chart gap lives on the chart (margin-top below), not here: a
    collapsed chart is display:none, so its margin vanishes with it and both
    collapsed sections shrink to the same height. */
-.panel-head { display: flex; flex-wrap: wrap; align-items: center; }
+.panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
 /* Fixed title column so the two graphs' Hide/Show toggles sit at the same x
-   whatever each title measures; the shared range selector rides the right
+   whatever each title measures; each graph's own range picker rides the right
    edge. */
 .panel-head .panel-title { flex: 0 0 11.5rem; }
-.panel-head .timeframe-tabs { margin-left: auto; }
+.panel-head .range-select { margin-left: auto; }
 /* Subtle break between the two graphs sharing the panel — the same 1px
    border the KPI and network grids divide their cells with. */
 .panel-head-split { border-top: 1px solid var(--border); margin-top: 1.15rem; padding-top: 1.15rem; }
-.panel-toggle {
-  display: inline-grid; place-items: center;
-  cursor: pointer; font: inherit; font-size: 0.72rem; color: var(--muted);
-  background: none; border: 1px solid var(--border); border-radius: 5px;
+/* The toggle and the range picker share one control size, so a <select>'s own
+   metrics can't leave the two sitting at different heights. */
+.panel-toggle, .range-select {
+  cursor: pointer; font: inherit; font-size: 0.72rem; line-height: 1.25;
+  color: var(--muted); border: 1px solid var(--border); border-radius: 5px;
   padding: 0.22rem 0.45rem;
 }
+.panel-toggle:hover, .range-select:hover { color: var(--text); border-color: var(--muted); }
+.panel-toggle { display: inline-grid; place-items: center; background: none; }
 .panel-toggle::before, .panel-toggle-label { grid-area: 1 / 1; }
 .panel-toggle::before { content: "Show"; visibility: hidden; }
-.panel-toggle:hover { color: var(--text); border-color: var(--muted); }
 .panel-title { font-size: 0.78rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.13em; color: var(--muted); }
-.timeframe-tabs { display: flex; flex-wrap: wrap; align-items: center; }
-.timeframe-btn {
-  cursor: pointer; font: inherit; font-size: 0.7rem; color: var(--muted);
-  background: var(--surface2); border: 1px solid var(--border); border-right: none;
-  border-radius: 0; padding: 0.23rem 0.45rem;
-}
-.timeframe-btn:first-child { border-radius: 5px 0 0 5px; }
-.timeframe-btn:last-child { border-right: 1px solid var(--border); border-radius: 0 5px 5px 0; }
-.timeframe-btn:hover { color: var(--text); }
-.timeframe-btn.active { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+.range-select { background: var(--surface2); }
+.range-select:focus { outline: none; border-color: var(--accent); }
 /* Viewport-relative so a phone gets a usable plot and a tall desktop doesn't
    push the workers table below the fold. ECharts does not track CSS size on
    its own — the debounced resize handler is what makes this take effect.
@@ -1222,9 +1216,10 @@ tr:last-child td { border-bottom: none; }
   #workers th:nth-child(10), #workers td:nth-child(10),
   #workers th:nth-child(13), #workers td:nth-child(13),
   #workers th:nth-child(15), #workers td:nth-child(15) { display: none; }
-  /* The range tabs take a full row of their own: squeezed beside the toggle
-     they crumple into the head instead of wrapping below it. */
-  .panel-head .timeframe-tabs { flex-basis: 100%; margin-left: 0; }
+  /* Let each title measure itself: the fixed column plus a range picker
+     overflows a phone's panel width, and the toggle alignment it buys is only
+     legible on a head wide enough to show both graphs' heads at once. */
+  .panel-head .panel-title { flex: 0 1 auto; }
   /* Two KPI columns; the 3-column row/divider maths above re-drawn for it. */
   .kpi-grid { grid-template-columns: repeat(2, 1fr); }
   .kpi:nth-child(odd) { border-left: none; }
@@ -1314,20 +1309,29 @@ tr:last-child td { border-bottom: none; }
     <div class="panel-head">
       <div class="panel-title">Hashrate averages</div>
       <button id="chart-toggle" class="panel-toggle" title="Hide or show the hashrate chart"><span class="panel-toggle-label">Hide</span></button>
-      <div id="chart-window-label" class="timeframe-tabs" role="group" aria-label="Chart range">
-        <button type="button" class="timeframe-btn active" data-window="1h">1h</button>
-        <button type="button" class="timeframe-btn" data-window="6h">6h</button>
-        <button type="button" class="timeframe-btn" data-window="24h">24h</button>
-        <button type="button" class="timeframe-btn" data-window="1w">1w</button>
-        <button type="button" class="timeframe-btn" data-window="30d">30d</button>
-        <button type="button" class="timeframe-btn" data-window="180d">180d</button>
-        <button type="button" class="timeframe-btn" data-window="all">All</button>
-      </div>
+      <select id="chart-window" class="range-select" aria-label="Hashrate chart range" title="Hashrate chart range">
+        <option value="1h" selected>1h</option>
+        <option value="6h">6h</option>
+        <option value="24h">24h</option>
+        <option value="1w">1w</option>
+        <option value="30d">30d</option>
+        <option value="180d">180d</option>
+        <option value="all">All</option>
+      </select>
     </div>
     <div id="hashrate-chart"></div>
     <div class="panel-head panel-head-split">
       <div class="panel-title">Shares per minute</div>
       <button id="sharerate-chart-toggle" class="panel-toggle" title="Hide or show the share rate chart"><span class="panel-toggle-label">Hide</span></button>
+      <select id="sharerate-chart-window" class="range-select" aria-label="Share rate chart range" title="Share rate chart range">
+        <option value="1h" selected>1h</option>
+        <option value="6h">6h</option>
+        <option value="24h">24h</option>
+        <option value="1w">1w</option>
+        <option value="30d">30d</option>
+        <option value="180d">180d</option>
+        <option value="all">All</option>
+      </select>
     </div>
     <div id="sharerate-chart"></div>
   </div>
@@ -1475,20 +1479,19 @@ function cssVar(name) {
 }
 
 // ── Chart range ──────────────────────────────────────────────────────────────
-// Persisted like the theme choice, so a reload keeps the range you were looking
-// at instead of snapping back to 1h. Validated against the allowlist on read:
-// the server already falls back to 1h for an unknown `window=`, but the button
-// highlight is driven off this value and would have nothing to light up.
+// Persisted per graph like the theme choice, so a reload keeps the ranges you
+// were looking at instead of snapping back to 1h. Validated against the
+// allowlist on read: the server already falls back to 1h for an unknown
+// `window=`, but the picker is set from this value and has no option to select
+// for anything outside the list.
 const DEFAULT_WINDOW = '1h';
-const WINDOW_KEY = 'btcpool-chart-window';
 const WINDOWS = ['1h', '6h', '24h', '1w', '30d', '180d', 'all'];
-function storedWindow() {
+function storedWindow(key) {
   try {
-    const w = localStorage.getItem(WINDOW_KEY);
+    const w = localStorage.getItem(key);
     return WINDOWS.includes(w) ? w : DEFAULT_WINDOW;
   } catch (_) { return DEFAULT_WINDOW; }
 }
-let selectedWindow = storedWindow();
 let lastBlockHeight = 0;
 // Degraded detection is *relative to each worker's own baseline*, not an absolute
 // timeout — so low-hashrate / never-submitted / just-connected miners (whose
@@ -1526,8 +1529,8 @@ function workerLed(w, nowSec) {
 // ── Chart panels ─────────────────────────────────────────────────────────────
 // Two panels — hashrate and shares/min — over one implementation. They differ
 // only in the endpoint they poll, the unit their values carry, and where their
-// preferences are stored. Both are driven by the single range selector, so they
-// always plot the same x axis and can be read against each other.
+// preferences are stored. Each owns its range picker, so one graph can sit on a
+// week while the other stays on the live hour.
 // The six decaying windows the live ranges plot, plus 'avg' — the single exact
 // series the server sends for ranges served from the share ledger, where a
 // bucket mean needs no window family.
@@ -1553,7 +1556,9 @@ function ratePanel(cfg) {
     chart: echarts.init(document.getElementById(cfg.canvasId), null, { renderer: 'canvas' }),
     // Last option object handed to the chart, kept so a resize can recompute
     // the width-dependent bits without refetching.
-    options: null
+    options: null,
+    // The range this graph plots, independent of the other one's.
+    window: storedWindow(cfg.windowKey)
   }, cfg);
   // Remember which series the user toggled. Registered once — instance listeners
   // survive the notMerge setOption each poll performs — and safe against a loop,
@@ -1565,15 +1570,26 @@ function ratePanel(cfg) {
   document.getElementById(cfg.toggleId).addEventListener('click', () => {
     applyPanelCollapsed(panel, !panelCollapsed(panel));
   });
+  // The markup marks 1h selected so a no-JS load reads sensibly; a stored range
+  // is applied over it here.
+  const rangeEl = document.getElementById(cfg.windowSelectId);
+  rangeEl.value = panel.window;
+  rangeEl.addEventListener('change', () => {
+    panel.window = WINDOWS.includes(rangeEl.value) ? rangeEl.value : DEFAULT_WINDOW;
+    try { localStorage.setItem(panel.windowKey, panel.window); } catch (_) {}
+    loadChart(panel, panel.window);
+  });
   return panel;
 }
 
 const hashratePanel = ratePanel({
   canvasId: 'hashrate-chart', toggleId: 'chart-toggle', endpoint: '/chart',
+  windowSelectId: 'chart-window', windowKey: 'btcpool-chart-window',
   legendKey: 'btcpool-chart-legend', collapsedKey: 'chartCollapsed', fmt: fmtHr
 });
 const sharePanel = ratePanel({
   canvasId: 'sharerate-chart', toggleId: 'sharerate-chart-toggle', endpoint: '/share-chart',
+  windowSelectId: 'sharerate-chart-window', windowKey: 'btcpool-share-window',
   legendKey: 'btcpool-share-legend', collapsedKey: 'shareChartCollapsed', fmt: fmtSpm
 });
 const PANELS = [hashratePanel, sharePanel];
@@ -1639,7 +1655,7 @@ window.addEventListener('resize', () => {
 document.getElementById('theme-toggle').addEventListener('click', () => {
   applyTheme(currentTheme() === 'light' ? 'carbon' : 'light');
   // Re-skin both charts from the new theme's CSS vars.
-  PANELS.forEach(panel => { if (!panelCollapsed(panel)) loadChart(panel, selectedWindow); });
+  PANELS.forEach(panel => { if (!panelCollapsed(panel)) loadChart(panel, panel.window); });
 });
 
 // ── Mobile nav drawer ────────────────────────────────────────────────────────
@@ -1691,14 +1707,12 @@ function applyPanelCollapsed(panel, collapsed) {
   try { localStorage.setItem(panel.collapsedKey, collapsed ? '1' : '0'); } catch (_) {}
   document.getElementById(panel.canvasId).style.display = collapsed ? 'none' : '';
   document.getElementById(panel.toggleId).querySelector('.panel-toggle-label').textContent = collapsed ? 'Show' : 'Hide';
-  // The one range selector drives both charts, so it is only meaningless once
-  // there is nothing left for it to range over.
-  document.getElementById('chart-window-label').style.display =
-    PANELS.every(panelCollapsed) ? 'none' : '';
+  // A picker ranges over its own graph only, so it goes away with it.
+  document.getElementById(panel.windowSelectId).style.display = collapsed ? 'none' : '';
   if (!collapsed) {
     panel.chart.resize(); // container was display:none; ECharts needs a re-measure
     // loadChart re-runs applyResponsiveLayout against the width we just measured.
-    loadChart(panel, selectedWindow);
+    loadChart(panel, panel.window);
   }
 }
 
@@ -2189,27 +2203,6 @@ function updateProbability(ourHps, netHps) {
   el('v-prob-powerball-copy').textContent = better ? 'x better' : 'x worse';
 }
 
-function attachTimeframeSelector() {
-  const group = document.getElementById('chart-window-label');
-  const highlight = () => group.querySelectorAll('.timeframe-btn').forEach(item => {
-    item.classList.toggle('active', item.dataset.window === selectedWindow);
-  });
-  group.addEventListener('click', event => {
-    const button = event.target.closest('.timeframe-btn');
-    if (!button) return;
-    selectedWindow = button.dataset.window;
-    try { localStorage.setItem(WINDOW_KEY, selectedWindow); } catch (_) {}
-    highlight();
-    // Both panels, so they never disagree about what range is on screen.
-    PANELS.forEach(panel => { if (!panelCollapsed(panel)) loadChart(panel, selectedWindow); });
-  });
-  // The markup hardcodes `active` on 1h so a no-JS load still reads sensibly.
-  // Correct it here — unconditionally, not just when the chart is visible, or
-  // expanding a collapsed panel would show a highlight that disagrees with the
-  // range actually plotted.
-  highlight();
-}
-
 function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
@@ -2343,10 +2336,9 @@ function wireCopy(inputId, btnId) {
 wireCopy('connect-url', 'connect-copy');
 wireCopy('connect-authority', 'connect-authority-copy');
 
-attachTimeframeSelector();
 PANELS.forEach(panel => {
   if (panelCollapsed(panel)) applyPanelCollapsed(panel, true);
-  else loadChart(panel, selectedWindow);
+  else loadChart(panel, panel.window);
 });
 refresh();
 fetchBtcPrice();
@@ -2354,7 +2346,7 @@ setInterval(refresh, 10000);
 // Matches the pool's snapshot interval, so the charts gain a point as soon as
 // one exists rather than up to a minute later.
 setInterval(() => {
-  PANELS.forEach(panel => { if (!panelCollapsed(panel)) loadChart(panel, selectedWindow); });
+  PANELS.forEach(panel => { if (!panelCollapsed(panel)) loadChart(panel, panel.window); });
 }, 10000);
 setInterval(fetchBtcPrice, 60000);
 </script>
@@ -2437,34 +2429,42 @@ mod tests {
             .collect()
     }
 
-    /// The range buttons, the JS allowlist that gates what gets persisted, and
-    /// the server's range table are three hand-maintained lists of the same
-    /// thing. Adding a range to one and not the others fails quietly: the new
-    /// button silently serves 1h data, or works but never survives a reload.
+    /// The range pickers, the JS allowlist that gates what gets persisted, and
+    /// the server's range table are hand-maintained lists of the same thing.
+    /// Adding a range to one and not the others fails quietly: the new option
+    /// silently serves 1h data, or works but never survives a reload. Each
+    /// graph carries its own picker, so both are checked.
     #[test]
     fn chart_ranges_agree_between_markup_js_and_server() {
-        let buttons: Vec<&str> = DASHBOARD_HTML
-            .match_indices("data-window=\"")
-            .filter_map(|(idx, pat)| {
-                let rest = &DASHBOARD_HTML[idx + pat.len()..];
-                rest.find('"').map(|end| &rest[..end])
+        let pickers: Vec<Vec<&str>> = DASHBOARD_HTML
+            .split("class=\"range-select\"")
+            .skip(1)
+            .map(|rest| {
+                let markup = &rest[..rest.find("</select>").expect("unterminated <select>")];
+                markup
+                    .match_indices("value=\"")
+                    .filter_map(|(idx, pat)| {
+                        let tail = &markup[idx + pat.len()..];
+                        tail.find('"').map(|end| &tail[..end])
+                    })
+                    .collect()
             })
             .collect();
-        assert!(
-            buttons.len() > 3,
-            "data-window scrape found too few: {buttons:?}"
-        );
-        assert_eq!(
-            buttons,
-            js_string_array("WINDOWS"),
-            "range buttons and the JS persistence allowlist have drifted apart"
-        );
+        assert_eq!(pickers.len(), 2, "expected one range picker per graph");
+        for ranges in &pickers {
+            assert!(ranges.len() > 3, "option scrape found too few: {ranges:?}");
+            assert_eq!(
+                *ranges,
+                js_string_array("WINDOWS"),
+                "range options and the JS persistence allowlist have drifted apart"
+            );
+        }
 
-        // Every button must reach a distinct server-side range. A typo'd or
+        // Every option must reach a distinct server-side range. A typo'd or
         // unregistered value falls through `chart_window`'s `_` arm to 1h,
-        // which renders as a working button that plots the wrong data.
+        // which renders as a working option that plots the wrong data.
         let mut seen: Vec<(&str, ChartWindow)> = Vec::new();
-        for &name in &buttons {
+        for &name in &pickers[0] {
             let window = chart_window(Some(name));
             if let Some((other, _)) = seen.iter().find(|(_, w)| *w == window) {
                 panic!("range '{name}' resolves to the same window as '{other}'");
@@ -2710,7 +2710,7 @@ mod tests {
 
     /// The two chart panels are one implementation with two configs. Every
     /// per-panel key has to actually differ, or the share chart would overwrite
-    /// the hashrate chart's stored legend and collapse state.
+    /// the hashrate chart's stored legend, range and collapse state.
     #[test]
     fn chart_panels_do_not_share_state_keys() {
         // The factory is declared `ratePanel(cfg)`, so only its call sites
@@ -2721,10 +2721,14 @@ mod tests {
         for key in [
             "'btcpool-chart-legend'",
             "'btcpool-share-legend'",
+            "'btcpool-chart-window'",
+            "'btcpool-share-window'",
             "'chartCollapsed'",
             "'shareChartCollapsed'",
             "'hashrate-chart'",
             "'sharerate-chart'",
+            "'chart-window'",
+            "'sharerate-chart-window'",
             "'/chart'",
             "'/share-chart'",
         ] {
@@ -2735,14 +2739,16 @@ mod tests {
             );
         }
 
-        // Panel elements are reached through `panel.canvasId`/`panel.toggleId`,
-        // so `all_ids_referenced_by_js_exist_in_markup`'s literal
-        // `getElementById('…')` scrape cannot see them.
+        // Panel elements are reached through `panel.canvasId`/`panel.toggleId`/
+        // `panel.windowSelectId`, so `all_ids_referenced_by_js_exist_in_markup`'s
+        // literal `getElementById('…')` scrape cannot see them.
         for id in [
             "hashrate-chart",
             "sharerate-chart",
             "chart-toggle",
             "sharerate-chart-toggle",
+            "chart-window",
+            "sharerate-chart-window",
         ] {
             assert!(
                 DASHBOARD_HTML.contains(&format!("id=\"{id}\"")),

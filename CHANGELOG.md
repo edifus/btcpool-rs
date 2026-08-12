@@ -9,6 +9,21 @@ everything else bumps the **patch** version.
 
 ## [Unreleased]
 
+### Changed
+- **Each graph carries its own range picker.** The row of range buttons that
+  drove both charts is now a dropdown beside each graph's Hide/Show toggle,
+  sized to match it and sitting where the buttons did. The two graphs are
+  independent — the hashrate chart can show a week while shares/min stays on
+  the live hour — and each remembers its own range across reloads. A phone no
+  longer has to give the ranges a row of their own to keep them from
+  crumpling, so both heads read the same at every width.
+
+## [0.5.0] - 2026-08-11
+
+A share ledger recording exact per-worker work, canonical worker identity
+across every statistic, and a stats schema that no longer migrates.
+**Existing stats databases must be deleted or moved aside.**
+
 ### Added
 - **A share ledger: exact per-worker work sums, kept long term.** Every
   accepted share's credited difficulty is summed into a one-minute row per
@@ -1187,7 +1202,8 @@ unlinked to avoid any ambiguity with a release of the same number here.
 - Dashboard rework: worker rendering and stats mapping fixes; reject rate moved
   into the rejected card; best share keyed by vardiff difficulty.
 
-[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.4.5...HEAD
+[Unreleased]: https://github.com/edifus/btcpool-rs/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/edifus/btcpool-rs/compare/v0.4.5...v0.5.0
 [0.4.5]: https://github.com/edifus/btcpool-rs/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/edifus/btcpool-rs/releases/tag/v0.4.4
 [0.3.4]: https://github.com/edifus/btcpool-rs/compare/v0.3.0...v0.3.4
