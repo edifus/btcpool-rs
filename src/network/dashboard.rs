@@ -775,6 +775,27 @@ fn draws_exact_series(duration_secs: u64) -> bool {
     duration_secs >= EXACT_SERIES_MIN_RANGE_SECS
 }
 
+/// What a chart with nothing to plot says instead of showing an empty grid.
+const COLLECTING_NOTICE: &str = "still collecting data";
+
+/// Whether this series paints a line.
+///
+/// A segment needs two *adjacent* points that both carry a value: symbols are
+/// off, so a lone sample is an invisible zero-length line, and `connectNulls` is
+/// off with them, so a bucket that held nothing breaks the line rather than
+/// being joined across. Every range is in this state for its first bucket or
+/// two — a pool minutes into its first run has one sample against a 30-day
+/// grid — and the range picker offers those widths from the start.
+fn draws_a_line(line: &serde_json::Value) -> bool {
+    line["data"].as_array().is_some_and(|data| {
+        data.windows(2).any(|segment| {
+            segment
+                .iter()
+                .all(|point| point.get(1).is_some_and(|value| !value.is_null()))
+        })
+    })
+}
+
 /// One range's chart: the window family it can still draw, plus the exact
 /// series where the range is wide enough to carry it.
 ///
@@ -806,6 +827,16 @@ fn build_chart_option(
         })
         .collect();
 
+    // Every window has to be ready, not just the first of them to fill. The
+    // family is read against itself — a fast average's excursions against the
+    // slow one it settles onto — so a chart drawn while half of it is still
+    // missing invites reading a difference that is only the history's age.
+    //
+    // The exact series is deliberately not counted. It comes from the ledger,
+    // which has nothing to show until a share lands, so gating on it would hold
+    // the whole chart back for as long as a pool sits quiet.
+    let collecting = !series.iter().all(draws_a_line);
+
     if draws_exact_series(duration_secs) {
         // Last in both orders — drawn on top of the averages it is the
         // reference for, and listed after the family it is not a member of.
@@ -827,7 +858,23 @@ fn build_chart_option(
         series.push(dashed(make_series(EXACT_SERIES, data, 2.0)));
     }
 
-    chart_frame(json!(legend), json!(selected), series, since, now)
+    if collecting {
+        // An empty grid under the notice, rather than the fraction of the chart
+        // that happens to have filled first. The series themselves stay, so the
+        // legend keeps its entries and the user's toggles keep their meaning.
+        for line in &mut series {
+            line["data"] = json!([]);
+        }
+    }
+
+    chart_frame(
+        json!(legend),
+        json!(selected),
+        series,
+        since,
+        now,
+        collecting,
+    )
 }
 
 /// Everything both charts agree on. Unit-agnostic — the hashrate and shares/min
@@ -838,9 +885,22 @@ fn chart_frame(
     series: Vec<serde_json::Value>,
     since: u64,
     now: u64,
+    collecting: bool,
 ) -> serde_json::Value {
     json!({
         "backgroundColor": "transparent",
+        // Shown while the grid is deliberately bare. A range wider than the
+        // history behind it is drawn honestly — full span, data at the
+        // right-hand edge — which until the family fills means an empty chart
+        // with nothing to say why. The client colours it; ECharts' default
+        // title colour is a fixed near-black that vanishes on the dark theme.
+        "title": {
+            "show": collecting,
+            "text": COLLECTING_NOTICE,
+            "left": "center",
+            "top": "middle",
+            "textStyle": { "fontSize": 12, "fontWeight": "normal" }
+        },
         "tooltip": { "trigger": "axis" },
         "legend": { "data": legend_data, "selected": legend_selected },
         // `containLabel` already reserves whatever the axis labels need inside
@@ -1997,6 +2057,11 @@ async function loadChart(panel, window) {
       yAxis.axisLabel = Object.assign(yAxis.axisLabel || {}, { color: muted });
       yAxis.splitLine = { lineStyle: { color: grid } };
     }
+    // The "still collecting data" notice, which the server shows on a chart
+    // with no line to draw. Reads as the axis labels do: present, secondary.
+    if (options.title) {
+      options.title.textStyle = Object.assign(options.title.textStyle || {}, { color: muted });
+    }
     const xAxis = Array.isArray(options.xAxis) ? options.xAxis[0] : options.xAxis;
     if (xAxis) {
       xAxis.splitLine = { lineStyle: { color: grid } };
@@ -2482,7 +2547,7 @@ mod tests {
         build_chart_option, canonical_scope_param, chart_window, plotted_series, ChartKind,
         ChartWindow, DASHBOARD_HTML,
     };
-    use crate::stats::WorkHistoryPoint;
+    use crate::stats::{RateHistoryPoint, WorkHistoryPoint};
     use std::collections::HashSet;
 
     /// Every element id the embedded JS looks up must exist in the markup —
@@ -2704,8 +2769,20 @@ mod tests {
             },
         ];
         let week = chart_window(Some("1w")).duration_secs;
+        // A window family with something to draw, so the chart is past the
+        // collecting state that blanks every series including this one.
+        let filled = |ts: u64| RateHistoryPoint {
+            ts,
+            one_minute: Some(1.0),
+            five_minutes: Some(1.0),
+            ten_minutes: Some(1.0),
+            one_hour: Some(1.0),
+            six_hours: Some(1.0),
+            twenty_four_hours: Some(1.0),
+        };
+        let history = [filled(1_700_000_000), filled(1_700_000_300)];
         let drawn = |kind: ChartKind| -> Vec<serde_json::Value> {
-            let chart = build_chart_option(&[], &points, kind, 0, week);
+            let chart = build_chart_option(&history, &points, kind, 0, week);
             let series = chart["series"].as_array().expect("series array").clone();
             let exact = series.last().expect("exact series").clone();
             assert_eq!(exact["name"], "avg");
@@ -2901,6 +2978,74 @@ mod tests {
                 "range {range} must end at the request, in ms"
             );
         }
+    }
+
+    /// A pinned axis makes a range with nothing in it read as an empty grid
+    /// rather than as a broken chart, but it still does not say why. The notice
+    /// covers exactly the case where no line can be painted, and gets out of
+    /// the way the moment one can.
+    #[test]
+    fn chart_says_it_is_collecting_until_it_can_draw_a_line() {
+        let point = |ts: u64, value: Option<f64>| RateHistoryPoint {
+            ts,
+            one_minute: value,
+            five_minutes: value,
+            ten_minutes: value,
+            one_hour: value,
+            six_hours: value,
+            twenty_four_hours: value,
+        };
+        let day = chart_window(Some("24h")).duration_secs;
+        let showing = |history: &[RateHistoryPoint]| -> bool {
+            build_chart_option(history, &[], ChartKind::Hashrate, 0, day)["title"]["show"] == true
+        };
+
+        assert!(showing(&[]), "a range with no history has nothing to draw");
+        assert!(
+            showing(&[point(1, Some(1.0))]),
+            "one sample is a zero-length line, and symbols are off"
+        );
+        // connectNulls is off, so a gap between two readings is two orphaned
+        // points, not a segment spanning it.
+        assert!(
+            showing(&[point(1, Some(1.0)), point(2, None), point(3, Some(3.0))]),
+            "readings either side of a gap do not join into a line"
+        );
+
+        assert!(
+            !showing(&[point(1, Some(1.0)), point(2, Some(2.0))]),
+            "two adjacent readings draw a line, so the notice must go"
+        );
+
+        // One window short of the set is still collecting, however much the
+        // others hold: the family is only readable against itself.
+        let mut partial = [point(1, Some(1.0)), point(2, Some(2.0))];
+        for slot in &mut partial {
+            slot.one_minute = None;
+        }
+        assert!(
+            showing(&partial),
+            "a window with nothing to draw holds the whole chart back"
+        );
+
+        // And nothing is plotted while it waits — not even the windows that
+        // could have drawn.
+        let chart = build_chart_option(&partial, &[], ChartKind::Hashrate, 0, day);
+        for line in chart["series"].as_array().expect("series array") {
+            assert_eq!(
+                line["data"].as_array().map(Vec::len),
+                Some(0),
+                "series {} must draw nothing while collecting",
+                line["name"]
+            );
+        }
+
+        // The notice is a real string on the chart, not an empty title box.
+        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, 0, day);
+        assert_eq!(chart["title"]["text"], super::COLLECTING_NOTICE);
+        // ECharts' default title colour is near-black and disappears against
+        // the dark theme, so the client has to take it from the theme's vars.
+        assert!(DASHBOARD_HTML.contains("options.title.textStyle = Object.assign("));
     }
 
     /// The client patches the server's axis for things only it can measure. It

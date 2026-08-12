@@ -43,8 +43,16 @@ everything else bumps the **patch** version.
   of its range: on a first run the 3d graph fitted a two-day axis around its
   single bucket and labelled a day of it in the future. Both graphs pin the
   axis to the window they queried, and sparse data sits where it actually falls
-  inside it. A range holding one bucket still draws no line — one point is not
-  a line — but the axis around it is now the one asked for.
+  inside it.
+- **A graph draws nothing until every window it plots can draw**, and says
+  "still collecting data" in the meantime. A line needs two adjacent readings —
+  symbols are off, and a bucket that recorded nothing breaks the line rather
+  than being joined across — so a range is blank for its first bucket or two,
+  and the widest ones for hours. Waiting for the whole family rather than the
+  first window to fill keeps the lines readable against each other: a chart
+  drawn half-populated invites reading a difference between two averages that
+  is only the history's age. The exact `avg` line is not part of that count —
+  it comes from the ledger, which has nothing to show until a share lands.
 
 ### Removed
 - **`hashrate_history.hashrate_hps` is no longer `NOT NULL`** — it holds the
