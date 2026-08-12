@@ -56,6 +56,9 @@ use tracing::{debug, error, info, warn};
 pub struct Session {
     // Identity
     pub peer: SocketAddr,
+    /// The name exactly as the miner authorized it. Protocol-facing only: the
+    /// submit guard compares against it and log lines echo it. Everything
+    /// recorded — stats, metrics, the ledger — keys on `stats_worker()`.
     pub worker: Option<String>,
     pub identity: Option<Arc<MinerIdentity>>,
     pub user_agent: Option<String>,
@@ -99,6 +102,14 @@ pub struct Session {
 }
 
 impl Session {
+    /// The canonical worker identity every statistic, metric label, and ledger
+    /// row is keyed on. Derived from the parsed identity, not the raw name, so
+    /// case variants of one bech32 address cannot split into several permanent
+    /// identities. `None` until authorized.
+    fn stats_worker(&self) -> Option<&str> {
+        self.identity.as_deref().map(|i| i.canonical_name.as_str())
+    }
+
     pub fn new(
         peer: SocketAddr,
         cfg: &Config,
@@ -246,7 +257,7 @@ pub async fn run(
                                 }
                             }
                             HandleResult::Disconnect(reason) => {
-                                if let Some(worker) = &session.worker {
+                                if let Some(worker) = session.stats_worker() {
                                     metrics::miner_disconnect(&reason, worker);
                                 }
                                 info!("Disconnecting {peer}: {reason}");
@@ -325,7 +336,7 @@ pub async fn run(
     metrics::miner_disconnected();
     session.stats.miner_disconnected();
     let uptime = session.connect_time.elapsed().as_secs() as f64;
-    if let Some(worker) = &session.worker {
+    if let Some(worker) = session.stats_worker() {
         session.stats.mark_worker_offline(worker);
         metrics::connection_duration(worker, uptime);
     }
@@ -358,7 +369,7 @@ async fn apply_retarget(
 
     let old_diff = session.difficulty;
     session.difficulty = new_diff;
-    if let Some(worker) = &session.worker {
+    if let Some(worker) = session.stats_worker() {
         metrics::vardiff_retarget(worker, old_diff, new_diff);
         session.stats.update_worker_vardiff(worker, new_diff);
     }
@@ -469,7 +480,7 @@ async fn handle_line(
     // subscribe floods are as cheap to send as shares and feed the same
     // per-message stats work, so they share the same bucket.
     if !session.guard.share_rate.try_consume() {
-        accounting::record_rate_limited(&session.stats, session.worker.as_deref());
+        accounting::record_rate_limited(&session.stats, session.stats_worker());
         ban_list.ban(session.peer.ip(), "message rate exceeded");
         return HandleResult::Disconnect("rate limited".into());
     }
@@ -661,21 +672,32 @@ async fn handle_authorize(
     };
 
     // Only a *new* identity counts against the cap or touches the stats maps;
-    // re-authorizing the same name (some firmware does on reconnect-in-place)
-    // must not inflate active_sessions or the authorization count.
-    if session.worker.as_deref() != Some(params.worker.as_str()) {
+    // re-authorizing the same identity (some firmware does on
+    // reconnect-in-place) must not inflate active_sessions or the
+    // authorization count. Compared canonically: a case variant of the same
+    // bech32 address is the same wallet, and burning the authorization budget
+    // on spelling would eventually disconnect a legitimate miner.
+    if session
+        .identity
+        .as_deref()
+        .map(|i| i.canonical_name.as_str())
+        != Some(identity.canonical_name.as_str())
+    {
         if !session.guard.record_new_authorization() {
             return HandleResult::Disconnect("too many worker identities".into());
         }
-        if let Some(prev) = session.worker.take() {
-            session.stats.mark_worker_offline(&prev);
+        session.worker.take();
+        if let Some(prev) = session.identity.take() {
+            session.stats.mark_worker_offline(&prev.canonical_name);
         }
         session.issued_jobs.clear();
         session.share_set.clear();
         session
             .stats
-            .mark_worker_online(&params.worker, session.difficulty);
-        session.stats.set_worker_protocol(&params.worker, "sv1");
+            .mark_worker_online(&identity.canonical_name, session.difficulty);
+        session
+            .stats
+            .set_worker_protocol(&identity.canonical_name, "sv1");
     }
     session.authorized = true;
     session.worker = Some(params.worker.clone());
@@ -739,16 +761,21 @@ async fn handle_submit(
     params: SubmitParams,
     engine: &Arc<TemplateEngine>,
 ) -> HandleResult {
-    let worker_owned = session.worker.clone().unwrap_or_else(|| "?".to_string());
-    let worker: &str = &worker_owned;
-
-    if !session.authorized || params.worker != worker {
+    // The guard compares the raw authorized spelling — firmware submits with
+    // the exact string it authorized. Everything recorded below keys on the
+    // canonical identity instead.
+    if !session.authorized || session.worker.as_deref() != Some(params.worker.as_str()) {
         reject_share(session, RejectReason::Unauthorized);
         return HandleResult::Messages(vec![ResponseBuilder::err(
             &req.id,
             PoolError::NotAuthorized.to_stratum_error(),
         )]);
     }
+    let worker_owned = session
+        .stats_worker()
+        .unwrap_or(params.worker.as_str())
+        .to_string();
+    let worker: &str = &worker_owned;
 
     let submit_start = Instant::now();
 
@@ -895,6 +922,13 @@ async fn handle_submit(
                     session.stats.clone(),
                 )
                 .await;
+            // Credited before the outcome is recorded, whatever the node said:
+            // the miner produced a valid block-difficulty share, losing a
+            // same-height race is not its fault, and a submit error does not
+            // unmake the work. Ordering matters — a win resets the round, and
+            // the share that ended a round belongs in it, not seeded into the
+            // next one as an unbeatable first best.
+            accept_share(session, worker, hash_difficulty, job_difficulty);
             match submit_result {
                 Ok(outcome) => {
                     accounting::record_block_outcome(
@@ -905,10 +939,6 @@ async fn handle_submit(
                         &job_payout,
                         &block_hash_hex,
                     );
-                    // Credited and acked either way: the miner produced a valid
-                    // block-difficulty share, and losing a same-height race is
-                    // not its fault.
-                    accept_share(session, worker, hash_difficulty, job_difficulty);
                     if outcome.is_win() {
                         info!("🏆 Block submitted! worker={worker} hash={block_hash_hex}");
                     } else {
@@ -926,9 +956,9 @@ async fn handle_submit(
                 Err(e) => {
                     metrics::block_submission_failure(e.submit_failure_label());
                     error!("submitblock failed: {e}");
-                    HandleResult::Messages(vec![ResponseBuilder::err(
+                    HandleResult::Messages(vec![ResponseBuilder::ok(
                         &req.id,
-                        e.to_stratum_error(),
+                        serde_json::Value::Bool(true),
                     )])
                 }
             }
@@ -990,7 +1020,7 @@ fn accept_share(
 /// exceeding its invalid-share budget.
 fn reject_share(session: &mut Session, reason: RejectReason) -> bool {
     session.shares_rejected += 1;
-    let worker = session.worker.clone().unwrap_or_else(|| "?".to_string());
+    let worker = session.stats_worker().unwrap_or("?").to_string();
     accounting::record_rejected(&session.stats, &mut session.guard, &worker, reason)
 }
 

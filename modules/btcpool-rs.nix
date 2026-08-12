@@ -50,7 +50,7 @@ let
         };
 
         vardiff = {
-          target_share_time_secs = 5;
+          target_share_time_secs = 3;
           retarget_interval_secs = 100;
           deadzone_low = 0.667;
           deadzone_high = 1.5;
@@ -77,9 +77,7 @@ let
         logging = {
           level = "info";
           json = false;
-          # Empty = journal only. Set a directory to also keep rotating files
-          # on disk; the unit would then want a matching LogsDirectory. `json`
-          # above formats those files; the journal stays human-readable.
+          # Set a directory to also keep rotating files on disk
           log_dir = "";
         };
       };
@@ -220,6 +218,7 @@ let
 
           serviceConfig = {
             Type = "simple";
+            ExecStartPre = "${lib.getExe cfg.package} --check-config /etc/btcpool-rs/config.toml";
             ExecStart = "${lib.getExe cfg.package} /etc/btcpool-rs/config.toml";
             EnvironmentFile = cfg.environmentFiles;
             User = cfg.user;
@@ -273,6 +272,7 @@ in
           fileset = lib.fileset.unions [
             ../Cargo.toml
             ../Cargo.lock
+            ../config.toml.example
             ../src
             ../tests
             ../examples

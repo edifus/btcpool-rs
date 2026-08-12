@@ -14,7 +14,7 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Offline workers idle longer than this are evicted from the in-memory stats
 /// maps (their persisted best share survives, subject to the cap below). Keeps
@@ -27,18 +27,46 @@ const IDLE_WORKER_EVICT_SECS: u64 = 86_400;
 /// operator's real fleet is far below this.
 const MAX_WORKER_BEST_SHARES: usize = 512;
 
-/// Bumped whenever the hashrate estimator changes in a way that makes stored
-/// history incomparable with newly recorded values. See `migrate_hashrate_algo`.
-/// v1: ckpool-style decaying averages, replacing the sliding-window estimator.
-const HASHRATE_ALGO_VERSION: u64 = 1;
+/// Stamped into `PRAGMA user_version`. Bumped whenever the schema changes, or
+/// whenever stored values stop meaning what they used to — a new hashrate
+/// estimator counts, since its readings are not comparable with the old ones.
+///
+/// A file stamped with anything else is refused rather than upgraded: this pool
+/// carries no migration path, by choice. The operator deletes the file and the
+/// next boot writes a current one. Nothing here is irreplaceable enough to
+/// justify code that has to understand every shape the schema ever had.
+const SCHEMA_VERSION: i64 = 1;
 
 /// How often the pool hashrate is written to `hashrate_history`. The dashboard
 /// polls the chart at the same cadence.
 pub const SNAPSHOT_INTERVAL_SECS: u64 = 10;
 
-/// How long samples are kept at `SNAPSHOT_INTERVAL_SECS` resolution before
-/// being thinned to one a minute.
+/// How long the decayed-average history (`hashrate_history`,
+/// `share_rate_history`) is kept. Those tables only serve the short chart
+/// ranges; everything longer is derived exactly from the share ledger.
 const FINE_HISTORY_RETENTION_SECS: u64 = 48 * 3600;
+
+/// Grid of the share ledger: one `share_intervals` row per worker per minute.
+pub const LEDGER_INTERVAL_SECS: u64 = 60;
+
+/// How long 1-minute ledger rows are kept before being rolled up into
+/// `share_intervals_hourly`. Rollup is exact — the rows are sums — so this
+/// bounds resolution, not accuracy.
+///
+/// This is the one table whose size grows with fleet size *and* calendar time
+/// (one row per worker per minute), so the window is set by what actually reads
+/// minute grain: `/history`, and nothing else. Every chart range buckets at 5
+/// minutes or coarser. Eight days keeps the fine table near 12k rows per
+/// worker while the hourly table — 60× smaller per unit time — carries the
+/// long record; the extra day past a week keeps the 1w chart range entirely
+/// clear of the rollup seam.
+const LEDGER_FINE_RETENTION_SECS: u64 = 8 * 86_400;
+
+/// Distinct workers the ledger will create rows for. Worker rows are permanent
+/// and authorization is unauthenticated, so without a cap a client rotating
+/// identities could grow `users`/`workers` without bound. A real fleet — even
+/// the hypothetical 1000-device one — is far below this.
+const MAX_LEDGER_WORKERS: usize = 10_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Found-block ledger
@@ -183,16 +211,111 @@ struct SessionHashrate {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Persistent store for all-time metrics
+// Persistent store
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Cumulative lifetime share counts, as persisted. A named struct rather than
-/// two bare integers because it is the unit a future per-worker totals map
-/// will carry through the same snapshot write.
+/// Share counts for the current round, as persisted. A named struct rather
+/// than two bare integers because it is the unit a future per-worker totals
+/// map will carry through the same snapshot write.
 #[derive(Debug, Clone, Copy, Default)]
 struct ShareTotals {
     accepted: u64,
     rejected: u64,
+}
+
+/// Amounts accumulated for one worker inside the ledger minute currently open.
+#[derive(Debug, Clone, Copy, Default)]
+struct LedgerPending {
+    /// Σ credited difficulty of accepted shares — the work-sum primitive every
+    /// long-range hashrate figure is derived from.
+    work: u64,
+    accepted: u64,
+    rejected: u64,
+}
+
+/// The share ledger's in-memory stage: everything submitted since the last
+/// minute boundary, keyed by worker name. One mutex guards both fields so the
+/// flush's swap-and-restamp is atomic against the share path.
+struct LedgerAccum {
+    /// Start of the minute the pending map is accumulating for.
+    minute_ts: u64,
+    pending: HashMap<String, LedgerPending>,
+}
+
+impl LedgerAccum {
+    /// Advance to the minute containing `now`, returning the closed minute's
+    /// contents if one just ended with anything in it.
+    ///
+    /// The stamp moves even when there was nothing to flush, so an idle stretch
+    /// cannot leave shares from a later minute filed under an earlier one.
+    fn roll_to(&mut self, now: u64) -> Option<(u64, Vec<LedgerEntry>)> {
+        let minute = now / LEDGER_INTERVAL_SECS * LEDGER_INTERVAL_SECS;
+        if minute == self.minute_ts {
+            return None;
+        }
+        // A clock stepped backwards must not reopen a minute already flushed:
+        // keep accumulating into the current one instead.
+        if minute < self.minute_ts {
+            return None;
+        }
+        let closed = self.take_open();
+        self.minute_ts = minute;
+        closed
+    }
+
+    /// Take everything staged for the open minute without closing it.
+    fn take_open(&mut self) -> Option<(u64, Vec<LedgerEntry>)> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let entries = self
+            .pending
+            .drain()
+            .map(|(worker, amounts)| LedgerEntry {
+                worker,
+                work: amounts.work,
+                accepted: amounts.accepted,
+                rejected: amounts.rejected,
+            })
+            .collect();
+        Some((self.minute_ts, entries))
+    }
+}
+
+/// One flushed worker-minute, applied by the writer thread with
+/// accumulate-on-conflict so a restart inside the minute merges rather than
+/// overwrites.
+#[derive(Debug, Clone)]
+struct LedgerEntry {
+    worker: String,
+    work: u64,
+    accepted: u64,
+    rejected: u64,
+}
+
+/// One bucket of the share ledger: exact sums over `[ts, ts + span_secs)`.
+/// Average hashrate over the bucket is `work × 2³² / span_secs`.
+///
+/// `span_secs` is usually the bucket size the caller asked for, but rows past
+/// the rollup horizon can only be bucketed at whole hours — the divisor
+/// travels with the point so no caller ever divides an hour's work by a
+/// minute's grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkHistoryPoint {
+    pub ts: u64,
+    pub work: u64,
+    pub accepted: u64,
+    pub rejected: u64,
+    pub span_secs: u64,
+}
+
+/// Scope of a ledger history query: the whole pool, one payout address, or one
+/// worker (`address` or `address.label`, exactly as authorized).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerScope<'a> {
+    Pool,
+    User(&'a str),
+    Worker(&'a str),
 }
 
 /// One sampling tick's worth of persisted state, assembled by
@@ -209,7 +332,7 @@ struct SnapshotWrite {
     rates: HashrateWindows,
     worker_rates: HashMap<String, HashrateWindows>,
     share_totals: ShareTotals,
-    lifetime_reject_reasons: BTreeMap<String, u64>,
+    round_reject_reasons: BTreeMap<String, u64>,
     /// Accepted-share work accumulated in the current round (see
     /// `PoolStats::round_work`).
     round_work: u64,
@@ -239,6 +362,13 @@ enum StoreWrite {
         difficulty: u64,
     },
     Snapshot(SnapshotWrite),
+    /// One flushed minute of the share ledger. Not epoch-guarded: the ledger
+    /// is round-agnostic by design — round figures are queries over it, not
+    /// state that a reset has to zero.
+    Ledger {
+        minute_ts: u64,
+        entries: Vec<LedgerEntry>,
+    },
     /// The pool found a block: zero every "since the last found block"
     /// quantity and stamp when the new round began. Watermark writes racing
     /// this are not epoch-guarded — the worst case is one share-sized
@@ -248,9 +378,10 @@ enum StoreWrite {
         since_ts: u64,
     },
     PruneWorkerBestShares(usize),
-    /// Enrol a found block in the confirmation ledger. Unlike everything else
-    /// here this is not a watermark that can be recomputed — losing it means
-    /// losing the only record that a reorg has to be checked for.
+    /// Enrol a found block in the confirmation ledger. Unlike a watermark this
+    /// cannot be recomputed — it is the only record that a reorg has to be
+    /// checked for — which is why the writer retries it on failure instead of
+    /// dropping it.
     BlockFound(PendingBlock),
     BlockResolved {
         hash: String,
@@ -263,20 +394,57 @@ enum StoreWrite {
     Flush(std::sync::mpsc::Sender<()>),
 }
 
-/// Pending writes allowed before new ones are dropped. Each is a few hundred
-/// bytes and the writer drains them in microseconds; a backlog this deep means
-/// the disk is gone, and dropping a best-share update is better than stalling
-/// the share path.
-const WRITE_QUEUE_DEPTH: usize = 256;
+/// How long the writer waits between retry passes over failed durable writes.
+/// Long enough for a transient condition (a `sqlite3` session holding the
+/// lock past the busy timeout) to clear, short enough that a recovered disk
+/// catches up within seconds.
+const WRITE_RETRY_SECS: u64 = 5;
+
+/// Failed durable writes held for retry before the oldest is dropped. Ledger
+/// minutes arrive once a minute and block events a few times a year, so a
+/// backlog this deep means the disk has been gone for days — at which point
+/// bounding memory matters more than the writes.
+const MAX_WRITE_BACKLOG: usize = 10_000;
 
 struct StatsStore {
     /// Read connection. Only touched from `spawn_blocking` (dashboard queries)
     /// and at boot, so it never blocks a runtime worker thread.
     read: Mutex<Connection>,
     /// `None` only while dropping, which is what closes the channel and lets
-    /// the writer thread finish.
-    writes: Option<std::sync::mpsc::SyncSender<StoreWrite>>,
+    /// the writer thread finish. Unbounded: `enqueue` must never block the
+    /// share path and must never drop — memory is bounded by event rate times
+    /// however long the writer is stalled, and every message is small.
+    writes: Option<std::sync::mpsc::Sender<StoreWrite>>,
     writer: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Refuse a stats file this build does not already understand.
+///
+/// The only two acceptable states are "stamped with our version" and "empty",
+/// the second being a file SQLite just created. Anything else was written by a
+/// different schema and is rejected outright — the caller degrades to running
+/// without persistence, so miners keep hashing while the operator deletes the
+/// file. Upgrading it in place is the thing this pool deliberately does not do.
+fn check_schema_version(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    let tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
+        [],
+        |row| row.get(0),
+    )?;
+    if version == 0 && tables == 0 {
+        return Ok(());
+    }
+    Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+        Some(format!(
+            "stats database is schema v{version}, this build writes v{SCHEMA_VERSION}; \
+             there is no migration path — delete or move the file and restart"
+        )),
+    ))
 }
 
 impl Drop for StatsStore {
@@ -302,144 +470,195 @@ impl StatsStore {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Off by default in SQLite, which would make the ledger's REFERENCES
+        // clauses decorative.
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(conn)
     }
 
     fn open(path: &str) -> Result<Self, rusqlite::Error> {
         let conn = Self::connect(path)?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS pool_stats (
-             id INTEGER PRIMARY KEY CHECK(id = 1),
-             best_share_difficulty INTEGER NOT NULL,
-             best_hashrate_hps REAL NOT NULL
-             )",
-            [],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO pool_stats (id, best_share_difficulty, best_hashrate_hps)
-             VALUES (1, 0, 0.0)",
-            [],
-        )?;
+        check_schema_version(&conn)?;
 
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS worker_best_shares (
-             worker TEXT PRIMARY KEY,
-             best_share_difficulty INTEGER NOT NULL
-             )",
-            [],
-        )?;
+        // One transaction, stamp last: a file either carries the whole schema
+        // and its version, or none of it — a crash mid-create cannot leave an
+        // unstamped half-schema that the next boot would refuse as foreign.
+        //
+        // The schema separates three kinds of state. Durable facts (`users`,
+        // `workers`, `share_intervals*`, `found_blocks`) are records nothing
+        // can reconstruct. Round state (`round_*`) is zeroed by every found
+        // block. Everything else is a decayed-display cache or checkpoint,
+        // pruned to a 48-hour horizon and rebuilt from live meters.
+        conn.execute_batch(&format!(
+            "BEGIN;
 
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS hashrate_history (
-             ts INTEGER PRIMARY KEY,
-             hashrate_hps REAL NOT NULL,
-             hashrate_1m_hps REAL,
-             hashrate_5m_hps REAL,
-             hashrate_1h_hps REAL,
-             hashrate_6h_hps REAL,
-             hashrate_24h_hps REAL
-             )",
-            [],
-        )?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS worker_hashrate_state (
-             worker TEXT PRIMARY KEY,
-             updated_ts INTEGER NOT NULL,
-             hashrate_1m_hps REAL NOT NULL,
-             hashrate_5m_hps REAL NOT NULL,
-             hashrate_10m_hps REAL NOT NULL,
-             hashrate_1h_hps REAL NOT NULL,
-             hashrate_3h_hps REAL NOT NULL,
-             hashrate_6h_hps REAL NOT NULL,
-             hashrate_24h_hps REAL NOT NULL
-             )",
-            [],
-        )?;
-        // The one table here that is a ledger rather than a watermark: each row
-        // is a block this pool found, and `status` is what the deferred
-        // confirmation pass reconciles against the chain. Rows are never
-        // deleted — a solo pool's block count is the whole point of the
-        // exercise, and the table grows by one row per block found.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS found_blocks (
-             hash TEXT PRIMARY KEY,
-             height INTEGER NOT NULL,
-             worker TEXT NOT NULL,
-             payout TEXT NOT NULL,
-             found_ts INTEGER NOT NULL,
-             won_at_submit INTEGER NOT NULL,
-             status TEXT NOT NULL,
-             resolved_ts INTEGER
-             )",
-            [],
-        )?;
+             -- Round state: every column resets when a block is found.
+             -- `since_ts` is when the current round began (file creation,
+             -- then each found block); `work` is the round's credited sum.
+             CREATE TABLE IF NOT EXISTS round_stats (
+               id INTEGER PRIMARY KEY CHECK(id = 1),
+               shares_accepted INTEGER NOT NULL CHECK(shares_accepted >= 0),
+               shares_rejected INTEGER NOT NULL CHECK(shares_rejected >= 0),
+               work INTEGER NOT NULL CHECK(work >= 0),
+               since_ts INTEGER NOT NULL CHECK(since_ts >= 0),
+               best_share_difficulty INTEGER NOT NULL CHECK(best_share_difficulty >= 0),
+               best_hashrate_hps REAL NOT NULL CHECK(best_hashrate_hps >= 0.0)
+             );
+             INSERT OR IGNORE INTO round_stats VALUES
+               (1, 0, 0, 0, CAST(strftime('%s','now') AS INTEGER), 0, 0.0);
+             CREATE TABLE IF NOT EXISTS round_worker_best_shares (
+               worker TEXT PRIMARY KEY,
+               best_share_difficulty INTEGER NOT NULL CHECK(best_share_difficulty >= 0)
+             );
+             -- Round rejects by reason. Keys come from the closed
+             -- `RejectReason` label set, so the table is bounded at a handful
+             -- of rows and never needs pruning.
+             CREATE TABLE IF NOT EXISTS round_reject_reasons (
+               reason TEXT PRIMARY KEY,
+               count INTEGER NOT NULL CHECK(count >= 0)
+             );
 
-        // Cumulative lifetime share counts on the snapshot grid. Rows are
-        // running totals, not per-interval deltas: differencing recovers the
-        // rate at any granularity, so the minute-level thinning loses nothing
-        // and a restart just leaves a flat step to difference across. Kept out
-        // of `hashrate_history` because `migrate_hashrate_algo` empties that
-        // table wholesale, and share counts must survive estimator changes.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS share_history (
-             ts INTEGER PRIMARY KEY,
-             shares_accepted INTEGER NOT NULL,
-             shares_rejected INTEGER NOT NULL
-             )",
-            [],
-        )?;
+             -- Durable: each row is a block this pool found, and `status` is
+             -- what the deferred confirmation pass reconciles against the
+             -- chain. Rows are never deleted — a solo pool's block count is
+             -- the whole point of the exercise.
+             CREATE TABLE IF NOT EXISTS found_blocks (
+               hash TEXT PRIMARY KEY,
+               height INTEGER NOT NULL CHECK(height >= 0),
+               worker TEXT NOT NULL,
+               payout TEXT NOT NULL,
+               found_ts INTEGER NOT NULL CHECK(found_ts >= 0),
+               won_at_submit INTEGER NOT NULL CHECK(won_at_submit IN (0, 1)),
+               status TEXT NOT NULL
+                 CHECK(status IN ('pending', 'confirmed', 'orphaned', 'abandoned')),
+               resolved_ts INTEGER,
+               CHECK((status = 'pending') = (resolved_ts IS NULL))
+             );
 
-        // Lifetime rejects broken down by reason. Keys come from the closed
-        // `RejectReason` label set (plus "rate_limited"), so the table is
-        // bounded at a handful of rows and never needs pruning.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS pool_reject_reasons (
-             reason TEXT PRIMARY KEY,
-             count INTEGER NOT NULL
-             )",
-            [],
-        )?;
+             -- Durable: the share ledger. Exact per-interval work sums,
+             -- dimensioned by worker and user (payout address) — the record
+             -- every long-range figure is derived from. `SUM(work) × 2³² /
+             -- span` is the average hashrate over any span, additive across
+             -- workers → users → pool, and it means the same thing under any
+             -- estimator, which is why these outlive every cache below.
+             CREATE TABLE IF NOT EXISTS users (
+               id INTEGER PRIMARY KEY,
+               payout_address TEXT NOT NULL UNIQUE CHECK(payout_address <> ''),
+               first_seen_ts INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS workers (
+               id INTEGER PRIMARY KEY,
+               user_id INTEGER NOT NULL REFERENCES users(id),
+               label TEXT NOT NULL,
+               first_seen_ts INTEGER NOT NULL,
+               UNIQUE(user_id, label)
+             );
+             -- WITHOUT ROWID: the composite key *is* the row identity, and
+             -- the B-tree on (worker_id, ts) is the per-worker range scan
+             -- every filtered query does. The ts indexes serve the pool-wide
+             -- scans. Timestamps are grid-aligned by construction; the CHECK
+             -- makes a misfiled row an error instead of a silent misplot.
+             CREATE TABLE IF NOT EXISTS share_intervals (
+               worker_id INTEGER NOT NULL REFERENCES workers(id),
+               ts INTEGER NOT NULL CHECK(ts % {minute} = 0),
+               work INTEGER NOT NULL CHECK(work >= 0),
+               accepted INTEGER NOT NULL CHECK(accepted >= 0),
+               rejected INTEGER NOT NULL CHECK(rejected >= 0),
+               PRIMARY KEY (worker_id, ts)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS share_intervals_ts ON share_intervals(ts);
+             CREATE TABLE IF NOT EXISTS share_intervals_hourly (
+               worker_id INTEGER NOT NULL REFERENCES workers(id),
+               ts INTEGER NOT NULL CHECK(ts % 3600 = 0),
+               work INTEGER NOT NULL CHECK(work >= 0),
+               accepted INTEGER NOT NULL CHECK(accepted >= 0),
+               rejected INTEGER NOT NULL CHECK(rejected >= 0),
+               PRIMARY KEY (worker_id, ts)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS share_intervals_hourly_ts
+               ON share_intervals_hourly(ts);
 
-        // Pool-wide accepted shares/min, as decaying averages on the snapshot
-        // grid — the same six windows `hashrate_history` carries, so the two
-        // charts plot the same points. Unlike `share_history` above these are
-        // decayed rather than raw counts, which is what ties them to the
-        // estimator version (see `migrate_hashrate_algo`).
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS share_rate_history (
-             ts INTEGER PRIMARY KEY,
-             spm_1m REAL,
-             spm_5m REAL,
-             spm_10m REAL,
-             spm_1h REAL,
-             spm_6h REAL,
-             spm_24h REAL
-             )",
-            [],
-        )?;
-        // Checkpoint of the live meter, so a restart resumes the averages
-        // decayed across the downtime instead of starting from zero. All seven
-        // windows, matching `worker_hashrate_state`: restoring 3h as zero would
-        // silently corrupt it the day it gets exposed.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS share_rate_state (
-             id INTEGER PRIMARY KEY CHECK (id = 1),
-             updated_ts INTEGER NOT NULL,
-             spm_1m REAL NOT NULL,
-             spm_5m REAL NOT NULL,
-             spm_10m REAL NOT NULL,
-             spm_1h REAL NOT NULL,
-             spm_3h REAL NOT NULL,
-             spm_6h REAL NOT NULL,
-             spm_24h REAL NOT NULL
-             )",
-            [],
-        )?;
+             -- Caches: decayed-average history and live-meter checkpoints,
+             -- pruned to a 48-hour horizon and rebuilt from live meters.
+             CREATE TABLE IF NOT EXISTS hashrate_history (
+               ts INTEGER PRIMARY KEY,
+               hashrate_hps REAL NOT NULL,
+               hashrate_1m_hps REAL,
+               hashrate_5m_hps REAL,
+               hashrate_1h_hps REAL,
+               hashrate_6h_hps REAL,
+               hashrate_24h_hps REAL
+             );
+             CREATE TABLE IF NOT EXISTS worker_hashrate_state (
+               worker TEXT PRIMARY KEY,
+               updated_ts INTEGER NOT NULL,
+               hashrate_1m_hps REAL NOT NULL,
+               hashrate_5m_hps REAL NOT NULL,
+               hashrate_10m_hps REAL NOT NULL,
+               hashrate_1h_hps REAL NOT NULL,
+               hashrate_3h_hps REAL NOT NULL,
+               hashrate_6h_hps REAL NOT NULL,
+               hashrate_24h_hps REAL NOT NULL
+             );
+             -- Pool-wide accepted shares/min over the same six windows as
+             -- `hashrate_history`, so the two charts plot the same points.
+             CREATE TABLE IF NOT EXISTS share_rate_history (
+               ts INTEGER PRIMARY KEY,
+               spm_1m REAL,
+               spm_5m REAL,
+               spm_10m REAL,
+               spm_1h REAL,
+               spm_6h REAL,
+               spm_24h REAL
+             );
+             -- Checkpoint of the live meter, so a restart resumes the
+             -- averages decayed across the downtime. All seven windows,
+             -- matching `worker_hashrate_state`: restoring 3h as zero would
+             -- silently corrupt it the day it gets exposed.
+             CREATE TABLE IF NOT EXISTS share_rate_state (
+               id INTEGER PRIMARY KEY CHECK (id = 1),
+               updated_ts INTEGER NOT NULL,
+               spm_1m REAL NOT NULL,
+               spm_5m REAL NOT NULL,
+               spm_10m REAL NOT NULL,
+               spm_1h REAL NOT NULL,
+               spm_3h REAL NOT NULL,
+               spm_6h REAL NOT NULL,
+               spm_24h REAL NOT NULL
+             );
 
-        Self::migrate_hashrate_history(&conn)?;
-        Self::migrate_hashrate_algo(&conn)?;
-        Self::migrate_share_stats(&conn)?;
+             PRAGMA user_version = {version};
+             COMMIT;",
+            minute = LEDGER_INTERVAL_SECS,
+            version = SCHEMA_VERSION,
+        ))?;
+
+        // `found_blocks` is the durable authority on when rounds ended. A
+        // reset that was parked in the retry backlog when the process died
+        // never reached `round_stats`, leaving the finished round's totals
+        // standing; reconcile by re-deriving the round boundary from the last
+        // submit-time win. Strictly newer only — `since_ts` is stamped by the
+        // reset in the same second the block is enrolled, so an applied reset
+        // never trips this.
+        let last_win: Option<u64> = conn.query_row(
+            "SELECT MAX(found_ts) FROM found_blocks WHERE won_at_submit = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let since_ts: u64 =
+            conn.query_row("SELECT since_ts FROM round_stats WHERE id = 1", [], |row| {
+                row.get(0)
+            })?;
+        if let Some(win_ts) = last_win {
+            if win_ts > since_ts {
+                apply_round_reset(&conn, win_ts)?;
+                info!(
+                    "Recovered a round reset lost to an unclean shutdown: \
+                     round restarted at the block found at {win_ts}"
+                );
+            }
+        }
 
         // Enforce the row cap at boot, synchronously and before the writer
         // thread exists, so an attacker-inflated table from a previous run is
@@ -447,7 +666,7 @@ impl StatsStore {
         prune_worker_best_shares(&conn, MAX_WORKER_BEST_SHARES);
 
         let writer_conn = Self::connect(path)?;
-        let (writes, rx) = std::sync::mpsc::sync_channel(WRITE_QUEUE_DEPTH);
+        let (writes, rx) = std::sync::mpsc::channel();
         let writer = std::thread::Builder::new()
             .name("stats-writer".into())
             .spawn(move || writer_loop(writer_conn, rx))
@@ -462,24 +681,18 @@ impl StatsStore {
         })
     }
 
-    /// Queue a write. Never blocks: persistence is best-effort next to serving
-    /// miners, so a wedged disk costs a stat, not a share.
+    /// Queue a write. Never blocks (the channel is unbounded) and never drops:
+    /// what happens on a failing disk is the writer's problem, not the share
+    /// path's.
     fn enqueue(&self, write: StoreWrite) {
-        use std::sync::mpsc::TrySendError;
         let Some(writes) = self.writes.as_ref() else {
             return; // shutting down
         };
-        match writes.try_send(write) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                warn!("Stats writer queue full — dropping a persisted stats update")
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                static GONE: std::sync::Once = std::sync::Once::new();
-                GONE.call_once(|| {
-                    warn!("Stats writer thread has stopped; stats are no longer persisted")
-                });
-            }
+        if writes.send(write).is_err() {
+            static GONE: std::sync::Once = std::sync::Once::new();
+            GONE.call_once(|| {
+                warn!("Stats writer thread has stopped; stats are no longer persisted")
+            });
         }
     }
 
@@ -491,15 +704,12 @@ impl StatsStore {
         let Some(writes) = self.writes.as_ref() else {
             return;
         };
-        match writes.try_send(StoreWrite::Flush(ack)) {
-            Ok(()) => {
-                if done.recv_timeout(Duration::from_secs(5)).is_err() {
-                    warn!("Timed out draining the stats write queue");
-                }
+        if writes.send(StoreWrite::Flush(ack)).is_ok() {
+            if done.recv_timeout(Duration::from_secs(5)).is_err() {
+                warn!("Timed out draining the stats write queue");
             }
-            // A full queue at flush time means the writer is already wedged;
-            // a blocking send would just move the hang here.
-            Err(_) => warn!("Stats write queue unavailable; skipping final flush"),
+        } else {
+            warn!("Stats writer is gone; skipping final flush");
         }
     }
 
@@ -508,7 +718,7 @@ impl StatsStore {
     ) -> Result<(u64, f64, std::collections::HashMap<String, u64>), rusqlite::Error> {
         let conn = self.read.lock();
         let mut stmt = conn.prepare(
-            "SELECT best_share_difficulty, best_hashrate_hps FROM pool_stats WHERE id = 1",
+            "SELECT best_share_difficulty, best_hashrate_hps FROM round_stats WHERE id = 1",
         )?;
         let mut rows = stmt.query([])?;
         let best_values = if let Some(row) = rows.next()? {
@@ -521,7 +731,7 @@ impl StatsStore {
 
         let mut worker_best_shares = std::collections::HashMap::new();
         let mut stmt =
-            conn.prepare("SELECT worker, best_share_difficulty FROM worker_best_shares")?;
+            conn.prepare("SELECT worker, best_share_difficulty FROM round_worker_best_shares")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let worker = row.get::<_, String>(0)?;
@@ -640,6 +850,10 @@ impl StatsStore {
         });
     }
 
+    fn record_ledger_minute(&self, minute_ts: u64, entries: Vec<LedgerEntry>) {
+        self.enqueue(StoreWrite::Ledger { minute_ts, entries });
+    }
+
     fn record_hashrate_snapshot(&self, snapshot: SnapshotWrite) {
         self.enqueue(StoreWrite::Snapshot(snapshot));
     }
@@ -648,133 +862,11 @@ impl StatsStore {
         self.enqueue(StoreWrite::RoundReset { epoch, since_ts });
     }
 
-    fn migrate_hashrate_history(conn: &Connection) -> Result<(), rusqlite::Error> {
-        let mut stmt = conn.prepare("PRAGMA table_info(hashrate_history)")?;
-        let existing: std::collections::HashSet<String> = stmt
-            .query_map([], |row| row.get(1))?
-            .filter_map(Result::ok)
-            .collect();
-        drop(stmt);
-
-        for column in [
-            "hashrate_1m_hps",
-            "hashrate_5m_hps",
-            "hashrate_1h_hps",
-            "hashrate_6h_hps",
-            "hashrate_24h_hps",
-        ] {
-            if !existing.contains(column) {
-                conn.execute(
-                    &format!("ALTER TABLE hashrate_history ADD COLUMN {column} REAL"),
-                    [],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Discard history written by an earlier hashrate estimator.
-    ///
-    /// Values from a different estimator are not comparable with the current
-    /// one, and the estimator that wrote them could emit readings
-    /// orders of magnitude too high when a lone share landed in a window — a
-    /// single such sample pins the chart's y-axis and permanently poisons the
-    /// all-time best-hashrate watermark. Rather than try to filter them, drop
-    /// the series and start clean. Found blocks, best shares and per-worker
-    /// bests are keyed elsewhere and survive.
-    ///
-    /// The line is decayed-vs-raw, not shares-vs-hashrate: `share_rate_*` comes
-    /// out of the same decay kernel and is dropped alongside, while
-    /// `share_history`'s undecayed cumulative counts mean the same thing under
-    /// any estimator and are left alone.
-    fn migrate_hashrate_algo(conn: &Connection) -> Result<(), rusqlite::Error> {
-        let mut stmt = conn.prepare("PRAGMA table_info(pool_stats)")?;
-        let existing: std::collections::HashSet<String> = stmt
-            .query_map([], |row| row.get(1))?
-            .filter_map(Result::ok)
-            .collect();
-        drop(stmt);
-
-        if !existing.contains("hashrate_algo_version") {
-            conn.execute(
-                "ALTER TABLE pool_stats ADD COLUMN hashrate_algo_version INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
-
-        let stored: u64 = conn
-            .query_row(
-                "SELECT hashrate_algo_version FROM pool_stats WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        if stored >= HASHRATE_ALGO_VERSION {
-            return Ok(());
-        }
-
-        let dropped_history = conn.execute("DELETE FROM hashrate_history", [])?
-            + conn.execute("DELETE FROM share_rate_history", [])?;
-        let dropped_state = conn.execute("DELETE FROM worker_hashrate_state", [])?
-            + conn.execute("DELETE FROM share_rate_state", [])?;
-        conn.execute(
-            "UPDATE pool_stats
-             SET best_hashrate_hps = 0.0, hashrate_algo_version = ?1
-             WHERE id = 1",
-            params![HASHRATE_ALGO_VERSION],
-        )?;
-        if dropped_history > 0 || dropped_state > 0 {
-            info!(
-                "Hashrate estimator changed (v{stored} → v{HASHRATE_ALGO_VERSION}): \
-                 dropped {dropped_history} incomparable history rows and {dropped_state} state rows, \
-                 and reset the best-hashrate watermark"
-            );
-        }
-        Ok(())
-    }
-
-    /// Add the since-last-block share counters to `pool_stats`. Runs after
-    /// `migrate_hashrate_algo` so that migration never sees columns it
-    /// predates. `stats_since_ts` marks where the totals start counting from:
-    /// set on the first boot with this schema, then moved forward by each
-    /// `RoundReset`.
-    fn migrate_share_stats(conn: &Connection) -> Result<(), rusqlite::Error> {
-        let mut stmt = conn.prepare("PRAGMA table_info(pool_stats)")?;
-        let existing: std::collections::HashSet<String> = stmt
-            .query_map([], |row| row.get(1))?
-            .filter_map(Result::ok)
-            .collect();
-        drop(stmt);
-
-        for column in [
-            "lifetime_shares_accepted",
-            "lifetime_shares_rejected",
-            "stats_since_ts",
-            "round_work",
-        ] {
-            if !existing.contains(column) {
-                conn.execute(
-                    &format!(
-                        "ALTER TABLE pool_stats ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
-                    ),
-                    [],
-                )?;
-            }
-        }
-
-        conn.execute(
-            "UPDATE pool_stats SET stats_since_ts = ?1 WHERE id = 1 AND stats_since_ts = 0",
-            params![PoolStats::now_secs()],
-        )?;
-        Ok(())
-    }
-
-    fn load_lifetime_stats(&self) -> Result<(ShareTotals, u64, u64), rusqlite::Error> {
+    fn load_round_stats(&self) -> Result<(ShareTotals, u64, u64), rusqlite::Error> {
         let conn = self.read.lock();
         conn.query_row(
-            "SELECT lifetime_shares_accepted, lifetime_shares_rejected, stats_since_ts,
-                    round_work
-             FROM pool_stats WHERE id = 1",
+            "SELECT shares_accepted, shares_rejected, since_ts, work
+             FROM round_stats WHERE id = 1",
             [],
             |row| {
                 Ok((
@@ -791,7 +883,7 @@ impl StatsStore {
 
     fn load_reject_reasons(&self) -> Result<BTreeMap<String, u64>, rusqlite::Error> {
         let conn = self.read.lock();
-        let mut stmt = conn.prepare("SELECT reason, count FROM pool_reject_reasons")?;
+        let mut stmt = conn.prepare("SELECT reason, count FROM round_reject_reasons")?;
         let mut rows = stmt.query([])?;
         let mut reasons = BTreeMap::new();
         while let Some(row) = rows.next()? {
@@ -857,6 +949,101 @@ impl StatsStore {
         .unwrap_or_default()
     }
 
+    /// Exact work sums over `[since_ts, ∞)`, bucketed to `bucket_secs`.
+    ///
+    /// Reads the 1-minute table where it still has rows and the hourly rollup
+    /// before that, so a range crossing the retention boundary is continuous.
+    /// The two never overlap: rollup deletes the minute rows it consumed, in
+    /// the same transaction that inserts the hours.
+    ///
+    /// Buckets with no shares are absent rather than zero — a caller plotting a
+    /// series decides for itself whether a gap means "idle" or "pool was down",
+    /// and inventing zeroes here would foreclose that.
+    fn get_work_history(
+        &self,
+        since_ts: u64,
+        bucket_secs: u64,
+        now_ts: u64,
+        scope: LedgerScope<'_>,
+    ) -> Vec<WorkHistoryPoint> {
+        let bucket = bucket_secs.max(1);
+        // Floor the range start onto the grid: a bucket must either be inside
+        // the range whole or not at all, or its leading point under-reads.
+        let since = since_ts / bucket * bucket;
+        // A bucket smaller than an hour cannot be served from the rollup, so
+        // rolled-up rows are bucketed at whole hours instead. Each branch
+        // reports the grid it used as `span`, which is the divisor that turns
+        // the bucket's work sum back into a rate — without it a caller
+        // dividing an hour's work by a minute grid reads 60× high.
+        let hourly_bucket = bucket.max(3_600) / 3_600 * 3_600;
+        // The bound name is unused by the pool-wide filter, but still bound:
+        // `?4` fixes the statement's parameter count either way.
+        let (filter, param): (&str, &str) = match scope {
+            LedgerScope::Pool => ("", ""),
+            LedgerScope::User(address) => (
+                "AND worker_id IN (SELECT w.id FROM workers w
+                                   JOIN users u ON u.id = w.user_id
+                                   WHERE u.payout_address = ?3)",
+                address,
+            ),
+            LedgerScope::Worker(name) => (
+                "AND worker_id IN (SELECT w.id FROM workers w
+                                   JOIN users u ON u.id = w.user_id
+                                   WHERE u.payout_address || CASE w.label WHEN '' THEN ''
+                                         ELSE '.' || w.label END = ?3)",
+                name,
+            ),
+        };
+        // The outer aggregation is not redundant with the inner ones: a bucket
+        // wider than an hour can span the retention seam and collect rows from
+        // both tables, which would otherwise emit that bucket twice. MAX(span)
+        // is exact for such a bucket — the grids coincide there, since a
+        // sub-hour bucket can never straddle the seam.
+        let sql = format!(
+            "SELECT bucket_ts, SUM(work), SUM(accepted), SUM(rejected), MAX(span) FROM (
+               SELECT (ts / ?2) * ?2 AS bucket_ts, SUM(work) AS work,
+                      SUM(accepted) AS accepted, SUM(rejected) AS rejected, ?2 AS span
+               FROM share_intervals
+               WHERE ts >= ?1 {filter}
+               GROUP BY bucket_ts
+               UNION ALL
+               SELECT (ts / ?4) * ?4 AS bucket_ts, SUM(work) AS work,
+                      SUM(accepted) AS accepted, SUM(rejected) AS rejected, ?4 AS span
+               FROM share_intervals_hourly
+               WHERE ts >= ?1 {filter}
+               GROUP BY bucket_ts
+             )
+             GROUP BY bucket_ts
+             ORDER BY bucket_ts ASC"
+        );
+        let conn = self.read.lock();
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                warn!("Failed to prepare ledger query: {e}");
+                return vec![];
+            }
+        };
+        stmt.query_map(params![since, bucket, param, hourly_bucket], |row| {
+            Ok(WorkHistoryPoint {
+                ts: row.get(0)?,
+                work: row.get::<_, i64>(1).unwrap_or(0).max(0) as u64,
+                accepted: row.get::<_, i64>(2).unwrap_or(0).max(0) as u64,
+                rejected: row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
+                span_secs: row.get::<_, i64>(4).unwrap_or(0).max(1) as u64,
+            })
+        })
+        .map(|rows| {
+            rows.filter_map(|r| r.ok())
+                // A bucket whose span has not fully elapsed holds a fraction
+                // of its final work; served as-is it reads as a rate collapse
+                // at the right edge of every chart.
+                .filter(|p: &WorkHistoryPoint| p.ts + p.span_secs <= now_ts)
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
     fn get_hashrate_history(&self, since_ts: u64, bucket_secs: u64) -> Vec<RateHistoryPoint> {
         let conn = self.read.lock();
         let mut stmt = match conn.prepare(
@@ -894,22 +1081,138 @@ impl StatsStore {
 /// Drain queued writes until the store is dropped. Owns the only write
 /// connection, so SQLite never sees two writers and every statement below runs
 /// off the async runtime.
+///
+/// Writes come in two classes. The durable ones — ledger minutes, found
+/// blocks, block resolutions, round resets — are records, not derivable from
+/// anything else, so a failed apply parks them in a retry backlog instead of
+/// dropping them; the loop wakes every `WRITE_RETRY_SECS` while any are
+/// pending. Everything else is a watermark or cache the next share or snapshot
+/// re-earns, and stays warn-and-drop.
 fn writer_loop(conn: Connection, rx: std::sync::mpsc::Receiver<StoreWrite>) {
-    // Epoch of the last RoundReset applied this boot. Snapshots read their
-    // epoch before their share stats, so one carrying an older epoch was
-    // assembled before that reset and its share stats must not be re-applied.
-    let mut round_epoch = 0u64;
-    while let Ok(write) = rx.recv() {
-        if let Err(e) = apply_write(&conn, write, &mut round_epoch) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let mut state = WriterState::default();
+    let mut backlog: std::collections::VecDeque<StoreWrite> = std::collections::VecDeque::new();
+    loop {
+        let next = if backlog.is_empty() {
+            match rx.recv() {
+                Ok(write) => Some(write),
+                Err(_) => break,
+            }
+        } else {
+            match rx.recv_timeout(Duration::from_secs(WRITE_RETRY_SECS)) {
+                Ok(write) => Some(write),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        };
+
+        // Oldest first, before newer work, so a recovered disk sees writes in
+        // roughly the order they happened.
+        retry_backlog(&conn, &mut backlog, &mut state);
+        if let Some(write) = next {
+            handle_write(&conn, write, &mut state, &mut backlog);
+        }
+    }
+
+    // The channel only closes with an empty queue, so all that can remain is
+    // the backlog: one last attempt, then say plainly what is being lost.
+    retry_backlog(&conn, &mut backlog, &mut state);
+    if !backlog.is_empty() {
+        error!(
+            "Exiting with {} durable stats writes unpersisted",
+            backlog.len()
+        );
+    }
+}
+
+/// State the writer thread carries between writes.
+#[derive(Default)]
+struct WriterState {
+    /// Epoch of the last RoundReset *successfully applied* this boot. A
+    /// snapshot's round-scoped stats are merged only when its epoch equals
+    /// this: an older epoch means the snapshot predates a reset, a newer one
+    /// means the reset itself has not landed yet (queued or parked in the
+    /// retry backlog) — merging in either state would resurrect a finished
+    /// round's totals through the MAX guards.
+    round_epoch: u64,
+    /// `workers.id` by name, saving one SELECT per worker per ledger minute.
+    /// Sound because both tables are insert-only — but a failed ledger write
+    /// rolls back rows whose ids may already be cached, so the cache is
+    /// cleared on that failure rather than left pointing at nothing.
+    worker_ids: std::collections::HashMap<String, i64>,
+}
+
+/// Whether a failed write must be retried rather than dropped: these are the
+/// records nothing can reconstruct.
+fn is_durable(write: &StoreWrite) -> bool {
+    matches!(
+        write,
+        StoreWrite::Ledger { .. }
+            | StoreWrite::BlockFound(_)
+            | StoreWrite::BlockResolved { .. }
+            | StoreWrite::RoundReset { .. }
+    )
+}
+
+fn handle_write(
+    conn: &Connection,
+    write: StoreWrite,
+    state: &mut WriterState,
+    backlog: &mut std::collections::VecDeque<StoreWrite>,
+) {
+    // A flush that acks while durable writes are parked would falsely tell
+    // shutdown everything landed.
+    if matches!(write, StoreWrite::Flush(_)) && !backlog.is_empty() {
+        warn!(
+            "{} durable stats writes still unpersisted at flush",
+            backlog.len()
+        );
+    }
+    if let Err(e) = apply_write(conn, &write, state) {
+        if is_durable(&write) {
+            warn!("Failed to persist a durable stats write (will retry): {e}");
+            if backlog.len() >= MAX_WRITE_BACKLOG {
+                error!("Durable stats backlog overflowed; dropping the oldest write");
+                backlog.pop_front();
+            }
+            backlog.push_back(write);
+        } else {
             warn!("Failed to persist stats update: {e}");
         }
     }
 }
 
+/// Re-attempt parked durable writes, oldest first. Stops at the first failure:
+/// if the disk is still gone there is no point hammering the rest, and order
+/// is preserved for the next pass. Retrying is safe — a failed transaction
+/// rolled back, and the ledger's upserts accumulate on conflict rather than
+/// replace.
+fn retry_backlog(
+    conn: &Connection,
+    backlog: &mut std::collections::VecDeque<StoreWrite>,
+    state: &mut WriterState,
+) {
+    let parked = backlog.len();
+    for _ in 0..parked {
+        let Some(write) = backlog.pop_front() else {
+            break;
+        };
+        if apply_write(conn, &write, state).is_err() {
+            backlog.push_front(write);
+            break;
+        }
+    }
+    let recovered = parked - backlog.len();
+    if recovered > 0 {
+        info!("Persisted {recovered} previously failed durable stats writes");
+    }
+}
+
 fn apply_write(
     conn: &Connection,
-    write: StoreWrite,
-    round_epoch: &mut u64,
+    write: &StoreWrite,
+    state: &mut WriterState,
 ) -> Result<(), rusqlite::Error> {
     match write {
         // The `?1 > ...` guards keep the watermarks monotonic at the SQL level:
@@ -917,28 +1220,28 @@ fn apply_write(
         // overwrite a higher one already persisted.
         StoreWrite::BestShare(difficulty) => {
             conn.execute(
-                "UPDATE pool_stats SET best_share_difficulty = ?1
+                "UPDATE round_stats SET best_share_difficulty = ?1
                  WHERE id = 1 AND ?1 > best_share_difficulty",
                 params![difficulty],
             )?;
         }
         StoreWrite::BestHashrate(hps) => {
             conn.execute(
-                "UPDATE pool_stats SET best_hashrate_hps = ?1
+                "UPDATE round_stats SET best_hashrate_hps = ?1
                  WHERE id = 1 AND ?1 > best_hashrate_hps",
                 params![hps],
             )?;
         }
         StoreWrite::WorkerBestShare { worker, difficulty } => {
             conn.execute(
-                "INSERT INTO worker_best_shares (worker, best_share_difficulty) VALUES (?1, ?2)
+                "INSERT INTO round_worker_best_shares (worker, best_share_difficulty) VALUES (?1, ?2)
                  ON CONFLICT(worker) DO UPDATE SET best_share_difficulty = excluded.best_share_difficulty
-                 WHERE excluded.best_share_difficulty > worker_best_shares.best_share_difficulty",
+                 WHERE excluded.best_share_difficulty > round_worker_best_shares.best_share_difficulty",
                 params![worker, difficulty],
             )?;
         }
         StoreWrite::PruneWorkerBestShares(keep) => {
-            prune_worker_best_shares(conn, keep);
+            prune_worker_best_shares(conn, *keep);
         }
         // `OR IGNORE`: the inline retry ladder and the background resubmitter
         // can both report the same block, and the first enrolment is the one
@@ -967,36 +1270,233 @@ fn apply_write(
             resolution,
             resolved_ts,
         } => {
-            conn.execute(
+            let updated = conn.execute(
                 "UPDATE found_blocks SET status = ?2, resolved_ts = ?3
                  WHERE hash = ?1 AND status = ?4",
                 params![hash, resolution.label(), resolved_ts, BLOCK_STATUS_PENDING],
             )?;
+            if updated == 0 {
+                // Zero rows has two very different meanings. The row exists
+                // with a settled status: a replay, safely dropped. The row
+                // does not exist at all: this resolution outran its
+                // `BlockFound`, which is parked in the retry backlog — treat
+                // it as a failure so it parks behind and lands after. Without
+                // this, the row would sit `pending` forever while the pool
+                // believed it resolved.
+                let exists = conn
+                    .query_row(
+                        "SELECT 1 FROM found_blocks WHERE hash = ?1",
+                        params![hash],
+                        |_| Ok(()),
+                    )
+                    .map(|_| true)
+                    .or_else(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                        other => Err(other),
+                    })?;
+                if !exists {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+            }
         }
         StoreWrite::Snapshot(snapshot) => {
-            let stale_round = snapshot.round_epoch < *round_epoch;
-            write_snapshot(conn, &snapshot, stale_round)?;
+            // Equality, not `<`: the round-scoped portion merges with MAX, so
+            // it is only valid against a `round_stats` row that the reset for
+            // this exact epoch has already zeroed. A snapshot from a *newer*
+            // epoch than the last applied reset means that reset is still in
+            // the queue or parked in the backlog — merging now would MAX the
+            // finished round's totals back in on top of the new round's.
+            let stale_round = snapshot.round_epoch != state.round_epoch;
+            write_snapshot(conn, snapshot, stale_round)?;
+        }
+        StoreWrite::Ledger { minute_ts, entries } => {
+            if let Err(e) = write_ledger_minute(conn, *minute_ts, entries, &mut state.worker_ids) {
+                // The rollback may have taken rows whose ids were just cached.
+                state.worker_ids.clear();
+                return Err(e);
+            }
+            // Separate from the minute write, and its failure must not send
+            // this write to the backlog: the minute is already committed, and
+            // replaying it would double-count. A failed rollup simply runs
+            // again on the next minute — the overdue rows are still there.
+            if let Err(e) = roll_up_ledger(conn, *minute_ts) {
+                warn!("Ledger rollup failed (will run again next minute): {e}");
+            }
         }
         StoreWrite::RoundReset { epoch, since_ts } => {
-            *round_epoch = (*round_epoch).max(epoch);
-            conn.execute(
-                "UPDATE pool_stats SET
-                   lifetime_shares_accepted = 0,
-                   lifetime_shares_rejected = 0,
-                   round_work = 0,
-                   best_share_difficulty = 0,
-                   best_hashrate_hps = 0.0,
-                   stats_since_ts = ?1
-                 WHERE id = 1",
-                params![since_ts],
-            )?;
-            conn.execute("DELETE FROM pool_reject_reasons", [])?;
-            conn.execute("DELETE FROM worker_best_shares", [])?;
+            apply_round_reset(conn, *since_ts)?;
+            // Advanced only after the reset committed: this is what the
+            // Snapshot arm's equality guard reads, and advancing it on a
+            // failed (parked) reset would declare snapshots of the new round
+            // mergeable against the old round's still-standing totals.
+            state.round_epoch = state.round_epoch.max(*epoch);
         }
         StoreWrite::Flush(ack) => {
             let _ = ack.send(());
         }
     }
+    Ok(())
+}
+
+/// Resolve a worker name to its `workers.id`, creating the user and worker rows
+/// on first sight.
+///
+/// Names arriving here are `MinerIdentity::canonical_name` — the frontends key
+/// every stats call on it — so splitting on the first dot yields the
+/// network-checked payout address, already in its one canonical spelling, and
+/// the device label. A bare address (no label) is a worker with an empty
+/// label, which keeps "one device authorized as just the address" a normal row
+/// rather than a special case.
+///
+/// Returns `None` once `MAX_LEDGER_WORKERS` rows exist and the name is not one
+/// of them: worker rows are permanent and authorization is unauthenticated, so
+/// the table needs a ceiling. Existing workers keep recording either way.
+fn resolve_worker_id(
+    conn: &Connection,
+    name: &str,
+    now: u64,
+) -> Result<Option<i64>, rusqlite::Error> {
+    let (address, label) = match name.split_once('.') {
+        Some((address, label)) => (address, label),
+        None => (name, ""),
+    };
+
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT w.id FROM workers w
+             JOIN users u ON u.id = w.user_id
+             WHERE u.payout_address = ?1 AND w.label = ?2",
+            params![address, label],
+            |row| row.get(0),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    if let Some(id) = existing {
+        return Ok(Some(id));
+    }
+
+    let workers: i64 = conn.query_row("SELECT COUNT(*) FROM workers", [], |row| row.get(0))?;
+    if workers as usize >= MAX_LEDGER_WORKERS {
+        static CAPPED: std::sync::Once = std::sync::Once::new();
+        CAPPED.call_once(|| {
+            warn!(
+                "Share ledger is at its {MAX_LEDGER_WORKERS}-worker cap; \
+                 new worker names are no longer recorded"
+            )
+        });
+        return Ok(None);
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO users (payout_address, first_seen_ts) VALUES (?1, ?2)",
+        params![address, now],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO workers (user_id, label, first_seen_ts)
+         VALUES ((SELECT id FROM users WHERE payout_address = ?1), ?2, ?3)",
+        params![address, label, now],
+    )?;
+    conn.query_row(
+        "SELECT w.id FROM workers w
+         JOIN users u ON u.id = w.user_id
+         WHERE u.payout_address = ?1 AND w.label = ?2",
+        params![address, label],
+        |row| row.get(0),
+    )
+    .map(Some)
+}
+
+/// Apply one flushed minute of the share ledger. One transaction, no side
+/// trips: the caller retries this write on failure, which is only sound while
+/// failure means nothing was committed.
+///
+/// Sums accumulate on conflict rather than replacing: a process restarted
+/// mid-minute flushes a partial row on the way down and the next run adds to
+/// it, so a bounce costs no work at all rather than a whole interval. That is
+/// also why the row is keyed by (worker, minute) instead of carrying a
+/// sequence — two flushes for the same minute are the normal case, not an
+/// error to detect.
+fn write_ledger_minute(
+    conn: &Connection,
+    minute_ts: u64,
+    entries: &[LedgerEntry],
+    worker_ids: &mut std::collections::HashMap<String, i64>,
+) -> Result<(), rusqlite::Error> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO share_intervals (worker_id, ts, work, accepted, rejected)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(worker_id, ts) DO UPDATE SET
+               work = work + excluded.work,
+               accepted = accepted + excluded.accepted,
+               rejected = rejected + excluded.rejected",
+        )?;
+        for entry in entries {
+            let worker_id = match worker_ids.get(&entry.worker) {
+                Some(id) => *id,
+                None => {
+                    let Some(id) = resolve_worker_id(&tx, &entry.worker, minute_ts)? else {
+                        continue;
+                    };
+                    worker_ids.insert(entry.worker.clone(), id);
+                    id
+                }
+            };
+            stmt.execute(params![
+                worker_id,
+                minute_ts,
+                entry.work,
+                entry.accepted,
+                entry.rejected
+            ])?;
+        }
+    }
+    tx.commit()
+}
+
+/// Fold minute rows older than `LEDGER_FINE_RETENTION_SECS` into hourly ones.
+///
+/// Summation, so the rollup is lossless in every quantity the ledger records —
+/// only time resolution goes. Insert and delete share one transaction: the two
+/// tables are read as a single series (`get_work_history` unions them), and a
+/// crash between the halves would either double-count an hour or lose it.
+fn roll_up_ledger(conn: &Connection, now: u64) -> Result<(), rusqlite::Error> {
+    let cutoff = now.saturating_sub(LEDGER_FINE_RETENTION_SECS);
+    // Whole hours only: rolling up a partially-elapsed hour would have the
+    // next pass insert the same hour again, and the accumulate-on-conflict
+    // below cannot tell that apart from a genuine second contribution.
+    let cutoff = cutoff / 3_600 * 3_600;
+    let due: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM share_intervals WHERE ts < ?1",
+        params![cutoff],
+        |row| row.get(0),
+    )?;
+    if due == 0 {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO share_intervals_hourly (worker_id, ts, work, accepted, rejected)
+         SELECT worker_id, (ts / 3600) * 3600, SUM(work), SUM(accepted), SUM(rejected)
+         FROM share_intervals
+         WHERE ts < ?1
+         GROUP BY worker_id, (ts / 3600) * 3600
+         ON CONFLICT(worker_id, ts) DO UPDATE SET
+           work = work + excluded.work,
+           accepted = accepted + excluded.accepted,
+           rejected = rejected + excluded.rejected",
+        params![cutoff],
+    )?;
+    let rolled = tx.execute("DELETE FROM share_intervals WHERE ts < ?1", params![cutoff])?;
+    tx.commit()?;
+    info!("Rolled up {rolled} ledger minute rows into hourly totals");
     Ok(())
 }
 
@@ -1011,7 +1511,7 @@ fn write_snapshot(
         rates,
         worker_rates,
         share_totals,
-        lifetime_reject_reasons,
+        round_reject_reasons,
         round_work,
         round_epoch: _,
         share_rates,
@@ -1063,30 +1563,25 @@ fn write_snapshot(
         // Share stats are round-scoped: a snapshot assembled before a round
         // reset the writer has already applied must not re-persist them.
         if !stale_round {
-            tx.execute(
-                "INSERT OR REPLACE INTO share_history (ts, shares_accepted, shares_rejected)
-                 VALUES (?1, ?2, ?3)",
-                params![history_ts, share_totals.accepted, share_totals.rejected],
-            )?;
             // Scalar MAX keeps the persisted totals monotonic within a round,
             // same idea as the watermark guards in `apply_write`: the baseline
             // the next boot restores must never regress, whatever order queued
             // snapshots land in.
             tx.execute(
-                "UPDATE pool_stats SET
-                   lifetime_shares_accepted = MAX(lifetime_shares_accepted, ?1),
-                   lifetime_shares_rejected = MAX(lifetime_shares_rejected, ?2),
-                   round_work = MAX(round_work, ?3)
+                "UPDATE round_stats SET
+                   shares_accepted = MAX(shares_accepted, ?1),
+                   shares_rejected = MAX(shares_rejected, ?2),
+                   work = MAX(work, ?3)
                  WHERE id = 1",
                 params![share_totals.accepted, share_totals.rejected, round_work],
             )?;
 
             {
                 let mut stmt = tx.prepare(
-                    "INSERT INTO pool_reject_reasons (reason, count) VALUES (?1, ?2)
+                    "INSERT INTO round_reject_reasons (reason, count) VALUES (?1, ?2)
                      ON CONFLICT(reason) DO UPDATE SET count = MAX(count, excluded.count)",
                 )?;
-                for (reason, count) in lifetime_reject_reasons {
+                for (reason, count) in round_reject_reasons {
                     stmt.execute(params![reason, count])?;
                 }
             }
@@ -1128,36 +1623,14 @@ fn write_snapshot(
         tx.commit()?;
     }
 
-    // Thin samples past the fine-grained retention down to one a minute.
-    // Charts covering more than a couple of days bucket at 5 minutes or
-    // coarser anyway, so the extra resolution buys nothing while the row
-    // count grows by SNAPSHOT_INTERVAL_SECS⁻¹ every second.
-    let fine_cutoff = history_ts.saturating_sub(FINE_HISTORY_RETENTION_SECS);
-    conn.execute(
-        "DELETE FROM hashrate_history WHERE ts < ?1 AND ts % 60 != 0",
-        params![fine_cutoff],
-    )?;
-    // Prune entries older than 6 months
-    let cutoff = history_ts.saturating_sub(6 * 30 * 24 * 3600);
+    // These two tables only back the short chart ranges now — anything longer
+    // is summed exactly from the ledger, which keeps its own retention. So they
+    // are dropped wholesale past the horizon rather than thinned: a decayed
+    // sample surviving at one-a-minute resolution has no reader.
+    let cutoff = history_ts.saturating_sub(FINE_HISTORY_RETENTION_SECS);
     conn.execute(
         "DELETE FROM hashrate_history WHERE ts < ?1",
         params![cutoff],
-    )?;
-
-    // The share series lives on the same grid with the same retention. Rows
-    // are cumulative, so thinning drops resolution, not counts.
-    conn.execute(
-        "DELETE FROM share_history WHERE ts < ?1 AND ts % 60 != 0",
-        params![fine_cutoff],
-    )?;
-    conn.execute("DELETE FROM share_history WHERE ts < ?1", params![cutoff])?;
-
-    // Same grid, same retention again. Unlike `share_history` these rows are
-    // averages rather than running totals, so thinning them loses the same
-    // detail the hashrate series loses — no more.
-    conn.execute(
-        "DELETE FROM share_rate_history WHERE ts < ?1 AND ts % 60 != 0",
-        params![fine_cutoff],
     )?;
     conn.execute(
         "DELETE FROM share_rate_history WHERE ts < ?1",
@@ -1166,18 +1639,40 @@ fn write_snapshot(
     Ok(())
 }
 
-/// Keep only the `keep` highest-difficulty rows in `worker_best_shares`.
+/// Zero every round-scoped table, stamping when the new round began. One
+/// transaction: a partially-applied reset retried later is harmless (every
+/// statement is idempotent), but the boot reconciliation below reads these
+/// tables as a unit and must never see half a reset.
+fn apply_round_reset(conn: &Connection, since_ts: u64) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE round_stats SET
+           shares_accepted = 0,
+           shares_rejected = 0,
+           work = 0,
+           best_share_difficulty = 0,
+           best_hashrate_hps = 0.0,
+           since_ts = ?1
+         WHERE id = 1",
+        params![since_ts],
+    )?;
+    tx.execute("DELETE FROM round_reject_reasons", [])?;
+    tx.execute("DELETE FROM round_worker_best_shares", [])?;
+    tx.commit()
+}
+
+/// Keep only the `keep` highest-difficulty rows in `round_worker_best_shares`.
 fn prune_worker_best_shares(conn: &Connection, keep: usize) {
     match conn.execute(
-        "DELETE FROM worker_best_shares WHERE worker NOT IN (
-           SELECT worker FROM worker_best_shares
+        "DELETE FROM round_worker_best_shares WHERE worker NOT IN (
+           SELECT worker FROM round_worker_best_shares
            ORDER BY best_share_difficulty DESC LIMIT ?1
          )",
         params![keep as i64],
     ) {
         Ok(0) => {}
-        Ok(n) => info!("Pruned {n} stale worker_best_shares rows (cap {keep})"),
-        Err(e) => warn!("Failed to prune worker_best_shares: {e}"),
+        Ok(n) => info!("Pruned {n} stale round_worker_best_shares rows (cap {keep})"),
+        Err(e) => warn!("Failed to prune round_worker_best_shares: {e}"),
     }
 }
 
@@ -1188,12 +1683,16 @@ fn prune_worker_best_shares(conn: &Connection, keep: usize) {
 pub struct PoolStats {
     shares_accepted: AtomicU64,
     shares_rejected: AtomicU64,
+    /// Inbound messages dropped by the per-connection rate limiter, this boot.
+    /// Not a share statistic: the limiter fires on any message type, so these
+    /// stay out of the reject counts and the ledger entirely.
+    rate_limited_drops: AtomicU64,
     /// Accepted/rejected totals carried over from previous runs. The atomics
     /// above count this boot only; anything round-facing goes through
-    /// `lifetime_shares_accepted()`/`..rejected()` = base + atomic − round
+    /// `round_shares_accepted()`/`..rejected()` = base + atomic − round
     /// offset. Immutable after construction, so plain integers.
-    lifetime_accepted_base: u64,
-    lifetime_rejected_base: u64,
+    round_accepted_base: u64,
+    round_rejected_base: u64,
     /// Value of base + atomic captured at the last round reset, so the
     /// displayed totals restart at zero while the boot counters keep serving
     /// the session cards. Zero until a block is found this boot.
@@ -1209,14 +1708,14 @@ pub struct PoolStats {
     /// Unix time the current round's accounting began: DB creation, then the
     /// last found block. Boot time when no stats DB is configured, so the
     /// totals above still read coherently.
-    stats_since_ts: AtomicU64,
+    round_since_ts: AtomicU64,
     /// This boot's rejects by reason, pool-wide. Keys are the closed reject
     /// label set, so cardinality is bounded; a mutex is fine because rejects
     /// are the exception on the share path.
     reject_reasons: Mutex<BTreeMap<&'static str, u64>>,
     /// Rejects by reason carried over from previous runs; same baseline
     /// arrangement as the share totals above. Immutable after construction.
-    lifetime_reject_reasons_base: BTreeMap<String, u64>,
+    round_reject_reasons_base: BTreeMap<String, u64>,
     /// Merged reason counts captured at the last round reset — the per-reason
     /// analogue of `round_offset_accepted`.
     round_offset_reject_reasons: Mutex<BTreeMap<String, u64>>,
@@ -1272,6 +1771,11 @@ pub struct PoolStats {
     /// idle — there is only the one, and a quiet pool should read zero rather
     /// than disappear.
     share_rate: Mutex<hashrate::HashrateDecay>,
+    /// Shares accumulated for the ledger minute currently open. The share path
+    /// only adds here; whole minutes are handed to the writer thread as they
+    /// close. This is the staging area for the pool's durable record, so unlike
+    /// every other map here it is not evicted, rebuilt, or reset by a round.
+    ledger: Mutex<LedgerAccum>,
     worker_protocol: DashMap<String, String>,
     worker_last_submit_ts: DashMap<String, u64>,
     worker_best_shares: DashMap<String, u64>,
@@ -1319,9 +1823,13 @@ pub struct WorkerState {
     pub hashrate_24h_hps: f64,
 }
 
-/// Everything read back from the stats DB at boot. Each failure mode degrades
-/// to "no persistence" with a warning rather than taking the pool down: a
-/// corrupt or unwritable stats file must never stop miners from hashing.
+/// Everything read back from the stats DB at boot.
+///
+/// `load` refuses a file it cannot open or read the core values from — the
+/// production boot (`open_recording`) propagates that so the operator learns
+/// immediately, instead of the pool running for months while recording
+/// nothing. The remaining loaders degrade per-table with a warning: their
+/// store is demonstrably usable, so partial state loss beats no persistence.
 #[derive(Default)]
 struct Persisted {
     store: Option<StatsStore>,
@@ -1333,10 +1841,10 @@ struct Persisted {
     blocks_found: u64,
     blocks_orphaned: u64,
     blocks_inconclusive: u64,
-    lifetime_share_totals: ShareTotals,
-    stats_since_ts: u64,
+    round_share_totals: ShareTotals,
+    round_since_ts: u64,
     round_work: u64,
-    lifetime_reject_reasons: BTreeMap<String, u64>,
+    round_reject_reasons: BTreeMap<String, u64>,
     /// Checkpointed pool share rate: when it was written, and the per-window
     /// shares/min at that moment. `None` when the table has no row yet, which
     /// is every boot before this feature existed.
@@ -1344,22 +1852,9 @@ struct Persisted {
 }
 
 impl Persisted {
-    fn load(path: &str) -> Self {
-        let store = match StatsStore::open(path) {
-            Ok(store) => store,
-            Err(e) => {
-                warn!("Failed to open stats DB {path}: {e}");
-                return Self::default();
-            }
-        };
-        let (best_share_difficulty, best_hashrate_hps, worker_best_shares) =
-            match store.load_values() {
-                Ok(values) => values,
-                Err(e) => {
-                    warn!("Failed to load stats from DB {path}: {e}");
-                    return Self::default();
-                }
-            };
+    fn load(path: &str) -> Result<Self, rusqlite::Error> {
+        let store = StatsStore::open(path)?;
+        let (best_share_difficulty, best_hashrate_hps, worker_best_shares) = store.load_values()?;
         let hashrates = store.load_hashrate_state().unwrap_or_else(|e| {
             warn!("Failed to restore hashrates from DB {path}: {e}");
             Vec::new()
@@ -1373,12 +1868,12 @@ impl Persisted {
                 warn!("Failed to restore block counts from DB {path}: {e}");
                 (0, 0, 0)
             });
-        let (lifetime_share_totals, stats_since_ts, round_work) =
-            store.load_lifetime_stats().unwrap_or_else(|e| {
+        let (round_share_totals, round_since_ts, round_work) =
+            store.load_round_stats().unwrap_or_else(|e| {
                 warn!("Failed to restore share totals from DB {path}: {e}");
                 (ShareTotals::default(), 0, 0)
             });
-        let lifetime_reject_reasons = store.load_reject_reasons().unwrap_or_else(|e| {
+        let round_reject_reasons = store.load_reject_reasons().unwrap_or_else(|e| {
             warn!("Failed to restore reject reasons from DB {path}: {e}");
             BTreeMap::new()
         });
@@ -1392,7 +1887,7 @@ impl Persisted {
                 pending_blocks.len()
             );
         }
-        Self {
+        Ok(Self {
             store: Some(store),
             best_share_difficulty,
             best_hashrate_hps,
@@ -1402,16 +1897,33 @@ impl Persisted {
             blocks_found,
             blocks_orphaned,
             blocks_inconclusive,
-            lifetime_share_totals,
-            stats_since_ts,
+            round_share_totals,
+            round_since_ts,
             round_work,
-            lifetime_reject_reasons,
+            round_reject_reasons,
             share_rate,
-        }
+        })
     }
 }
 
 impl PoolStats {
+    /// The production constructor: a configured path must yield a working
+    /// store, or the error goes to the caller and boot stops. A pool that
+    /// silently runs without the ledger it was told to keep looks healthy
+    /// right up until the operator asks where their history went. Deleting or
+    /// moving the refused file is the recovery — there is no migration path.
+    pub fn open_recording(stats_db_path: &str) -> Result<Arc<Self>, rusqlite::Error> {
+        let persisted = Persisted::load(stats_db_path)?;
+        Ok(Self::from_persisted(
+            persisted,
+            Self::now_secs(),
+            Instant::now(),
+        ))
+    }
+
+    /// Construct with best-effort persistence: an unusable path degrades to
+    /// running without a store, with a warning. For tests and tools; the
+    /// production boot uses `open_recording`.
     pub fn new_with_store(stats_db_path: Option<String>) -> Arc<Self> {
         Self::new_with_store_at(stats_db_path, Self::now_secs(), Instant::now())
     }
@@ -1421,6 +1933,20 @@ impl PoolStats {
         wall_now: u64,
         instant_now: Instant,
     ) -> Arc<Self> {
+        let persisted = stats_db_path
+            .filter(|p| !p.is_empty())
+            .and_then(|path| match Persisted::load(&path) {
+                Ok(persisted) => Some(persisted),
+                Err(e) => {
+                    warn!("Failed to open stats DB {path}: {e}");
+                    None
+                }
+            })
+            .unwrap_or_default();
+        Self::from_persisted(persisted, wall_now, instant_now)
+    }
+
+    fn from_persisted(persisted: Persisted, wall_now: u64, instant_now: Instant) -> Arc<Self> {
         let Persisted {
             store,
             best_share_difficulty,
@@ -1431,15 +1957,12 @@ impl PoolStats {
             blocks_found,
             blocks_orphaned,
             blocks_inconclusive,
-            lifetime_share_totals,
-            stats_since_ts,
+            round_share_totals,
+            round_since_ts,
             round_work,
-            lifetime_reject_reasons,
+            round_reject_reasons,
             share_rate: persisted_share_rate,
-        } = stats_db_path
-            .filter(|p| !p.is_empty())
-            .map(|path| Persisted::load(&path))
-            .unwrap_or_default();
+        } = persisted;
 
         let pending_blocks = DashMap::new();
         for block in persisted_pending_blocks {
@@ -1486,21 +2009,22 @@ impl PoolStats {
         Arc::new(Self {
             shares_accepted: AtomicU64::new(0),
             shares_rejected: AtomicU64::new(0),
-            lifetime_accepted_base: lifetime_share_totals.accepted,
-            lifetime_rejected_base: lifetime_share_totals.rejected,
+            rate_limited_drops: AtomicU64::new(0),
+            round_accepted_base: round_share_totals.accepted,
+            round_rejected_base: round_share_totals.rejected,
             round_offset_accepted: AtomicU64::new(0),
             round_offset_rejected: AtomicU64::new(0),
             round_work: AtomicU64::new(round_work),
             round_epoch: AtomicU64::new(0),
             // Zero covers every no-persistence path: `Persisted::default()`
             // and a DB the migration has not stamped yet.
-            stats_since_ts: AtomicU64::new(if stats_since_ts == 0 {
+            round_since_ts: AtomicU64::new(if round_since_ts == 0 {
                 wall_now
             } else {
-                stats_since_ts
+                round_since_ts
             }),
             reject_reasons: Mutex::new(BTreeMap::new()),
-            lifetime_reject_reasons_base: lifetime_reject_reasons,
+            round_reject_reasons_base: round_reject_reasons,
             round_offset_reject_reasons: Mutex::new(BTreeMap::new()),
             blocks_found: AtomicU64::new(blocks_found),
             blocks_inconclusive: AtomicU64::new(blocks_inconclusive),
@@ -1521,6 +2045,10 @@ impl PoolStats {
             session_hashrates,
             pending_shares: AtomicU64::new(0),
             share_rate: Mutex::new(share_rate),
+            ledger: Mutex::new(LedgerAccum {
+                minute_ts: wall_now / LEDGER_INTERVAL_SECS * LEDGER_INTERVAL_SECS,
+                pending: HashMap::new(),
+            }),
             worker_protocol: DashMap::new(),
             worker_last_submit_ts: DashMap::new(),
             worker_best_shares,
@@ -1575,24 +2103,134 @@ impl PoolStats {
             .fetch_max(hash_difficulty, Ordering::Relaxed);
     }
 
+    /// Add an accepted share to the ledger: `credit` difficulty of proven work
+    /// against `worker`.
+    ///
+    /// `credit` is the same value the hashrate estimator is fed
+    /// (`mining::credit`), never the share's actual hash difficulty — hash
+    /// difficulty is heavy-tailed (a share can land at 100× its target by
+    /// luck), so summing it would make the ledger's work totals a lottery
+    /// rather than a measurement. Summed credit is what converges to real work.
+    pub fn ledger_share_accepted(&self, worker: &str, credit: u64) {
+        self.record_ledger(worker, credit, 1, 0, Self::now_secs());
+    }
+
+    /// Add a rejected share to the ledger. Rejects carry no work — they are
+    /// counted so a device's reject ratio is recoverable over any past range,
+    /// which is the number that tells a fleet operator a rig is failing.
+    pub fn ledger_share_rejected(&self, worker: &str) {
+        self.record_ledger(worker, 0, 0, 1, Self::now_secs());
+    }
+
+    fn record_ledger(&self, worker: &str, work: u64, accepted: u64, rejected: u64, now: u64) {
+        if self.store.is_none() {
+            return;
+        }
+        // Only authorized identities get ledger rows. Rejects can arrive from a
+        // session that never authorized, carrying a placeholder name; a worker
+        // row is permanent, and its user dimension is a payout address, so a
+        // name that was never parsed as one must not create either.
+        if !self.worker_states.contains_key(worker) {
+            return;
+        }
+        let closed = {
+            let mut accum = self.ledger.lock();
+            let closed = accum.roll_to(now);
+            // The staging map needs no cap of its own: it only ever holds names
+            // already present in `worker_states`, which is the pool's ceiling on
+            // live identities, and it is emptied every minute. Capping it here
+            // instead would let a burst of new names crowd out an established
+            // worker whose first share of the minute happened to arrive later.
+            let entry = accum.pending.entry(worker.to_string()).or_default();
+            entry.work = entry.work.saturating_add(work);
+            entry.accepted = entry.accepted.saturating_add(accepted);
+            entry.rejected = entry.rejected.saturating_add(rejected);
+            closed
+        };
+        self.persist_ledger_minute(closed);
+    }
+
+    /// Close the open ledger minute if `now` has moved past it, and hand
+    /// whatever it holds to the writer thread. Called from the snapshot ticker
+    /// so a pool that goes quiet still persists its last minute promptly
+    /// instead of holding it until the next share arrives.
+    fn flush_ledger_at(&self, now: u64) {
+        if self.store.is_none() {
+            return;
+        }
+        let closed = self.ledger.lock().roll_to(now);
+        self.persist_ledger_minute(closed);
+    }
+
+    /// Persist the open minute even though it has not closed, without
+    /// disturbing the accumulator's boundary. Only for shutdown: the writer
+    /// accumulates on conflict, so the next run's flush of the same minute adds
+    /// to this partial row rather than replacing it.
+    fn flush_ledger_partial(&self) {
+        if self.store.is_none() {
+            return;
+        }
+        let closed = self.ledger.lock().take_open();
+        self.persist_ledger_minute(closed);
+    }
+
+    fn persist_ledger_minute(&self, closed: Option<(u64, Vec<LedgerEntry>)>) {
+        let (Some(store), Some((minute_ts, entries))) = (&self.store, closed) else {
+            return;
+        };
+        store.record_ledger_minute(minute_ts, entries);
+    }
+
+    /// Exact work/share totals per bucket over `[since, ∞)` for one scope.
+    /// Empty when no stats DB is configured.
+    pub fn work_history(
+        &self,
+        since_ts: u64,
+        bucket_secs: u64,
+        scope: LedgerScope<'_>,
+    ) -> Vec<WorkHistoryPoint> {
+        self.work_history_at(since_ts, bucket_secs, Self::now_secs(), scope)
+    }
+
+    /// `work_history` against an explicit clock. `now_ts` bounds the result to
+    /// buckets whose span has fully elapsed — a partial bucket under-reads.
+    pub fn work_history_at(
+        &self,
+        since_ts: u64,
+        bucket_secs: u64,
+        now_ts: u64,
+        scope: LedgerScope<'_>,
+    ) -> Vec<WorkHistoryPoint> {
+        self.store
+            .as_ref()
+            .map(|s| s.get_work_history(since_ts, bucket_secs, now_ts, scope))
+            .unwrap_or_default()
+    }
+
     /// `reason` must come from the closed reject label set
-    /// (`RejectReason::label()` or `"rate_limited"`) — it becomes a persisted
-    /// map key, so it must not be mintable from miner input.
+    /// (`RejectReason::label()`) — it becomes a persisted map key, so it must
+    /// not be mintable from miner input.
     pub fn share_rejected(&self, reason: &'static str) {
         self.shares_rejected.fetch_add(1, Ordering::Relaxed);
         *self.reject_reasons.lock().entry(reason).or_insert(0) += 1;
     }
 
+    /// Count a message dropped by the rate limiter. Not a share reject — the
+    /// limiter fires on any inbound message type.
+    pub fn message_rate_limited(&self) {
+        self.rate_limited_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Accepted shares since the last found block (pool lifetime until the
     /// first win): persisted base plus this boot, minus the round offset.
-    fn lifetime_shares_accepted(&self) -> u64 {
-        self.lifetime_accepted_base
+    fn round_shares_accepted(&self) -> u64 {
+        self.round_accepted_base
             .saturating_add(self.shares_accepted.load(Ordering::Relaxed))
             .saturating_sub(self.round_offset_accepted.load(Ordering::Relaxed))
     }
 
-    fn lifetime_shares_rejected(&self) -> u64 {
-        self.lifetime_rejected_base
+    fn round_shares_rejected(&self) -> u64 {
+        self.round_rejected_base
             .saturating_add(self.shares_rejected.load(Ordering::Relaxed))
             .saturating_sub(self.round_offset_rejected.load(Ordering::Relaxed))
     }
@@ -1608,8 +2246,8 @@ impl PoolStats {
 
     /// Rejects by reason since the last found block: the persisted baseline
     /// plus this boot, minus the counts captured at the last round reset.
-    fn lifetime_reject_reasons(&self) -> BTreeMap<String, u64> {
-        let mut merged = self.lifetime_reject_reasons_base.clone();
+    fn round_reject_reasons(&self) -> BTreeMap<String, u64> {
+        let mut merged = self.round_reject_reasons_base.clone();
         for (reason, count) in self.reject_reasons.lock().iter() {
             *merged.entry((*reason).to_string()).or_insert(0) += count;
         }
@@ -1632,21 +2270,20 @@ impl PoolStats {
     /// store. Session counters (this boot's cards) and the Prometheus
     /// counters, which must stay monotonic, are left alone.
     fn round_reset(&self) {
-        let epoch = self.round_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         let now = Self::now_secs();
         self.round_offset_accepted.store(
-            self.lifetime_accepted_base
+            self.round_accepted_base
                 .saturating_add(self.shares_accepted.load(Ordering::Relaxed)),
             Ordering::Relaxed,
         );
         self.round_offset_rejected.store(
-            self.lifetime_rejected_base
+            self.round_rejected_base
                 .saturating_add(self.shares_rejected.load(Ordering::Relaxed)),
             Ordering::Relaxed,
         );
         {
             let mut offsets = self.round_offset_reject_reasons.lock();
-            *offsets = self.lifetime_reject_reasons_base.clone();
+            *offsets = self.round_reject_reasons_base.clone();
             for (reason, count) in self.reject_reasons.lock().iter() {
                 *offsets.entry((*reason).to_string()).or_insert(0) += count;
             }
@@ -1654,11 +2291,19 @@ impl PoolStats {
         self.round_work.store(0, Ordering::Relaxed);
         self.best_share_difficulty.store(0, Ordering::Relaxed);
         self.best_hashrate_hps.store(0, Ordering::Relaxed);
-        self.stats_since_ts.store(now, Ordering::Relaxed);
+        self.round_since_ts.store(now, Ordering::Relaxed);
         self.worker_best_shares.clear();
         for mut state in self.worker_states.iter_mut() {
             state.best_share_difficulty = 0;
         }
+        // Bumped only after the offsets above are in place. A snapshot task
+        // interleaving reads its epoch first and its share totals second; were
+        // the epoch bumped first, a snapshot could carry the new epoch with
+        // pre-reset totals, pass the writer's staleness guard, and resurrect
+        // the finished round on disk. This order makes the failure mode the
+        // benign one — old epoch on already-zeroed stats, which the guard
+        // discards.
+        let epoch = self.round_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(store) = &self.store {
             store.round_reset(epoch, now);
         }
@@ -1858,7 +2503,8 @@ impl PoolStats {
         self.share_rate.lock().per_minute()
     }
 
-    /// Track all-time best (persistent) and session-best (since boot).
+    /// Track round-best (persistent, zeroed by a found block) and session-best
+    /// (since boot).
     ///
     /// `fetch_max` works directly on the bit patterns: for non-negative finite
     /// f64 the IEEE-754 encoding is monotonic, so comparing the bits as `u64`
@@ -2052,7 +2698,7 @@ impl PoolStats {
             info!("Evicted {} idle offline workers from stats", stale.len());
         }
 
-        // Best shares survive eviction (the dashboard still lists all-time
+        // Best shares survive eviction (the dashboard still lists the round's
         // bests), bounded by count so they can't grow without limit.
         if self.worker_best_shares.len() > MAX_WORKER_BEST_SHARES {
             let mut all: Vec<(String, u64)> = self
@@ -2075,6 +2721,10 @@ impl PoolStats {
     }
 
     fn record_hashrate_snapshot_at(&self, state_ts: u64) {
+        // Close the ledger minute if one ended since the last tick. Runs first
+        // so a quiet pool's final minute reaches the writer on the same pass
+        // that checkpoints the meters.
+        self.flush_ledger_at(state_ts);
         if let Some(store) = &self.store {
             // Snap to the sampling grid. The recorder's wall-clock timestamps
             // drift by however long a tick took, and two things downstream need
@@ -2083,9 +2733,11 @@ impl PoolStats {
             // which unsnapped timestamps would hit only by luck, thinning the
             // long-range history away to nothing.
             let history_ts = state_ts / SNAPSHOT_INTERVAL_SECS * SNAPSHOT_INTERVAL_SECS;
-            // Epoch before share stats: a reset landing in between leaves an
-            // old epoch on fresh (already-zeroed) stats, which the writer
-            // treats as stale and skips — never the reverse.
+            // Epoch before share stats, and `round_reset` bumps the epoch
+            // *after* zeroing them: whichever way a reset interleaves, this
+            // snapshot can only pair an old epoch with fresh stats — which the
+            // writer treats as stale and skips — never a new epoch with the
+            // finished round's totals.
             let round_epoch = self.round_epoch.load(Ordering::Relaxed);
             let by_worker = self.hashrates_by_worker();
             let mut total = HashrateWindows::default();
@@ -2098,10 +2750,10 @@ impl PoolStats {
                 rates: total,
                 worker_rates: by_worker,
                 share_totals: ShareTotals {
-                    accepted: self.lifetime_shares_accepted(),
-                    rejected: self.lifetime_shares_rejected(),
+                    accepted: self.round_shares_accepted(),
+                    rejected: self.round_shares_rejected(),
                 },
-                lifetime_reject_reasons: self.lifetime_reject_reasons(),
+                round_reject_reasons: self.round_reject_reasons(),
                 round_work: self.round_work.load(Ordering::Relaxed),
                 round_epoch,
                 share_rates: self.share_rate_windows(),
@@ -2117,6 +2769,10 @@ impl PoolStats {
     /// production.
     pub fn shutdown_persist(&self) {
         self.record_hashrate_snapshot();
+        // The minute in progress has not closed, but the work in it is real and
+        // the writer merges it with whatever the next run records for the same
+        // minute — so a restart costs no work rather than up to a minute of it.
+        self.flush_ledger_partial();
         if let Some(store) = &self.store {
             store.flush();
         }
@@ -2224,8 +2880,8 @@ impl PoolStats {
             })
             .collect();
 
-        // Workers with no live `WorkerState`: those known only by an all-time
-        // best share, and those restored from the hashrate checkpoint that have
+        // Workers with no live `WorkerState`: those known only by a round-best
+        // share, and those restored from the hashrate checkpoint that have
         // not reconnected yet. The latter still contribute a decaying tail to
         // the pool total, so the table has to show it rather than a zero row.
         let extra_workers = self
@@ -2283,11 +2939,12 @@ impl PoolStats {
         StatsSnapshot {
             shares_accepted: self.shares_accepted.load(Ordering::Relaxed),
             shares_rejected: self.shares_rejected.load(Ordering::Relaxed),
-            lifetime_shares_accepted: self.lifetime_shares_accepted(),
-            lifetime_shares_rejected: self.lifetime_shares_rejected(),
-            stats_since_ts: self.stats_since_ts.load(Ordering::Relaxed),
+            round_shares_accepted: self.round_shares_accepted(),
+            round_shares_rejected: self.round_shares_rejected(),
+            round_since_ts: self.round_since_ts.load(Ordering::Relaxed),
             reject_reasons: self.session_reject_reasons(),
-            lifetime_reject_reasons: self.lifetime_reject_reasons(),
+            rate_limited_drops: self.rate_limited_drops.load(Ordering::Relaxed),
+            round_reject_reasons: self.round_reject_reasons(),
             blocks_found: self.blocks_found.load(Ordering::Relaxed),
             blocks_inconclusive: self.blocks_inconclusive.load(Ordering::Relaxed),
             blocks_orphaned: self.blocks_orphaned.load(Ordering::Relaxed),
@@ -2348,23 +3005,23 @@ impl PoolStats {
 pub struct StatsSnapshot {
     pub shares_accepted: u64,
     pub shares_rejected: u64,
-    /// Totals since the pool's last found block (`stats_since_ts` onward) —
-    /// its whole recorded life until the first win; the pair above counts this
-    /// process only. Identical to that pair when no stats DB is configured.
-    pub lifetime_shares_accepted: u64,
-    pub lifetime_shares_rejected: u64,
+    /// Round totals: since the pool's last found block (`round_since_ts`
+    /// onward) — its whole recorded life until the first win. The pair above
+    /// counts this process only; identical when no stats DB is configured.
+    pub round_shares_accepted: u64,
+    pub round_shares_rejected: u64,
     /// Unix time the current round's accounting began: DB creation, then the
     /// last found block.
-    pub stats_since_ts: u64,
+    pub round_since_ts: u64,
     /// This process's pool-wide rejects by reason. Unlike the per-worker
-    /// breakdowns in `worker_states`, this also counts rejects that never
-    /// attached to a known worker (pre-auth rate limiting) and survives
-    /// worker eviction.
+    /// breakdowns in `worker_states`, this survives worker eviction.
     pub reject_reasons: BTreeMap<String, u64>,
-    /// Rejects by reason since the last found block. Reasons were introduced
-    /// after the share totals, so their sum can trail
-    /// `lifetime_shares_rejected` on pools with older history.
-    pub lifetime_reject_reasons: BTreeMap<String, u64>,
+    /// Messages dropped by the per-connection rate limiter, this boot. Kept
+    /// apart from the share rejects: the limiter fires on any message type,
+    /// so folding these in would corrupt every reject ratio.
+    pub rate_limited_drops: u64,
+    /// The round's rejects by reason.
+    pub round_reject_reasons: BTreeMap<String, u64>,
     /// Wins that have survived so far: decremented when the confirmation pass
     /// finds one was reorged out. The Prometheus counter of the same name
     /// cannot go down, so the two differ by `blocks_orphaned`.
@@ -2382,6 +3039,8 @@ pub struct StatsSnapshot {
     /// Version of the current block template. The dashboard fills this from
     /// the TemplateEngine; other snapshot consumers receive zero.
     pub template_version: u32,
+    /// Round-scoped bests, zeroed by a found block; the `session_*` pair is
+    /// this boot only.
     pub best_share_difficulty: u64,
     pub session_best_share_difficulty: u64,
     pub best_hashrate_hps: f64,
@@ -2647,103 +3306,67 @@ mod tests {
         std::fs::remove_file(db_path).ok();
     }
 
+    /// A file from another schema is refused, not upgraded and not silently
+    /// written over. The pool then runs without persistence, which is the same
+    /// degradation an unreadable file already gets: miners keep hashing, and
+    /// the operator is told to move the file aside.
     #[test]
-    fn legacy_hashrate_history_migrates_without_inventing_windows() {
+    fn a_foreign_schema_version_is_refused() {
         let db_path = make_temp_db();
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute(
-                "CREATE TABLE hashrate_history (
-                   ts INTEGER PRIMARY KEY,
-                   hashrate_hps REAL NOT NULL
-                 )",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO hashrate_history (ts, hashrate_hps) VALUES (120, 42.0)",
-                [],
-            )
-            .unwrap();
-            // Already recorded by the current estimator, so the algo migration
-            // has no reason to discard these rows — this test is only about the
-            // column migration not inventing values for the missing windows.
-            conn.execute(
                 "CREATE TABLE pool_stats (
                    id INTEGER PRIMARY KEY CHECK(id = 1),
                    best_share_difficulty INTEGER NOT NULL,
-                   best_hashrate_hps REAL NOT NULL,
-                   hashrate_algo_version INTEGER NOT NULL DEFAULT 0
+                   best_hashrate_hps REAL NOT NULL
                  )",
                 [],
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO pool_stats
-                   (id, best_share_difficulty, best_hashrate_hps, hashrate_algo_version)
-                 VALUES (1, 0, 0.0, ?1)",
-                params![HASHRATE_ALGO_VERSION],
-            )
-            .unwrap();
+            conn.execute("INSERT INTO pool_stats VALUES (1, 7, 0.0)", [])
+                .unwrap();
         }
 
+        // The production boot path refuses to start on this file.
+        assert!(PoolStats::open_recording(&db_path).is_err());
+        // Refused means untouched: the old row is still there for whoever wants
+        // to read it with sqlite3 before deleting the file.
+        let conn = Connection::open(&db_path).unwrap();
+        let best: i64 = conn
+            .query_row("SELECT best_share_difficulty FROM pool_stats", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(best, 7);
+        drop(conn);
+
+        // The best-effort constructor still degrades to no store, for tests.
         let stats = PoolStats::new_with_store(Some(db_path.clone()));
-        let history = stats.get_hashrate_history(0, 60);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].ten_minutes, Some(42.0));
-        assert_eq!(history[0].one_minute, None);
-        assert_eq!(history[0].five_minutes, None);
-        assert_eq!(history[0].one_hour, None);
-        assert_eq!(history[0].six_hours, None);
-        assert_eq!(history[0].twenty_four_hours, None);
+        assert!(stats.store.is_none());
 
         drop(stats);
         std::fs::remove_file(db_path).ok();
     }
 
-    /// History written by a sliding-window estimator is not comparable
-    /// with the decaying averages, and its spikes would pin the chart's y-axis
-    /// and the all-time watermark forever. Opening such a DB must clear both.
+    /// A file this build wrote is reopened without complaint, and one SQLite
+    /// has only just created is stamped rather than rejected.
     #[test]
-    fn upgrading_the_estimator_discards_incomparable_history() {
+    fn a_fresh_file_is_stamped_and_reopens_cleanly() {
         let db_path = make_temp_db();
         {
             let store = StatsStore::open(&db_path).unwrap();
             store.set_best_hashrate_hps(60.0 * TH);
-            let worker_rates =
-                HashMap::from([("axe".to_string(), HashrateWindows::uniform(949.0e15))]);
-            store.record_hashrate_snapshot(SnapshotWrite {
-                history_ts: 120,
-                state_ts: 120,
-                rates: HashrateWindows::uniform(949.0e15),
-                worker_rates: worker_rates.clone(),
-                ..Default::default()
-            });
-            // Pretend it was written before the estimator changed.
-            store.flush();
-            store
-                .read
-                .lock()
-                .execute(
-                    "UPDATE pool_stats SET hashrate_algo_version = 0 WHERE id = 1",
-                    [],
-                )
-                .unwrap();
-            assert_eq!(store.get_hashrate_history(0, 60).len(), 1);
         }
+        let conn = Connection::open(&db_path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(conn);
 
         let stats = PoolStats::new_with_store(Some(db_path.clone()));
-        assert!(stats.get_hashrate_history(0, 60).is_empty());
-        assert!(stats.session_hashrates.is_empty());
-        assert_eq!(stats.snapshot().best_hashrate_hps, 0.0);
-
-        // Second open is a no-op: the version now matches.
-        drop(stats);
-        let stats = PoolStats::new_with_store(Some(db_path.clone()));
-        stats.record_best_hashrate(3.0 * TH);
-        drop(stats);
-        let stats = PoolStats::new_with_store(Some(db_path.clone()));
-        assert_eq!(stats.snapshot().best_hashrate_hps, 3.0 * TH);
+        assert_eq!(stats.snapshot().best_hashrate_hps, 60.0 * TH);
 
         drop(stats);
         std::fs::remove_file(db_path).ok();
@@ -2778,13 +3401,11 @@ mod tests {
         std::fs::remove_file(db_path).ok();
     }
 
-    /// Sampling every 10s would put ~1.5M rows in the table over the six-month
-    /// retention, so anything past the fine-grained horizon is thinned to one
-    /// row a minute. This only works because recorded timestamps are snapped to
-    /// the sampling grid — with drifting wall-clock values the `ts % 60` filter
-    /// would match almost nothing and delete the entire long-range history.
+    /// The decayed series only backs the live chart ranges now, so it is
+    /// dropped wholesale past its horizon rather than thinned: everything
+    /// longer is summed exactly from the ledger, which keeps its own retention.
     #[test]
-    fn samples_past_the_fine_horizon_are_thinned_to_one_a_minute() {
+    fn decayed_samples_are_dropped_past_their_horizon() {
         let db_path = make_temp_db();
         let store = StatsStore::open(&db_path).unwrap();
 
@@ -2821,18 +3442,28 @@ mod tests {
             .iter()
             .map(|p| p.ts)
             .collect();
-        assert_eq!(kept, vec![base, base + 60, now]);
+        assert_eq!(kept, vec![now]);
+        // The share-rate series shares the horizon; a survivor there would mean
+        // one of the two tables is growing without a reader.
+        assert_eq!(
+            store
+                .get_share_rate_history(0, SNAPSHOT_INTERVAL_SECS)
+                .iter()
+                .map(|p| p.ts)
+                .collect::<Vec<u64>>(),
+            vec![now]
+        );
 
         drop(store);
         std::fs::remove_file(db_path).ok();
     }
 
     #[test]
-    fn lifetime_share_totals_survive_restart() {
+    fn round_share_totals_survive_restart() {
         let db_path = make_temp_db();
         {
             let stats = PoolStats::new_with_store(Some(db_path.clone()));
-            assert!(stats.snapshot().stats_since_ts > 0);
+            assert!(stats.snapshot().round_since_ts > 0);
             for _ in 0..3 {
                 stats.share_accepted(1_000, 1_000);
             }
@@ -2846,26 +3477,23 @@ mod tests {
         // rather than re-stamp "now".
         Connection::open(&db_path)
             .unwrap()
-            .execute(
-                "UPDATE pool_stats SET stats_since_ts = 111 WHERE id = 1",
-                [],
-            )
+            .execute("UPDATE round_stats SET since_ts = 111 WHERE id = 1", [])
             .unwrap();
 
         {
             let stats = PoolStats::new_with_store(Some(db_path.clone()));
             let snap = stats.snapshot();
-            // Boot counters restart at zero; the lifetime pair carries on.
+            // Boot counters restart at zero; the round pair carries on.
             assert_eq!(snap.shares_accepted, 0);
             assert_eq!(snap.shares_rejected, 0);
-            assert_eq!(snap.lifetime_shares_accepted, 3);
-            assert_eq!(snap.lifetime_shares_rejected, 2);
-            assert_eq!(snap.stats_since_ts, 111);
+            assert_eq!(snap.round_shares_accepted, 3);
+            assert_eq!(snap.round_shares_rejected, 2);
+            assert_eq!(snap.round_since_ts, 111);
             // The reason breakdown restores alongside the totals; this boot
             // has rejected nothing yet.
             assert!(snap.reject_reasons.is_empty());
-            assert_eq!(snap.lifetime_reject_reasons.get("stale"), Some(&1));
-            assert_eq!(snap.lifetime_reject_reasons.get("duplicate"), Some(&1));
+            assert_eq!(snap.round_reject_reasons.get("stale"), Some(&1));
+            assert_eq!(snap.round_reject_reasons.get("duplicate"), Some(&1));
 
             stats.share_accepted(1_000, 1_000);
             stats.record_hashrate_snapshot_at(130);
@@ -2873,193 +3501,680 @@ mod tests {
 
         let stats = PoolStats::new_with_store(Some(db_path.clone()));
         let snap = stats.snapshot();
-        assert_eq!(snap.lifetime_shares_accepted, 4);
-        assert_eq!(snap.lifetime_shares_rejected, 2);
-        assert_eq!(snap.stats_since_ts, 111);
+        assert_eq!(snap.round_shares_accepted, 4);
+        assert_eq!(snap.round_shares_rejected, 2);
+        assert_eq!(snap.round_since_ts, 111);
 
         drop(stats);
         std::fs::remove_file(db_path).ok();
     }
 
-    /// A DB from before the lifetime counters existed gains the columns on
-    /// open, keeps its watermarks, and gets its inception stamped.
+    /// The lifetime counters start from the moment the file was created, not
+    /// from zero-the-epoch, so "shares since" on a fresh pool reads as today
+    /// rather than 1970.
     #[test]
-    fn share_stats_migration_adds_columns_to_existing_db() {
+    fn a_new_db_stamps_its_own_inception() {
         let db_path = make_temp_db();
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute(
-                "CREATE TABLE pool_stats (
-                   id INTEGER PRIMARY KEY CHECK(id = 1),
-                   best_share_difficulty INTEGER NOT NULL,
-                   best_hashrate_hps REAL NOT NULL,
-                   hashrate_algo_version INTEGER NOT NULL DEFAULT 0
-                 )",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO pool_stats
-                   (id, best_share_difficulty, best_hashrate_hps, hashrate_algo_version)
-                 VALUES (1, 7, 0.0, ?1)",
-                params![HASHRATE_ALGO_VERSION],
-            )
-            .unwrap();
-        }
-
         let before = PoolStats::now_secs();
         let stats = PoolStats::new_with_store(Some(db_path.clone()));
         let snap = stats.snapshot();
-        assert_eq!(snap.best_share_difficulty, 7);
-        assert_eq!(snap.lifetime_shares_accepted, 0);
-        assert_eq!(snap.lifetime_shares_rejected, 0);
-        assert!(snap.stats_since_ts >= before);
+        assert_eq!(snap.round_shares_accepted, 0);
+        assert_eq!(snap.round_shares_rejected, 0);
+        assert!(snap.round_since_ts >= before);
 
-        // And the new write path works against the migrated schema.
         stats.share_accepted(1_000, 1_000);
         stats.record_hashrate_snapshot_at(120);
         drop(stats);
 
         let stats = PoolStats::new_with_store(Some(db_path.clone()));
-        assert_eq!(stats.snapshot().lifetime_shares_accepted, 1);
+        assert_eq!(stats.snapshot().round_shares_accepted, 1);
 
         drop(stats);
         std::fs::remove_file(db_path).ok();
     }
 
+    // ── Share ledger ─────────────────────────────────────────────────────────
+
+    const ADDRESS: &str = "bc1qexampleaddress";
+
+    /// A stats instance whose ledger clock starts at `start_ts`, with `workers`
+    /// authorized — which is what gates a name into the ledger.
+    ///
+    /// The start matters: the accumulator opens the minute containing it, and
+    /// a share stamped before that minute is treated as a backwards clock step.
+    fn ledger_stats(db_path: &str, start_ts: u64, workers: &[&str]) -> Arc<PoolStats> {
+        let stats =
+            PoolStats::new_with_store_at(Some(db_path.to_string()), start_ts, Instant::now());
+        for worker in workers {
+            stats.mark_worker_online(worker, 1_024);
+        }
+        stats
+    }
+
+    /// Feed `count` accepted shares of `credit` each, stamped inside the minute
+    /// containing `at`. Deliberately does not flush: several workers share a
+    /// minute, and closing it after the first would make the rest look like a
+    /// backwards clock step.
+    fn ledger_shares(stats: &PoolStats, worker: &str, credit: u64, count: u64, at: u64) {
+        for _ in 0..count {
+            stats.record_ledger(worker, credit, 1, 0, at);
+        }
+    }
+
+    /// Close every minute up to `at` and drain the writer queue, so the ledger
+    /// is readable.
+    fn ledger_flush(stats: &PoolStats, at: u64) {
+        stats.flush_ledger_at(at);
+        stats.store.as_ref().unwrap().flush();
+    }
+
+    /// The ledger's whole purpose: summed credit recovers the true average
+    /// hashrate over any span exactly, with no estimator in the path.
     #[test]
-    fn share_history_records_cumulative_series_on_the_snapshot_grid() {
+    fn ledger_work_sums_to_the_true_average_hashrate() {
         let db_path = make_temp_db();
-        let stats = PoolStats::new_with_store(Some(db_path.clone()));
+        let stats = ledger_stats(&db_path, 600, &[ADDRESS]);
 
-        stats.share_accepted(1_000, 1_000);
-        stats.share_accepted(1_000, 1_000);
-        stats.share_rejected("stale");
-        // 125 snaps to the 120 grid line, like the recorder's drifting ticks.
-        stats.record_hashrate_snapshot_at(125);
+        // 10 TH/s for one minute at difficulty 2048: work = rate × secs / 2³².
+        let credit = 2_048;
+        let expected_hps = 10.0e12;
+        let shares = (expected_hps * 60.0 / hashrate::NONCES / credit as f64).round() as u64;
+        ledger_shares(&stats, ADDRESS, credit, shares, 600);
+        ledger_flush(&stats, 660);
 
-        stats.share_accepted(1_000, 1_000);
-        stats.record_hashrate_snapshot_at(130);
+        let points = stats.work_history(0, 60, LedgerScope::Pool);
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].ts, 600);
+        assert_eq!(points[0].accepted, shares);
 
-        let store = stats.store.as_ref().unwrap();
-        store.flush();
-        let rows: Vec<(u64, u64, u64)> = {
-            let conn = store.read.lock();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT ts, shares_accepted, shares_rejected FROM share_history ORDER BY ts",
-                )
-                .unwrap();
-            let rows = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .unwrap()
-                .map(|r| r.unwrap())
-                .collect();
-            rows
-        };
-        assert_eq!(rows, vec![(120, 2, 1), (130, 3, 1)]);
+        let hps = points[0].work as f64 * hashrate::NONCES / 60.0;
+        let error = (hps - expected_hps).abs() / expected_hps;
+        assert!(
+            error < 0.01,
+            "ledger read {hps:e} H/s against a true {expected_hps:e} H/s"
+        );
 
         drop(stats);
         std::fs::remove_file(db_path).ok();
     }
 
+    /// Work is additive across workers → users → pool, which is what makes one
+    /// ledger serve every scope. A per-worker query must also not leak its
+    /// sibling's rows, the failure that would make a device page silently wrong.
     #[test]
-    fn share_history_is_thinned_alongside_hashrate_history() {
+    fn ledger_totals_are_additive_and_scope_filters_are_exact() {
         let db_path = make_temp_db();
-        let store = StatsStore::open(&db_path).unwrap();
+        let one = format!("{ADDRESS}.gamma");
+        let two = format!("{ADDRESS}.nerdqaxe");
+        let other = "bc1qotheraddress.rig";
+        let stats = ledger_stats(&db_path, 600, &[&one, &two, other]);
 
-        let share_history_ts = |store: &StatsStore| -> Vec<u64> {
-            let conn = store.read.lock();
-            let mut stmt = conn
-                .prepare("SELECT ts FROM share_history ORDER BY ts")
-                .unwrap();
-            let rows = stmt
-                .query_map([], |r| r.get(0))
-                .unwrap()
-                .map(|r| r.unwrap())
-                .collect();
-            rows
+        ledger_shares(&stats, &one, 100, 3, 600);
+        ledger_shares(&stats, &two, 100, 5, 600);
+        ledger_shares(&stats, other, 100, 7, 600);
+        ledger_flush(&stats, 660);
+
+        let work_of = |scope: LedgerScope<'_>| -> u64 {
+            stats
+                .work_history(0, 60, scope)
+                .iter()
+                .map(|p| p.work)
+                .sum()
         };
 
-        // Two minutes of samples on the grid, at a minute boundary.
-        let base = 9_999_960;
-        for i in 0..12 {
-            let ts = base + i * SNAPSHOT_INTERVAL_SECS;
-            store.record_hashrate_snapshot(SnapshotWrite {
-                history_ts: ts,
-                state_ts: ts,
+        assert_eq!(work_of(LedgerScope::Worker(&one)), 300);
+        assert_eq!(work_of(LedgerScope::Worker(&two)), 500);
+        // The user is the sum of its workers, and excludes the other address.
+        assert_eq!(work_of(LedgerScope::User(ADDRESS)), 800);
+        // The pool is the sum of every user.
+        assert_eq!(work_of(LedgerScope::Pool), 1_500);
+
+        // A bare address must not act as a prefix match on its own workers.
+        assert_eq!(work_of(LedgerScope::Worker(ADDRESS)), 0);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// A miner authorizing as a bare payout address — no worker label — is a
+    /// normal row, not a special case, and lands under its own user.
+    #[test]
+    fn a_bare_address_is_a_worker_with_an_empty_label() {
+        let db_path = make_temp_db();
+        let stats = ledger_stats(&db_path, 600, &[ADDRESS]);
+        ledger_shares(&stats, ADDRESS, 64, 2, 600);
+        ledger_flush(&stats, 660);
+
+        assert_eq!(
+            stats
+                .work_history(0, 60, LedgerScope::Worker(ADDRESS))
+                .iter()
+                .map(|p| p.work)
+                .sum::<u64>(),
+            128
+        );
+        assert_eq!(
+            stats
+                .work_history(0, 60, LedgerScope::User(ADDRESS))
+                .iter()
+                .map(|p| p.work)
+                .sum::<u64>(),
+            128
+        );
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// A resolution can outrun its block when the `BlockFound` insert is
+    /// parked in the retry backlog. It must park behind it and land after —
+    /// the alternative is a row stuck `pending` forever while the pool
+    /// believes it resolved. A genuine replay against a settled row is still
+    /// a clean drop.
+    #[test]
+    fn a_resolution_that_outran_its_block_parks_until_it_lands() {
+        let db_path = make_temp_db();
+        drop(StatsStore::open(&db_path).unwrap());
+        let writer = Connection::open(&db_path).unwrap();
+
+        let mut state = WriterState::default();
+        let mut backlog = std::collections::VecDeque::new();
+        let resolved = StoreWrite::BlockResolved {
+            hash: "00cafe".into(),
+            resolution: BlockResolution::Orphaned,
+            resolved_ts: 700,
+        };
+        handle_write(&writer, resolved, &mut state, &mut backlog);
+        assert_eq!(backlog.len(), 1, "no row yet: the resolution must park");
+
+        handle_write(
+            &writer,
+            StoreWrite::BlockFound(PendingBlock {
+                hash: "00cafe".into(),
+                height: 800_000,
+                worker: ADDRESS.to_string(),
+                payout: ADDRESS.to_string(),
+                found_ts: 600,
+                won_at_submit: true,
+            }),
+            &mut state,
+            &mut backlog,
+        );
+        retry_backlog(&writer, &mut backlog, &mut state);
+        assert!(backlog.is_empty());
+        let (status, resolved_ts): (String, u64) = writer
+            .query_row(
+                "SELECT status, resolved_ts FROM found_blocks WHERE hash = '00cafe'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), resolved_ts), ("orphaned", 700));
+
+        // A replay of the same resolution is a no-op, not a parked retry.
+        let replay = StoreWrite::BlockResolved {
+            hash: "00cafe".into(),
+            resolution: BlockResolution::Confirmed,
+            resolved_ts: 900,
+        };
+        handle_write(&writer, replay, &mut state, &mut backlog);
+        assert!(backlog.is_empty());
+
+        drop(writer);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// A snapshot's round totals merge with MAX, so they may only merge once
+    /// the reset for their exact epoch has landed. A snapshot from a newer
+    /// epoch than the last applied reset would otherwise MAX the finished
+    /// round's totals back in on top of the new round's.
+    #[test]
+    fn a_snapshot_ahead_of_its_rounds_reset_is_not_merged() {
+        let db_path = make_temp_db();
+        drop(StatsStore::open(&db_path).unwrap());
+        let writer = Connection::open(&db_path).unwrap();
+
+        let mut state = WriterState::default();
+        let mut backlog = std::collections::VecDeque::new();
+        let snapshot = |epoch: u64, accepted: u64| {
+            StoreWrite::Snapshot(SnapshotWrite {
+                history_ts: 60,
+                state_ts: 60,
                 share_totals: ShareTotals {
-                    accepted: i,
+                    accepted,
                     rejected: 0,
                 },
+                round_epoch: epoch,
                 ..Default::default()
-            });
-        }
-        store.flush();
-        assert_eq!(share_history_ts(&store).len(), 12);
+            })
+        };
+        let round_accepted = |conn: &Connection| -> u64 {
+            conn.query_row(
+                "SELECT shares_accepted FROM round_stats WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
 
-        // A sample past the horizon thins them to the minute rows. Cumulative
-        // values make that lossless: differencing the survivors still yields
-        // the per-minute counts.
-        let now = base + FINE_HISTORY_RETENTION_SECS + 600;
-        store.record_hashrate_snapshot(SnapshotWrite {
-            history_ts: now,
-            state_ts: now,
-            share_totals: ShareTotals {
-                accepted: 12,
-                rejected: 0,
+        // The reset for epoch 1 has not applied yet: skip the merge.
+        handle_write(&writer, snapshot(1, 42), &mut state, &mut backlog);
+        assert_eq!(round_accepted(&writer), 0);
+
+        handle_write(
+            &writer,
+            StoreWrite::RoundReset {
+                epoch: 1,
+                since_ts: 200,
             },
-            ..Default::default()
-        });
-        store.flush();
-        assert_eq!(share_history_ts(&store), vec![base, base + 60, now]);
+            &mut state,
+            &mut backlog,
+        );
+        handle_write(&writer, snapshot(1, 42), &mut state, &mut backlog);
+        assert_eq!(round_accepted(&writer), 42);
 
-        drop(store);
+        // And a snapshot from before that reset stays skipped.
+        handle_write(&writer, snapshot(0, 9_000), &mut state, &mut backlog);
+        assert_eq!(round_accepted(&writer), 42);
+
+        drop(writer);
         std::fs::remove_file(db_path).ok();
     }
 
-    /// The estimator migration clears `hashrate_history` wholesale; the share
-    /// series and lifetime totals are not estimator artefacts and must ride
-    /// through it — the reason they live in their own table.
+    /// A round reset parked in the backlog dies with an unclean shutdown, but
+    /// `found_blocks` — written independently — still records the win. Boot
+    /// re-derives the round boundary from it, so the finished round's totals
+    /// cannot leak into the new round as its baseline.
     #[test]
-    fn share_history_survives_hashrate_algo_reset() {
+    fn boot_recovers_a_round_reset_lost_to_a_crash() {
         let db_path = make_temp_db();
         {
             let stats = PoolStats::new_with_store(Some(db_path.clone()));
-            stats.share_accepted(1_000, 1_000);
-            stats.share_rejected("stale");
+            for _ in 0..5 {
+                stats.share_accepted(1_000, 1_000);
+            }
             stats.record_hashrate_snapshot_at(120);
-            let store = stats.store.as_ref().unwrap();
-            store.flush();
-            // Pretend everything was written before the estimator changed.
-            store
-                .read
-                .lock()
-                .execute(
-                    "UPDATE pool_stats SET hashrate_algo_version = 0 WHERE id = 1",
-                    [],
-                )
-                .unwrap();
+            stats.store.as_ref().unwrap().flush();
         }
 
+        // Pin the round start below the synthetic win time, then record the
+        // win in found_blocks without the reset it should have triggered ever
+        // reaching round_stats.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("UPDATE round_stats SET since_ts = 100 WHERE id = 1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO found_blocks VALUES
+               ('00feed', 800000, 'w', 'p', 500, 1, 'pending', NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
         let stats = PoolStats::new_with_store(Some(db_path.clone()));
-        assert!(stats.get_hashrate_history(0, 60).is_empty());
         let snap = stats.snapshot();
-        assert_eq!(snap.lifetime_shares_accepted, 1);
-        assert_eq!(snap.lifetime_shares_rejected, 1);
+        assert_eq!(snap.round_shares_accepted, 0, "old round must not leak");
+        assert_eq!(snap.round_since_ts, 500, "round restarts at the win");
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// A durable write that fails is parked and lands once the disk recovers —
+    /// exactly once, since the failed transaction rolled back. A best-effort
+    /// write failing the same way is simply dropped.
+    #[test]
+    fn a_failed_durable_write_is_retried_not_dropped() {
+        let db_path = make_temp_db();
+        drop(StatsStore::open(&db_path).unwrap());
+
+        // Zero busy timeout, so a held write lock fails immediately instead of
+        // stalling the test.
+        let writer = Connection::open(&db_path).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        let blocker = Connection::open(&db_path).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let mut state = WriterState::default();
+        let mut backlog = std::collections::VecDeque::new();
+        let minute = StoreWrite::Ledger {
+            minute_ts: 600,
+            entries: vec![LedgerEntry {
+                worker: ADDRESS.to_string(),
+                work: 512,
+                accepted: 4,
+                rejected: 0,
+            }],
+        };
+        handle_write(&writer, minute, &mut state, &mut backlog);
+        handle_write(&writer, StoreWrite::BestShare(9), &mut state, &mut backlog);
+        assert_eq!(backlog.len(), 1, "only the durable write is parked");
+
+        // Still down: the pass leaves the backlog intact.
+        retry_backlog(&writer, &mut backlog, &mut state);
+        assert_eq!(backlog.len(), 1);
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        retry_backlog(&writer, &mut backlog, &mut state);
+        assert!(backlog.is_empty());
+
+        let work: u64 = blocker
+            .query_row("SELECT SUM(work) FROM share_intervals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(work, 512);
+
+        drop((writer, blocker));
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Restarting inside a minute must not cost the work already done in it:
+    /// the shutdown flush writes a partial row and the next run adds to it.
+    #[test]
+    fn a_restart_inside_a_minute_merges_rather_than_overwrites() {
+        let db_path = make_temp_db();
+        {
+            let stats = ledger_stats(&db_path, 600, &[ADDRESS]);
+            for _ in 0..3 {
+                stats.record_ledger(ADDRESS, 100, 1, 0, 600);
+            }
+            stats.shutdown_persist();
+        }
+        {
+            let stats = ledger_stats(&db_path, 600, &[ADDRESS]);
+            for _ in 0..2 {
+                stats.record_ledger(ADDRESS, 100, 1, 0, 630);
+            }
+            stats.shutdown_persist();
+
+            // Both runs recorded into the same minute, and neither was lost.
+            let points = stats.work_history(0, 60, LedgerScope::Pool);
+            assert_eq!(points.len(), 1);
+            assert_eq!(points[0].ts, 600);
+            assert_eq!(points[0].work, 500);
+            assert_eq!(points[0].accepted, 5);
+
+            drop(stats);
+        }
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Rolling up to hours is summation, so it must be lossless in every
+    /// recorded quantity — and the union across the seam must not double-count
+    /// or drop the hour it moved.
+    #[test]
+    fn the_hourly_rollup_preserves_every_total() {
+        let db_path = make_temp_db();
+        let stats = ledger_stats(&db_path, 600, &[ADDRESS]);
+
+        // Three minutes inside one hour, old enough to be rolled up.
+        let base = 3_600;
+        for minute in 0..3 {
+            ledger_shares(&stats, ADDRESS, 100, 2, base + minute * 60);
+        }
+        ledger_flush(&stats, base + 180);
+        let before: u64 = stats
+            .work_history(0, 3_600, LedgerScope::Pool)
+            .iter()
+            .map(|p| p.work)
+            .sum();
+        assert_eq!(before, 600);
+
+        // A share past the retention horizon triggers the rollup.
+        let far = base + LEDGER_FINE_RETENTION_SECS + 7_200;
+        ledger_shares(&stats, ADDRESS, 50, 1, far);
+        ledger_flush(&stats, far + 60);
+
         let store = stats.store.as_ref().unwrap();
-        let rows: u64 = store
+        let minute_rows: u64 = store
             .read
             .lock()
-            .query_row("SELECT COUNT(*) FROM share_history", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM share_intervals WHERE ts < ?1",
+                params![far - LEDGER_FINE_RETENTION_SECS],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(rows, 1);
+        assert_eq!(minute_rows, 0, "rolled-up minutes must not survive");
 
-        // The share *rate* is a decaying average off the same kernel, so unlike
-        // the raw counts above it is incomparable across estimators and goes
-        // with the hashrate series.
-        assert!(stats.get_share_rate_history(0, 60).is_empty());
-        assert!(store.load_share_rate_state().unwrap().is_none());
+        // Totals are unchanged, and the rolled hour is still one bucket.
+        let points = stats.work_history(0, 3_600, LedgerScope::Pool);
+        let rolled = points.iter().find(|p| p.ts == base).expect("rolled hour");
+        assert_eq!(rolled.work, 600);
+        assert_eq!(rolled.accepted, 6);
+        assert_eq!(
+            points.iter().map(|p| p.work).sum::<u64>(),
+            650,
+            "the seam must not double-count or drop a bucket"
+        );
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// A minute-grid query across the rollup seam returns each bucket with the
+    /// span it actually covers. Dividing by the requested grid instead read
+    /// rolled-up hours 60× high — the exact bug this field exists to prevent.
+    #[test]
+    fn rolled_up_buckets_carry_their_hourly_span() {
+        let db_path = make_temp_db();
+        let stats = ledger_stats(&db_path, 600, &[ADDRESS]);
+
+        let base = 3_600;
+        for minute in 0..3 {
+            ledger_shares(&stats, ADDRESS, 100, 2, base + minute * 60);
+        }
+        ledger_flush(&stats, base + 180);
+        let far = base + LEDGER_FINE_RETENTION_SECS + 7_200;
+        ledger_shares(&stats, ADDRESS, 50, 1, far);
+        ledger_flush(&stats, far + 60);
+
+        let points = stats.work_history(0, 60, LedgerScope::Pool);
+        let rolled = points.iter().find(|p| p.ts == base).expect("rolled hour");
+        assert_eq!((rolled.work, rolled.span_secs), (600, 3_600));
+        let fresh = points.iter().find(|p| p.ts == far).expect("fresh minute");
+        assert_eq!((fresh.work, fresh.span_secs), (50, 60));
+
+        // The implied rate is flat: the same per-minute work at both grains.
+        let rate = |p: &WorkHistoryPoint| p.work as f64 / p.span_secs as f64;
+        assert!((rate(rolled) - rate(fresh) * 0.2).abs() < 1e-12);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// The range start snaps down to the bucket grid: a bucket is either in
+    /// the range whole or not at all, never silently missing its head.
+    #[test]
+    fn the_range_start_is_floored_to_the_bucket_grid() {
+        let db_path = make_temp_db();
+        let stats = ledger_stats(&db_path, 60, &[ADDRESS]);
+
+        ledger_shares(&stats, ADDRESS, 100, 1, 60);
+        ledger_shares(&stats, ADDRESS, 100, 1, 180);
+        ledger_flush(&stats, 240);
+
+        // `since` lands mid-bucket; both minutes belong to bucket 0.
+        let points = stats.work_history(130, 300, LedgerScope::Pool);
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].ts, 0);
+        assert_eq!(points[0].work, 200);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// A bucket whose span has not fully elapsed holds a fraction of its final
+    /// work; serving it would dent the right edge of every chart.
+    #[test]
+    fn a_partially_elapsed_bucket_is_not_served() {
+        let db_path = make_temp_db();
+        let stats = ledger_stats(&db_path, 600, &[ADDRESS]);
+
+        ledger_shares(&stats, ADDRESS, 100, 1, 600);
+        ledger_flush(&stats, 660);
+
+        // Bucket [600, 900) is still open at 700 and closed at 900.
+        assert!(stats
+            .work_history_at(0, 300, 700, LedgerScope::Pool)
+            .is_empty());
+        assert_eq!(
+            stats.work_history_at(0, 300, 900, LedgerScope::Pool).len(),
+            1
+        );
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Rejects carry no work but are counted, so a device's reject ratio stays
+    /// recoverable over any past range.
+    #[test]
+    fn rejects_are_counted_without_contributing_work() {
+        let db_path = make_temp_db();
+        let stats = ledger_stats(&db_path, 600, &[ADDRESS]);
+
+        stats.record_ledger(ADDRESS, 500, 1, 0, 600);
+        stats.record_ledger(ADDRESS, 0, 0, 1, 600);
+        stats.flush_ledger_at(660);
+        stats.store.as_ref().unwrap().flush();
+
+        let points = stats.work_history(0, 60, LedgerScope::Pool);
+        assert_eq!(points[0].work, 500);
+        assert_eq!(points[0].accepted, 1);
+        assert_eq!(points[0].rejected, 1);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Worker rows are permanent and authorization is unauthenticated, so a
+    /// name that never authorized must not be able to mint one.
+    #[test]
+    fn an_unauthorized_name_never_reaches_the_ledger() {
+        let db_path = make_temp_db();
+        let stats = ledger_stats(&db_path, 600, &[ADDRESS]);
+
+        // The placeholder a pre-auth reject carries.
+        stats.record_ledger("?", 0, 0, 1, 600);
+        stats.record_ledger("bc1qneverauthorized", 1_000, 1, 0, 600);
+        stats.flush_ledger_at(660);
+        stats.store.as_ref().unwrap().flush();
+
+        assert!(stats.work_history(0, 60, LedgerScope::Pool).is_empty());
+        let store = stats.store.as_ref().unwrap();
+        let users: u64 = store
+            .read
+            .lock()
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(users, 0);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Work is summed credit, never the share's actual hash difficulty: hash
+    /// difficulty is heavy-tailed, so a lucky share would otherwise show up as
+    /// a hashrate spike that never happened.
+    #[test]
+    fn the_ledger_records_credit_not_hash_difficulty() {
+        let db_path = make_temp_db();
+        let stats = ledger_stats(&db_path, 600, &[ADDRESS]);
+
+        // A share worth 1024 that happened to hash 500× harder.
+        let later = PoolStats::now_secs() + 2 * LEDGER_INTERVAL_SECS;
+        crate::mining::accounting::record_accepted(&stats, "session", ADDRESS, 1_024, 512_000);
+        stats.flush_ledger_at(later);
+        stats.store.as_ref().unwrap().flush();
+
+        let work: u64 = stats
+            .work_history_at(0, 60, later, LedgerScope::Pool)
+            .iter()
+            .map(|p| p.work)
+            .sum();
+        assert_eq!(work, 1_024);
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// The ledger outlives the decayed caches it sits beside: those are pruned
+    /// to a 48-hour horizon, while summed credit is kept whatever its age.
+    #[test]
+    fn pruning_the_decayed_caches_leaves_the_ledger_alone() {
+        let db_path = make_temp_db();
+        let base = 9_999_960;
+        let stats = ledger_stats(&db_path, base, &[ADDRESS]);
+        ledger_shares(&stats, ADDRESS, 100, 4, base);
+        ledger_flush(&stats, base + LEDGER_INTERVAL_SECS);
+        stats.record_hashrate_snapshot_at(base);
+
+        // A snapshot far enough ahead to prune everything written above.
+        stats.record_hashrate_snapshot_at(base + FINE_HISTORY_RETENTION_SECS + 60);
+        stats.store.as_ref().unwrap().flush();
+
+        let dropped = |points: Vec<RateHistoryPoint>| points.iter().all(|p| p.ts > base);
+        assert!(dropped(stats.get_hashrate_history(0, 60)));
+        assert!(dropped(stats.get_share_rate_history(0, 60)));
+        assert_eq!(
+            stats
+                .work_history(0, 60, LedgerScope::Pool)
+                .iter()
+                .map(|p| p.work)
+                .sum::<u64>(),
+            400
+        );
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// A minute only closes when the clock leaves it, and shares must land in
+    /// the minute they arrived in rather than the one the flush happened in.
+    #[test]
+    fn shares_are_filed_under_the_minute_they_arrived_in() {
+        let db_path = make_temp_db();
+        let stats = ledger_stats(&db_path, 600, &[ADDRESS]);
+
+        stats.record_ledger(ADDRESS, 10, 1, 0, 615);
+        stats.record_ledger(ADDRESS, 10, 1, 0, 659);
+        // Crossing into the next minute closes the first…
+        stats.record_ledger(ADDRESS, 10, 1, 0, 661);
+        stats.flush_ledger_at(721);
+        stats.store.as_ref().unwrap().flush();
+
+        let points = stats.work_history(0, 60, LedgerScope::Pool);
+        assert_eq!(points.len(), 2);
+        assert_eq!((points[0].ts, points[0].work), (600, 20));
+        assert_eq!((points[1].ts, points[1].work), (660, 10));
+
+        drop(stats);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// A clock stepping backwards must not reopen a minute already flushed —
+    /// the row would be written twice and, being accumulate-on-conflict,
+    /// double-counted.
+    #[test]
+    fn a_backwards_clock_step_does_not_reopen_a_closed_minute() {
+        let db_path = make_temp_db();
+        let stats = ledger_stats(&db_path, 600, &[ADDRESS]);
+
+        stats.record_ledger(ADDRESS, 10, 1, 0, 660);
+        stats.record_ledger(ADDRESS, 10, 1, 0, 720);
+        // Back into the already-closed minute.
+        stats.record_ledger(ADDRESS, 10, 1, 0, 600);
+        stats.flush_ledger_at(780);
+        stats.store.as_ref().unwrap().flush();
+
+        let points = stats.work_history(0, 60, LedgerScope::Pool);
+        assert_eq!(points.iter().map(|p| p.work).sum::<u64>(), 30);
+        assert!(
+            points.iter().all(|p| p.ts >= 660),
+            "a closed minute was reopened: {points:?}"
+        );
 
         drop(stats);
         std::fs::remove_file(db_path).ok();
@@ -3108,53 +4223,6 @@ mod tests {
         let (updated_ts, restored) = store.load_share_rate_state().unwrap().expect("checkpoint");
         assert_eq!(updated_ts, 125);
         assert_eq!(restored, rates);
-
-        drop(store);
-        std::fs::remove_file(db_path).ok();
-    }
-
-    /// Same retention as every other series on the grid: one row a minute past
-    /// the fine horizon, so months of history stay bounded.
-    #[test]
-    fn share_rate_samples_past_the_fine_horizon_are_thinned() {
-        let db_path = make_temp_db();
-        let store = StatsStore::open(&db_path).unwrap();
-        let rates = [1.0; hashrate::WINDOW_COUNT];
-
-        let base = 9_999_960;
-        assert_eq!(base % 60, 0);
-        for i in 0..12 {
-            let ts = base + i * SNAPSHOT_INTERVAL_SECS;
-            store.record_hashrate_snapshot(SnapshotWrite {
-                history_ts: ts,
-                state_ts: ts,
-                share_rates: rates,
-                ..Default::default()
-            });
-        }
-        store.flush();
-        assert_eq!(
-            store
-                .get_share_rate_history(0, SNAPSHOT_INTERVAL_SECS)
-                .len(),
-            12
-        );
-
-        let now = base + FINE_HISTORY_RETENTION_SECS + 600;
-        store.record_hashrate_snapshot(SnapshotWrite {
-            history_ts: now,
-            state_ts: now,
-            share_rates: rates,
-            ..Default::default()
-        });
-        store.flush();
-
-        let kept: Vec<u64> = store
-            .get_share_rate_history(0, SNAPSHOT_INTERVAL_SECS)
-            .iter()
-            .map(|p| p.ts)
-            .collect();
-        assert_eq!(kept, vec![base, base + 60, now]);
 
         drop(store);
         std::fs::remove_file(db_path).ok();
@@ -3269,8 +4337,8 @@ mod tests {
         let (accepted, rejected): (u64, u64) = Connection::open(&db_path)
             .unwrap()
             .query_row(
-                "SELECT lifetime_shares_accepted, lifetime_shares_rejected
-                 FROM pool_stats WHERE id = 1",
+                "SELECT shares_accepted, shares_rejected
+                 FROM round_stats WHERE id = 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -3331,9 +4399,9 @@ mod tests {
 
         let snap = stats.snapshot();
         assert_eq!(snap.blocks_found, 1);
-        assert_eq!(snap.lifetime_shares_accepted, 0);
-        assert_eq!(snap.lifetime_shares_rejected, 0);
-        assert!(snap.lifetime_reject_reasons.is_empty());
+        assert_eq!(snap.round_shares_accepted, 0);
+        assert_eq!(snap.round_shares_rejected, 0);
+        assert!(snap.round_reject_reasons.is_empty());
         assert_eq!(snap.best_share_difficulty, 0);
         assert_eq!(snap.best_hashrate_hps, 0.0);
         assert_eq!(snap.pool_difficulty, 0);
@@ -3350,10 +4418,10 @@ mod tests {
         stats.share_accepted(500, 500);
         stats.share_rejected("duplicate");
         let snap = stats.snapshot();
-        assert_eq!(snap.lifetime_shares_accepted, 1);
-        assert_eq!(snap.lifetime_shares_rejected, 1);
-        assert_eq!(snap.lifetime_reject_reasons.get("duplicate"), Some(&1));
-        assert_eq!(snap.lifetime_reject_reasons.get("stale"), None);
+        assert_eq!(snap.round_shares_accepted, 1);
+        assert_eq!(snap.round_shares_rejected, 1);
+        assert_eq!(snap.round_reject_reasons.get("duplicate"), Some(&1));
+        assert_eq!(snap.round_reject_reasons.get("stale"), None);
         assert_eq!(snap.pool_difficulty, 500);
         assert_eq!(snap.best_share_difficulty, 500);
     }
@@ -3374,9 +4442,9 @@ mod tests {
 
         let stats = PoolStats::new_with_store(Some(db_path.clone()));
         let snap = stats.snapshot();
-        assert_eq!(snap.lifetime_shares_accepted, 0);
-        assert_eq!(snap.lifetime_shares_rejected, 0);
-        assert!(snap.lifetime_reject_reasons.is_empty());
+        assert_eq!(snap.round_shares_accepted, 0);
+        assert_eq!(snap.round_shares_rejected, 0);
+        assert!(snap.round_reject_reasons.is_empty());
         assert_eq!(snap.best_share_difficulty, 0);
         assert_eq!(snap.pool_difficulty, 0);
         assert!(snap
@@ -3407,7 +4475,7 @@ mod tests {
         });
         store.flush();
 
-        let (totals, since_ts, round_work) = store.load_lifetime_stats().unwrap();
+        let (totals, since_ts, round_work) = store.load_round_stats().unwrap();
         assert_eq!(totals.accepted, 0);
         assert_eq!(totals.rejected, 0);
         assert_eq!(round_work, 0);

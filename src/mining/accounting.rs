@@ -90,6 +90,7 @@ pub fn record_accepted(
     stats.share_accepted(credit, hash_difficulty);
     stats.worker_share_accepted(worker, hash_difficulty);
     stats.mark_worker_submit(worker);
+    stats.ledger_share_accepted(worker, credit);
     metrics::share_accepted(credit, worker);
 }
 
@@ -104,24 +105,22 @@ pub fn record_rejected(
     let label = reason.label();
     stats.share_rejected(label);
     stats.worker_share_rejected(worker, label);
+    stats.ledger_share_rejected(worker);
     metrics::share_rejected(label, worker);
     reason.counts_as_invalid() && guard.invalid_shares.record_invalid()
 }
 
 /// Record a message dropped by the per-connection rate limiter.
 ///
-/// Deliberately not `record_rejected`: rate limiting is a pool-side defence,
-/// not a validator verdict, so `"rate_limited"` is not a `RejectReason` and
-/// this takes no `SessionGuard` — it cannot feed the invalid-share ban budget.
-/// The limiter fires on any inbound message, not just submits; the Prometheus
-/// counter has always counted it that way, and `PoolStats` — which the
-/// persisted lifetime totals are built from — must agree with it.
+/// Not a share reject in any form: the limiter fires on any inbound message —
+/// authorize floods, subscribe floods — and a dropped `mining.configure` is
+/// not a bad share. Counting these as rejects poisoned every reject ratio a
+/// fleet operator would read, so they get their own counter and their own
+/// metric, and never touch the ledger. It also takes no `SessionGuard` — a
+/// pool-side defence cannot feed the invalid-share ban budget.
 pub fn record_rate_limited(stats: &PoolStats, worker: Option<&str>) {
-    stats.share_rejected("rate_limited");
-    if let Some(worker) = worker {
-        stats.worker_share_rejected(worker, "rate_limited");
-    }
-    metrics::share_rejected("rate_limited", worker.unwrap_or("?"));
+    stats.message_rate_limited();
+    metrics::rate_limited(worker.unwrap_or("?"));
 }
 
 /// Record what the node did with a block we submitted.
@@ -387,26 +386,59 @@ mod tests {
         assert_eq!(snap.blocks_pending_confirmation, 0);
     }
 
-    /// Rate-limited messages must show up in the pool and worker reject
-    /// counts (matching the Prometheus counter), without needing a
-    /// `SessionGuard` — the fn taking none is what keeps them out of the
-    /// invalid-share ban budget.
+    /// The share that wins a block is the last share of the round it ended.
+    /// Recorded in the frontends' order — accepted first, outcome second — the
+    /// reset sweeps it away with the rest of the round. The reverse order
+    /// seeded every new round with one share and an unbeatable block-level
+    /// best.
     #[test]
-    fn rate_limited_rejects_count_into_pool_and_worker_stats() {
+    fn the_winning_share_belongs_to_the_round_it_ended() {
+        let stats = PoolStats::new_with_store(None);
+        stats.mark_worker_online("worker1", 1_000);
+
+        record_accepted(&stats, "s1", "worker1", 1_000, 2_000);
+        // The block share, credited before its outcome is recorded.
+        record_accepted(&stats, "s1", "worker1", 1_000, 120_000_000_000_000);
+        record_block_outcome(
+            &stats,
+            BlockSubmitOutcome::Accepted,
+            800_000,
+            "worker1",
+            "bc1qpayout",
+            "0000cafe",
+        );
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.blocks_found, 1);
+        assert_eq!(snap.round_shares_accepted, 0, "round restarts empty");
+        assert_eq!(snap.best_share_difficulty, 0, "round best restarts empty");
+        let worker = snap
+            .worker_states
+            .iter()
+            .find(|w| w.worker == "worker1")
+            .unwrap();
+        assert_eq!(worker.best_share_difficulty, 0);
+
+        drop(stats);
+    }
+
+    /// A rate-limited message is not a share, so it must move its own counter
+    /// and leave every share statistic untouched — the limiter fires on any
+    /// message type, and a dropped `mining.configure` is not a bad share.
+    #[test]
+    fn rate_limited_messages_do_not_touch_share_accounting() {
         let stats = PoolStats::new_with_store(None);
         stats.mark_worker_online("w", 1_000);
 
         record_rate_limited(&stats, Some("w"));
-        // Pre-auth sessions have no worker yet; only the pool counter moves.
         record_rate_limited(&stats, None);
 
         let snap = stats.snapshot();
-        assert_eq!(snap.shares_rejected, 2);
-        // The pool-wide breakdown counts both, including the pre-auth one the
-        // worker-scoped map cannot see.
-        assert_eq!(snap.reject_reasons.get("rate_limited"), Some(&2));
+        assert_eq!(snap.rate_limited_drops, 2);
+        assert_eq!(snap.shares_rejected, 0);
+        assert!(snap.reject_reasons.is_empty());
         let worker = snap.worker_states.iter().find(|w| w.worker == "w").unwrap();
-        assert_eq!(worker.shares_rejected, 1);
-        assert_eq!(worker.reject_reasons.get("rate_limited"), Some(&1));
+        assert_eq!(worker.shares_rejected, 0);
+        assert!(worker.reject_reasons.is_empty());
     }
 }

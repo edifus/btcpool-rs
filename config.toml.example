@@ -172,8 +172,14 @@ poll_fallback = true
 poll_interval_ms = 1000
 
 [vardiff]
-# Target number of seconds between share submissions per miner
-target_share_time_secs = 5
+# Target number of seconds between share submissions per miner.
+#
+# This is the pool's only sampling rate: hashrate is estimated from share
+# arrivals, so estimator noise scales as sqrt(target) — a 1-minute reading
+# carries roughly 1/sqrt(60/target) relative error. Lowering it buys a steadier
+# chart at the cost of more submits; raising it does the reverse. Blocks are
+# unaffected either way, share difficulty being accounting rather than consensus.
+target_share_time_secs = 3
 
 # How often (seconds) a difficulty change may be considered. A miner running
 # faster than target is re-evaluated early, once it has submitted the number of
