@@ -1133,6 +1133,10 @@ tr:last-child td { border-bottom: none; }
 #workers .col-rate, #workers .col-count {
   padding-left: 0.35rem; padding-right: 0.35rem;
 }
+/* Rounded on screen, exact in the title. The cursor is what advertises it —
+   a class rather than the inline style used elsewhere, since the table cells
+   carrying it are generated once per worker per refresh. */
+.exact-hint { cursor: help; }
 /* New chain tip: pulse the number itself in the accent color (two beats),
    matching the other highlighted values instead of flashing the background. */
 @keyframes blockPulse {
@@ -1361,13 +1365,13 @@ tr:last-child td { border-bottom: none; }
     </div>
     <div class="kpi">
       <div class="label" title="Highest-difficulty share since the last found block">Best share</div>
-      <div class="val" id="v-best-share">&mdash;</div>
-      <div class="sub">since restart: <span id="v-session-best-share">&mdash;</span></div>
+      <div class="val exact-hint" id="v-best-share">&mdash;</div>
+      <div class="sub">since restart: <span class="exact-hint" id="v-session-best-share">&mdash;</span></div>
     </div>
     <div class="kpi">
       <div class="label">Pool difficulty</div>
       <div class="val" id="v-pool-diff" title="100% is one block's worth of expected work">&mdash;</div>
-      <div class="sub" id="v-pool-diff-work" title="Accepted share difficulty accumulated since the last found block">work: &mdash;</div>
+      <div class="sub exact-hint" id="v-pool-diff-work">work: &mdash;</div>
     </div>
     <div class="kpi">
       <div class="label">Miners</div>
@@ -1442,7 +1446,7 @@ tr:last-child td { border-bottom: none; }
     <div class="kpi">
       <div class="label">Network hashrate</div>
       <div class="val" id="v-net-hashrate">&mdash;</div>
-      <div class="sub" id="v-net-diff">diff: &mdash;</div>
+      <div class="sub exact-hint" id="v-net-diff">diff: &mdash;</div>
     </div>
     <div class="kpi">
       <div class="label">Next adjustment</div>
@@ -1812,6 +1816,21 @@ function fmtSpm(spm, short, digits) {
   return Math.round(spm).toLocaleString() + (short ? '' : ' shares/min');
 }
 
+// The figure behind a rounded difficulty, for the element's title. "2.2K" is
+// the right density for a table column but cannot answer whether a miner's
+// vardiff landed on 2048 or 2189. Rounded because network difficulty is
+// fractional and its decimals are noise at that magnitude.
+function exactDiff(d) {
+  return Math.round(d).toLocaleString();
+}
+
+// Write a difficulty rounded, with the exact figure on the element's title.
+function setDiff(id, value, prefix) {
+  const el = document.getElementById(id);
+  el.textContent = (prefix || '') + fmtDiff(value);
+  el.title = exactDiff(value);
+}
+
 function fmtDiff(d) {
   if (d >= 1e12) return (d / 1e12).toFixed(2) + 'T';
   if (d >= 1e9)  return (d / 1e9 ).toFixed(2) + 'G';
@@ -2095,13 +2114,19 @@ async function refresh() {
     const netDiffForPool = d.network_difficulty || 0;
     document.getElementById('v-pool-diff').textContent =
       netDiffForPool > 0 ? fmtPct(100 * roundWork / netDiffForPool) : '—';
-    document.getElementById('v-pool-diff-work').textContent = 'work: ' + fmtDiff(roundWork);
-    document.getElementById('v-best-share').textContent = fmtDiff(d.best_share_difficulty);
-    document.getElementById('v-session-best-share').textContent = fmtDiff(d.session_best_share_difficulty);
+    const workEl = document.getElementById('v-pool-diff-work');
+    workEl.textContent = 'work: ' + fmtDiff(roundWork);
+    // The only one of these carrying prose as well as a figure. Composed here
+    // rather than left in the markup so the two cannot accumulate across
+    // refreshes, matching the block-reward tooltip above.
+    workEl.title = 'Accepted share difficulty accumulated since the last found block\n'
+      + exactDiff(roundWork);
+    setDiff('v-best-share', d.best_share_difficulty);
+    setDiff('v-session-best-share', d.session_best_share_difficulty);
 
     // Network section (human-readable hashrate + difficulty + next-adjustment ETA)
     document.getElementById('v-net-hashrate').textContent = fmtHr(d.network_hashrate_hps || 0, false);
-    document.getElementById('v-net-diff').textContent = 'diff: ' + fmtDiff(d.network_difficulty || 0);
+    setDiff('v-net-diff', d.network_difficulty || 0, 'diff: ');
     document.getElementById('v-net-next-adj').textContent = fmtNextAdjustment(d.current_height || 0);
     const adj = fmtAdjustmentPct(d.est_difficulty_change_pct);
     const adjEl = document.getElementById('v-net-adj-pct');
@@ -2184,7 +2209,7 @@ async function refresh() {
             <td>${escHtml(name)}</td>
             <td class="col-led"><span class="led ${led.cls}" title="${led.title}"></span></td>
             <td>${mode}</td>
-            <td>${fmtDiff(w.current_vardiff)}</td>
+            <td class="exact-hint" title="${exactDiff(w.current_vardiff)}">${fmtDiff(w.current_vardiff)}</td>
             <td class="col-rate">${fmtHr(w.hashrate_60s_hps, false)}</td>
             <td class="col-rate">${fmtHr(w.hashrate_5m_hps, false)}</td>
             <td class="col-rate">${fmtHr(w.hashrate_10m_hps, false)}</td>
@@ -2193,7 +2218,7 @@ async function refresh() {
             <td class="col-rate">${fmtHr(w.hashrate_24h_hps, false)}</td>
             <td class="col-count">${w.shares_accepted.toLocaleString()}</td>
             <td class="col-count" title="${rejectBreakdown(w)}">${w.shares_rejected.toLocaleString()}</td>
-            <td>${fmtDiff(w.best_share_difficulty)}</td>
+            <td class="exact-hint" title="${exactDiff(w.best_share_difficulty)}">${fmtDiff(w.best_share_difficulty)}</td>
             <td>${lastShareAgo}</td>
             <td>${uptime}</td>
           </tr>`;
@@ -2917,6 +2942,29 @@ mod tests {
         // must be routes the server actually serves.
         assert!(DASHBOARD_HTML.contains("async function loadChart(panel, window)"));
         assert!(DASHBOARD_HTML.contains("fetch(panel.endpoint + '?window=' + window)"));
+    }
+
+    /// Every rounded difficulty carries its exact figure on hover: "2.2K"
+    /// cannot answer whether a miner's vardiff landed on 2048 or 2189, which is
+    /// the question that reading gets opened for. The two helpers are used in
+    /// pairs — once each at their own definition, then once per display — so a
+    /// reading that shipped without its tooltip is a count mismatch.
+    #[test]
+    fn every_rounded_difficulty_carries_its_exact_value() {
+        assert_eq!(
+            DASHBOARD_HTML.matches("fmtDiff(").count(),
+            DASHBOARD_HTML.matches("exactDiff(").count(),
+            "a difficulty is rendered rounded with no exact value on hover"
+        );
+
+        // The two per-worker readings, which are built inline rather than
+        // through `setDiff` because they are cells in a generated row.
+        for field in ["current_vardiff", "best_share_difficulty"] {
+            assert!(
+                DASHBOARD_HTML.contains(&format!("title=\"${{exactDiff(w.{field})}}\"")),
+                "workers table {field} cell must carry its exact value"
+            );
+        }
     }
 
     /// Shares/min is not a hashrate: formatting it with `fmtHr` would render
