@@ -6,7 +6,7 @@
 use crate::mining::hashrate;
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{
@@ -35,16 +35,39 @@ const MAX_WORKER_BEST_SHARES: usize = 512;
 /// carries no migration path, by choice. The operator deletes the file and the
 /// next boot writes a current one. Nothing here is irreplaceable enough to
 /// justify code that has to understand every shape the schema ever had.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// How often the pool hashrate is written to `hashrate_history`. The dashboard
 /// polls the chart at the same cadence.
 pub const SNAPSHOT_INTERVAL_SECS: u64 = 10;
 
 /// How long the decayed-average history (`hashrate_history`,
-/// `share_rate_history`) is kept. Those tables only serve the short chart
-/// ranges; everything longer is derived exactly from the share ledger.
-const FINE_HISTORY_RETENTION_SECS: u64 = 48 * 3600;
+/// `share_rate_history`) is kept. Every chart range plots the decaying window
+/// family, so these tables have to reach as far back as the longest range —
+/// 30 days — with a day spare so its left edge never sits on the boundary.
+const FINE_HISTORY_RETENTION_SECS: u64 = 31 * 86_400;
+
+/// How long those rows keep full sampling resolution. Only the two shortest
+/// ranges read a grid finer than a minute (they bucket at `SNAPSHOT_INTERVAL`
+/// and 60s); every longer range buckets at five minutes or coarser and cannot
+/// see the difference, so older rows are thinned to the minute grid. That is
+/// what keeps a month of history in single-digit MB rather than tens.
+const FINE_HISTORY_FULL_RES_SECS: u64 = 2 * 86_400;
+
+/// The grid surviving rows are thinned onto.
+const FINE_HISTORY_THINNED_GRID_SECS: u64 = 60;
+
+/// How long each fast window stays readable, oldest-surviving last.
+///
+/// A decaying average stops resolving anything once the chart bucket dwarfs its
+/// time constant — a 1m average across a half-hour bucket is that bucket's mean
+/// with extra steps — so each window drops out at the longest range that still
+/// draws it, and the column is nulled from rows older than that. The chart's
+/// series ladder is built from these, so no range can ask for a column the
+/// pruner has already emptied. The 1h/6h/24h windows live as long as the row.
+pub(crate) const FINE_1M_HORIZON_SECS: u64 = 3 * 86_400;
+pub(crate) const FINE_5M_HORIZON_SECS: u64 = 7 * 86_400;
+pub(crate) const FINE_10M_HORIZON_SECS: u64 = 30 * 86_400;
 
 /// Grid of the share ledger: one `share_intervals` row per worker per minute.
 pub const LEDGER_INTERVAL_SECS: u64 = 60;
@@ -489,7 +512,7 @@ impl StatsStore {
         // `workers`, `share_intervals*`, `found_blocks`) are records nothing
         // can reconstruct. Round state (`round_*`) is zeroed by every found
         // block. Everything else is a decayed-display cache or checkpoint,
-        // pruned to a 48-hour horizon and rebuilt from live meters.
+        // aged out by `prune_fine_history` and rebuilt from live meters.
         conn.execute_batch(&format!(
             "BEGIN;
 
@@ -579,11 +602,15 @@ impl StatsStore {
              CREATE INDEX IF NOT EXISTS share_intervals_hourly_ts
                ON share_intervals_hourly(ts);
 
-             -- Caches: decayed-average history and live-meter checkpoints,
-             -- pruned to a 48-hour horizon and rebuilt from live meters.
+             -- Caches: decayed-average history and live-meter checkpoints.
+             -- The history's fast columns are nulled as they age past the
+             -- ranges that draw them; see `prune_fine_history`.
              CREATE TABLE IF NOT EXISTS hashrate_history (
                ts INTEGER PRIMARY KEY,
-               hashrate_hps REAL NOT NULL,
+               -- Nullable like the rest: this is the 10m window under the
+               -- operational name, and `prune_fine_history` empties it at the
+               -- age past which no chart range draws it.
+               hashrate_hps REAL,
                hashrate_1m_hps REAL,
                hashrate_5m_hps REAL,
                hashrate_1h_hps REAL,
@@ -1623,19 +1650,76 @@ fn write_snapshot(
         tx.commit()?;
     }
 
-    // These two tables only back the short chart ranges now — anything longer
-    // is summed exactly from the ledger, which keeps its own retention. So they
-    // are dropped wholesale past the horizon rather than thinned: a decayed
-    // sample surviving at one-a-minute resolution has no reader.
-    let cutoff = history_ts.saturating_sub(FINE_HISTORY_RETENTION_SECS);
-    conn.execute(
-        "DELETE FROM hashrate_history WHERE ts < ?1",
-        params![cutoff],
-    )?;
-    conn.execute(
-        "DELETE FROM share_rate_history WHERE ts < ?1",
-        params![cutoff],
-    )?;
+    prune_fine_history(conn, *history_ts)?;
+    Ok(())
+}
+
+/// Age out the decayed-average tables in three steps, coarsest last: rows past
+/// `FINE_HISTORY_FULL_RES_SECS` are thinned to the minute grid, each fast
+/// window's column is nulled past its own horizon, and whole rows go at the
+/// retention horizon.
+///
+/// Runs on every snapshot, so each step first reads the newest row below its
+/// cutoff and does nothing when that row shows the step has already been
+/// applied. Without those probes each pass would re-scan tens of thousands of
+/// aged rows every ten seconds to find nothing to do.
+fn prune_fine_history(conn: &Connection, now: u64) -> Result<(), rusqlite::Error> {
+    // Both tables carry the same grid and the same horizons; only the column
+    // names differ, and only for the windows that age out.
+    const TABLES: [&str; 2] = ["hashrate_history", "share_rate_history"];
+
+    let thin_cutoff = now.saturating_sub(FINE_HISTORY_FULL_RES_SECS);
+    for table in TABLES {
+        // Off-grid rows are deleted oldest-first over the whole region, so the
+        // newest row below the cutoff answers for the region: if it is already
+        // on the grid, an earlier pass covered everything older.
+        let newest: Option<u64> = conn
+            .query_row(
+                &format!("SELECT ts FROM {table} WHERE ts < ?1 ORDER BY ts DESC LIMIT 1"),
+                params![thin_cutoff],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if newest.is_some_and(|ts| ts % FINE_HISTORY_THINNED_GRID_SECS != 0) {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE ts < ?1 AND ts % ?2 != 0"),
+                params![thin_cutoff, FINE_HISTORY_THINNED_GRID_SECS],
+            )?;
+        }
+    }
+
+    // Nulled rather than deleted: the row's slower windows are still drawn.
+    for (hashrate_column, share_rate_column, horizon) in [
+        ("hashrate_1m_hps", "spm_1m", FINE_1M_HORIZON_SECS),
+        ("hashrate_5m_hps", "spm_5m", FINE_5M_HORIZON_SECS),
+        // The 10m rate is the operational one, so it carries the bare name.
+        ("hashrate_hps", "spm_10m", FINE_10M_HORIZON_SECS),
+    ] {
+        let cutoff = now.saturating_sub(horizon);
+        for (table, column) in TABLES.into_iter().zip([hashrate_column, share_rate_column]) {
+            let pending: Option<Option<f64>> = conn
+                .query_row(
+                    &format!("SELECT {column} FROM {table} WHERE ts < ?1 ORDER BY ts DESC LIMIT 1"),
+                    params![cutoff],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if matches!(pending, Some(Some(_))) {
+                conn.execute(
+                    &format!("UPDATE {table} SET {column} = NULL WHERE ts < ?1"),
+                    params![cutoff],
+                )?;
+            }
+        }
+    }
+
+    let cutoff = now.saturating_sub(FINE_HISTORY_RETENTION_SECS);
+    for table in TABLES {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE ts < ?1"),
+            params![cutoff],
+        )?;
+    }
     Ok(())
 }
 
@@ -2729,9 +2813,9 @@ impl PoolStats {
             // Snap to the sampling grid. The recorder's wall-clock timestamps
             // drift by however long a tick took, and two things downstream need
             // them regular: the chart buckets at exactly this width on the 1h
-            // view, and the retention step keeps rows where `ts % 60 == 0` —
-            // which unsnapped timestamps would hit only by luck, thinning the
-            // long-range history away to nothing.
+            // view, and the retention step thins aged rows to those where
+            // `ts % 60 == 0` — which unsnapped timestamps would hit only by
+            // luck, thinning the long-range history away to nothing.
             let history_ts = state_ts / SNAPSHOT_INTERVAL_SECS * SNAPSHOT_INTERVAL_SECS;
             // Epoch before share stats, and `round_reset` bumps the epoch
             // *after* zeroing them: whichever way a reset interleaves, this
@@ -3401,9 +3485,115 @@ mod tests {
         std::fs::remove_file(db_path).ok();
     }
 
-    /// The decayed series only backs the live chart ranges now, so it is
-    /// dropped wholesale past its horizon rather than thinned: everything
-    /// longer is summed exactly from the ledger, which keeps its own retention.
+    /// Rows past `FINE_HISTORY_FULL_RES_SECS` are thinned to the minute grid.
+    /// Only the two shortest ranges read a finer grid than that, and they read
+    /// nothing this old; keeping every sample for a month is what the thinning
+    /// exists to avoid.
+    #[test]
+    fn aged_samples_thin_to_the_minute_grid() {
+        let db_path = make_temp_db();
+        let store = StatsStore::open(&db_path).unwrap();
+
+        // Two minutes of samples from a minute boundary, so exactly two of the
+        // twelve sit on the grid the thinning keeps.
+        let base = 9_999_960;
+        assert_eq!(base % 60, 0);
+        for i in 0..12 {
+            let ts = base + i * SNAPSHOT_INTERVAL_SECS;
+            store.record_hashrate_snapshot(SnapshotWrite {
+                history_ts: ts,
+                state_ts: ts,
+                rates: HashrateWindows::uniform(10.0),
+                ..Default::default()
+            });
+        }
+        store.flush();
+
+        // Far enough ahead to age them past full resolution, but well inside
+        // the retention horizon that would delete them outright.
+        let now = base + FINE_HISTORY_FULL_RES_SECS + 600;
+        store.record_hashrate_snapshot(SnapshotWrite {
+            history_ts: now,
+            state_ts: now,
+            rates: HashrateWindows::uniform(20.0),
+            ..Default::default()
+        });
+        store.flush();
+
+        let kept: Vec<u64> = store
+            .get_hashrate_history(0, SNAPSHOT_INTERVAL_SECS)
+            .iter()
+            .map(|p| p.ts)
+            .collect();
+        assert_eq!(kept, vec![base, base + 60, now]);
+
+        drop(store);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Each fast window is emptied at the age past which no chart range draws
+    /// it, while the slow windows and the row itself stay. A column still
+    /// holding values past its horizon would be a series the chart is entitled
+    /// to draw over a range the pruner has already thinned.
+    #[test]
+    fn fast_windows_are_nulled_at_their_horizons() {
+        let db_path = make_temp_db();
+        let store = StatsStore::open(&db_path).unwrap();
+
+        let base = 9_999_960;
+        store.record_hashrate_snapshot(SnapshotWrite {
+            history_ts: base,
+            state_ts: base,
+            rates: HashrateWindows::uniform(10.0),
+            ..Default::default()
+        });
+        store.flush();
+
+        // Each pass ages the row a little further and empties one more window.
+        // The horizons are checked oldest-first, so every step also re-asserts
+        // that the previous one stayed empty.
+        let oldest = |store: &StatsStore| store.get_hashrate_history(0, SNAPSHOT_INTERVAL_SECS)[0];
+        let advance = |store: &StatsStore, horizon: u64| {
+            let now = base + horizon + 60;
+            store.record_hashrate_snapshot(SnapshotWrite {
+                history_ts: now,
+                state_ts: now,
+                rates: HashrateWindows::uniform(20.0),
+                ..Default::default()
+            });
+            store.flush();
+        };
+
+        let point = oldest(&store);
+        assert_eq!(point.one_minute, Some(10.0));
+        assert_eq!(point.five_minutes, Some(10.0));
+        assert_eq!(point.ten_minutes, Some(10.0));
+
+        advance(&store, FINE_1M_HORIZON_SECS);
+        let point = oldest(&store);
+        assert_eq!(point.one_minute, None);
+        assert_eq!(point.five_minutes, Some(10.0));
+
+        advance(&store, FINE_5M_HORIZON_SECS);
+        let point = oldest(&store);
+        assert_eq!(point.one_minute, None);
+        assert_eq!(point.five_minutes, None);
+        assert_eq!(point.ten_minutes, Some(10.0));
+
+        advance(&store, FINE_10M_HORIZON_SECS);
+        let point = oldest(&store);
+        assert_eq!(point.ten_minutes, None);
+        // The windows every range draws outlive all three, right up to the
+        // retention horizon that takes the whole row.
+        assert_eq!(point.one_hour, Some(10.0));
+        assert_eq!(point.six_hours, Some(10.0));
+        assert_eq!(point.twenty_four_hours, Some(10.0));
+
+        drop(store);
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Whole rows go at the retention horizon, however much of each is left.
     #[test]
     fn decayed_samples_are_dropped_past_their_horizon() {
         let db_path = make_temp_db();

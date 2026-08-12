@@ -423,10 +423,10 @@ With `prometheus_addr` set (default `0.0.0.0:9090`), an HTTP server exposes:
 
 | Route | Description |
 |---|---|
-| `GET /` | HTML dashboard: rolling hashrate and shares/min averages with 1h-180d ranges, workers, network difficulty + estimated next-retarget move, Bitcoin node info (implementation, version, BIP signaling tags), market data, probability, uptime (auto-refreshes) |
+| `GET /` | HTML dashboard: rolling hashrate and shares/min averages with 1h-30d ranges, each graph on its own range, workers, network difficulty + estimated next-retarget move, Bitcoin node info (implementation, version, BIP signaling tags), market data, probability, uptime (auto-refreshes) |
 | `GET /stats` | JSON snapshot of current pool state |
 | `GET /history` | Legacy 10-minute hashrate history (`?since=<unix-ts>`) |
-| `GET /chart` | Hashrate ECharts option data (`?window=1h\|6h\|24h\|1w\|30d\|180d\|all`) |
+| `GET /chart` | Hashrate ECharts option data (`?window=1h\|6h\|24h\|3d\|1w\|30d`) |
 | `GET /share-chart` | Accepted shares/min ECharts option data, same `?window=` values |
 | `GET /api/info` | Pool version, network, Stratum port, SV2 status, and authority public key |
 | `GET /metrics` | Prometheus text exposition |

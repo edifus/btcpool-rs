@@ -339,32 +339,18 @@ struct ChartParams {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChartWindow {
-    duration_secs: Option<u64>,
+    duration_secs: u64,
     bucket_secs: u64,
-    source: ChartSource,
 }
 
-/// Which record a chart range is drawn from.
+/// Bucket sizes are picked to land near 360 points per view. The shortest range
+/// buckets at the sampling interval, so the chart moves as often as the pool
+/// records — anything coarser would average away the 1m line's detail.
 ///
-/// The two are different statistics, not two resolutions of one. A decaying
-/// average is the pool's *current* reading under a named time constant — six of
-/// them, which is what makes the short ranges worth looking at. A ledger bucket
-/// is the mean implied by the bucket's summed credited work, so it needs no
-/// window family and carries no decay bias.
-///
-/// Short ranges keep the decayed view because watching the 1m line move is the
-/// point of a live chart. Everything longer comes from the ledger: the sums
-/// are exact, they survive estimator changes, and the ledger is the only one
-/// of the two retained past 48 hours.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChartSource {
-    Decayed,
-    Ledger,
-}
-
-/// Bucket sizes are picked to land near 360 points per view. The two shortest
-/// ranges bucket at the sampling interval, so the chart moves as often as the
-/// pool records — anything coarser would average away the 1m line's detail.
+/// Every range draws the decaying window family; which windows survive a given
+/// range is `plotted_series`'s call, since the history stops keeping the fast
+/// ones once no range can resolve them. The exact ledger sums back `/work` and
+/// `/history` instead, where a caller asks for a number rather than a shape.
 ///
 /// Note there is deliberately no `"1m"` or `"6m"` alias here: `1m` is a *series*
 /// name on this chart, and having it also mean "30 days" as a range made for a
@@ -372,41 +358,28 @@ enum ChartSource {
 fn chart_window(value: Option<&str>) -> ChartWindow {
     match value.unwrap_or("1h") {
         "1h" => ChartWindow {
-            duration_secs: Some(3_600),
+            duration_secs: 3_600,
             bucket_secs: crate::stats::SNAPSHOT_INTERVAL_SECS,
-            source: ChartSource::Decayed,
         },
         "6h" => ChartWindow {
-            duration_secs: Some(6 * 3_600),
+            duration_secs: 6 * 3_600,
             bucket_secs: 60,
-            source: ChartSource::Decayed,
         },
-        // From here on the ledger, whose buckets can be no finer than the
-        // minute it records on.
         "24h" => ChartWindow {
-            duration_secs: Some(24 * 3_600),
+            duration_secs: 24 * 3_600,
             bucket_secs: 5 * 60,
-            source: ChartSource::Ledger,
+        },
+        "3d" => ChartWindow {
+            duration_secs: 3 * 24 * 3_600,
+            bucket_secs: 15 * 60,
         },
         "1w" => ChartWindow {
-            duration_secs: Some(7 * 24 * 3_600),
+            duration_secs: 7 * 24 * 3_600,
             bucket_secs: 30 * 60,
-            source: ChartSource::Ledger,
         },
         "30d" => ChartWindow {
-            duration_secs: Some(30 * 24 * 3_600),
+            duration_secs: 30 * 24 * 3_600,
             bucket_secs: 2 * 3_600,
-            source: ChartSource::Ledger,
-        },
-        "180d" => ChartWindow {
-            duration_secs: Some(6 * 30 * 24 * 3_600),
-            bucket_secs: 12 * 3_600,
-            source: ChartSource::Ledger,
-        },
-        "all" => ChartWindow {
-            duration_secs: None,
-            bucket_secs: 12 * 3_600,
-            source: ChartSource::Ledger,
         },
         _ => chart_window(None),
     }
@@ -512,47 +485,43 @@ async fn rate_chart_response(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let since = window
-        .duration_secs
-        .map(|duration| now.saturating_sub(duration))
-        .unwrap_or(0);
+    let since = now.saturating_sub(window.duration_secs);
 
-    let chart = match window.source {
-        ChartSource::Decayed => {
-            let mut history = rate_history(
-                &state,
-                since,
-                window.bucket_secs,
-                move |stats, since, bucket| kind.decayed_history(stats, since, bucket),
-            )
-            .await;
+    let mut history = rate_history(
+        &state,
+        since,
+        window.bucket_secs,
+        move |stats, since, bucket| kind.decayed_history(stats, since, bucket),
+    )
+    .await;
 
-            // Append the current live value as the trailing edge of the chart,
-            // snapped to the bucket grid. Every other point is a bucket mean, so
-            // plotting a raw instantaneous sample at `now` put a different
-            // statistic at a different x offset and visibly kinked the
-            // right-hand end. If the query already returned the bucket we are
-            // inside, it holds the same samples and there is nothing to add.
-            let live_bucket = now / window.bucket_secs.max(1) * window.bucket_secs.max(1);
-            if history.last().map(|p| p.ts) != Some(live_bucket) {
-                history.push(kind.live_point(&state.stats.snapshot(), live_bucket));
-            }
-            build_decayed_chart_option(&history)
-        }
-        // No live point here: the ledger's open minute is still accumulating,
-        // and a partial bucket plotted beside completed ones would dip at the
-        // right-hand edge for no reason other than being measured early.
-        ChartSource::Ledger => {
-            let bucket = window.bucket_secs;
-            let stats = state.stats.clone();
-            let points = tokio::task::spawn_blocking(move || {
-                stats.work_history(since, bucket, crate::stats::LedgerScope::Pool)
-            })
-            .await
-            .unwrap_or_default();
-            build_ledger_chart_option(&points, kind)
-        }
+    // Append the current live value as the trailing edge of the chart, snapped
+    // to the bucket grid. Every other point is a bucket mean, so plotting a raw
+    // instantaneous sample at `now` put a different statistic at a different x
+    // offset and visibly kinked the right-hand end. If the query already
+    // returned the bucket we are inside, it holds the same samples and there is
+    // nothing to add.
+    let live_bucket = now / window.bucket_secs.max(1) * window.bucket_secs.max(1);
+    if history.last().map(|p| p.ts) != Some(live_bucket) {
+        history.push(kind.live_point(&state.stats.snapshot(), live_bucket));
+    }
+
+    // No live point on this one: the ledger's open bucket is still filling, and
+    // `work_history` withholds it until it closes rather than plotting a
+    // part-measured bucket that dips at the right-hand edge.
+    let exact = if draws_exact_series(window.duration_secs) {
+        let bucket = window.bucket_secs;
+        let stats = state.stats.clone();
+        tokio::task::spawn_blocking(move || {
+            stats.work_history(since, bucket, crate::stats::LedgerScope::Pool)
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
     };
+
+    let chart = build_chart_option(&history, &exact, kind, window.duration_secs);
 
     let body = serde_json::to_string(&chart).unwrap_or_else(|_| "{}".to_string());
     (
@@ -659,10 +628,7 @@ async fn work_json(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let since = window
-        .duration_secs
-        .map(|duration| now.saturating_sub(duration))
-        .unwrap_or(0);
+    let since = now.saturating_sub(window.duration_secs);
     // The ledger records on a minute grid, so a range whose chart bucket is
     // finer than that (the two live ranges) is served at the grid instead of
     // silently returning buckets that can only ever hold one row.
@@ -712,44 +678,150 @@ fn make_series(name: &str, data: Vec<serde_json::Value>, width: f64) -> serde_js
     })
 }
 
-/// One exact series per bucket, from the ledger. `connectNulls` stays off in
-/// the frame, so a stretch with no shares reads as a gap rather than a line
-/// drawn through it.
-fn build_ledger_chart_option(points: &[WorkHistoryPoint], kind: ChartKind) -> serde_json::Value {
-    let data = points
-        .iter()
-        .map(|point| json!([point.ts.saturating_mul(1_000), kind.ledger_value(point)]))
-        .collect();
-    chart_frame(
-        json!(["avg"]),
-        json!({ "avg": true }),
-        vec![make_series("avg", data, 1.6)],
-    )
+/// Dash a series' line. The client's skinning merges its colour into whatever
+/// `lineStyle` arrives, so a pattern set here survives to the canvas.
+fn dashed(mut series: serde_json::Value) -> serde_json::Value {
+    series["lineStyle"]["type"] = json!("dashed");
+    series
 }
 
-fn build_decayed_chart_option(history: &[RateHistoryPoint]) -> serde_json::Value {
-    chart_frame(
-        json!(["1m", "5m", "10m", "1h", "6h", "24h"]),
-        json!({ "1m": true, "5m": true, "10m": true, "1h": true, "6h": false, "24h": false }),
-        // Longest window first: ECharts paints series in array order, so this
-        // puts the short, fast-moving lines on top of the slow ones instead of
-        // burying them. The legend reads the other way round (see `legend.data`
-        // above) — it takes its order from that list, not from this one — and
-        // the client keys line colours by series *name* so that the two
-        // orderings can differ without shuffling the palette.
-        vec![
+/// One decaying window as it is drawn.
+struct DecayedSeries {
+    name: &'static str,
+    value: fn(&RateHistoryPoint) -> Option<f64>,
+    width: f64,
+    /// The age at which the history nulls this window's column, and so the
+    /// longest range that draws it. A range exactly this wide still reaches
+    /// every column it asks for: the pruner empties rows *older* than the
+    /// horizon, which is where the range's own query stops. Past it the line
+    /// would end partway across the chart — and by then the window's time
+    /// constant is a fraction of the bucket, so it has stopped saying anything
+    /// the slower lines beside it do not say more steadily.
+    horizon_secs: u64,
+    /// Whether it starts visible. The two slowest sit behind the legend on
+    /// arrival: six lines at once reads as a smear, and these are the two a
+    /// reader is least often after.
+    shown: bool,
+}
+
+/// Longest window first: ECharts paints series in array order, so this puts the
+/// short, fast-moving lines on top of the slow ones instead of burying them. The
+/// legend reads the other way round — it takes its order from `legend.data` —
+/// and the client keys line colours by series *name*, so the two orderings can
+/// differ without shuffling the palette.
+const DECAYED_SERIES: &[DecayedSeries] = &[
+    DecayedSeries {
+        name: "24h",
+        value: |p| p.twenty_four_hours,
+        width: 1.2,
+        horizon_secs: u64::MAX,
+        shown: false,
+    },
+    DecayedSeries {
+        name: "6h",
+        value: |p| p.six_hours,
+        width: 1.2,
+        horizon_secs: u64::MAX,
+        shown: false,
+    },
+    DecayedSeries {
+        name: "1h",
+        value: |p| p.one_hour,
+        width: 1.4,
+        horizon_secs: u64::MAX,
+        shown: true,
+    },
+    DecayedSeries {
+        name: "10m",
+        value: |p| p.ten_minutes,
+        width: 1.8,
+        horizon_secs: crate::stats::FINE_10M_HORIZON_SECS,
+        shown: true,
+    },
+    DecayedSeries {
+        name: "5m",
+        value: |p| p.five_minutes,
+        width: 1.2,
+        horizon_secs: crate::stats::FINE_5M_HORIZON_SECS,
+        shown: true,
+    },
+    DecayedSeries {
+        name: "1m",
+        value: |p| p.one_minute,
+        width: 1.0,
+        horizon_secs: crate::stats::FINE_1M_HORIZON_SECS,
+        shown: true,
+    },
+];
+
+/// The windows a range of `duration_secs` can draw, in paint order.
+fn plotted_series(duration_secs: u64) -> impl DoubleEndedIterator<Item = &'static DecayedSeries> {
+    DECAYED_SERIES
+        .iter()
+        .filter(move |series| series.horizon_secs >= duration_secs)
+}
+
+/// The ledger's exact bucket mean, drawn beside the window family rather than
+/// as one of it: not a decaying average under a time constant, but the rate
+/// implied by the work actually credited inside each bucket.
+const EXACT_SERIES: &str = "avg";
+
+/// Ranges this wide or wider also draw it. This is where the window family
+/// starts thinning out, and where a bucket is wide enough that what happened
+/// across it is a steadier reading than any average decaying through it.
+const EXACT_SERIES_MIN_RANGE_SECS: u64 = 7 * 24 * 3_600;
+
+fn draws_exact_series(duration_secs: u64) -> bool {
+    duration_secs >= EXACT_SERIES_MIN_RANGE_SECS
+}
+
+/// One range's chart: the window family it can still draw, plus the exact
+/// series where the range is wide enough to carry it.
+fn build_chart_option(
+    history: &[RateHistoryPoint],
+    exact: &[WorkHistoryPoint],
+    kind: ChartKind,
+    duration_secs: u64,
+) -> serde_json::Value {
+    let mut legend: Vec<serde_json::Value> = plotted_series(duration_secs)
+        .rev()
+        .map(|series| json!(series.name))
+        .collect();
+    let mut selected: serde_json::Map<String, serde_json::Value> = plotted_series(duration_secs)
+        .map(|series| (series.name.to_string(), json!(series.shown)))
+        .collect();
+    let mut series: Vec<serde_json::Value> = plotted_series(duration_secs)
+        .map(|series| {
             make_series(
-                "24h",
-                chart_series_data(history, |p| p.twenty_four_hours),
-                1.2,
-            ),
-            make_series("6h", chart_series_data(history, |p| p.six_hours), 1.2),
-            make_series("1h", chart_series_data(history, |p| p.one_hour), 1.4),
-            make_series("10m", chart_series_data(history, |p| p.ten_minutes), 1.8),
-            make_series("5m", chart_series_data(history, |p| p.five_minutes), 1.2),
-            make_series("1m", chart_series_data(history, |p| p.one_minute), 1.0),
-        ],
-    )
+                series.name,
+                chart_series_data(history, series.value),
+                series.width,
+            )
+        })
+        .collect();
+
+    if draws_exact_series(duration_secs) {
+        // Last in both orders — drawn on top of the averages it is the
+        // reference for, and listed after the family it is not a member of.
+        // `connectNulls` stays off in the frame, so a stretch with no shares
+        // reads as a gap rather than a line drawn through it.
+        // The dash belongs to the line, not to the legend icon: at pip size a
+        // dashed stroke is more gap than ink and reads as a switched-off entry.
+        // The icon keeps the series colour — this overrides the pattern only.
+        legend.push(json!({ "name": EXACT_SERIES, "lineStyle": { "type": "solid" } }));
+        selected.insert(EXACT_SERIES.to_string(), json!(true));
+        let data = exact
+            .iter()
+            .map(|point| json!([point.ts.saturating_mul(1_000), kind.ledger_value(point)]))
+            .collect();
+        // Dashed and a little heavier than any window: it is a different
+        // statistic, and the difference should survive being read in one
+        // glance, on a phone, or by someone who cannot separate its hue from
+        // the six beside it.
+        series.push(dashed(make_series(EXACT_SERIES, data, 2.0)));
+    }
+
+    chart_frame(json!(legend), json!(selected), series)
 }
 
 /// Everything both charts agree on. Unit-agnostic — the hashrate and shares/min
@@ -1313,10 +1385,9 @@ tr:last-child td { border-bottom: none; }
         <option value="1h" selected>1h</option>
         <option value="6h">6h</option>
         <option value="24h">24h</option>
+        <option value="3d">3d</option>
         <option value="1w">1w</option>
         <option value="30d">30d</option>
-        <option value="180d">180d</option>
-        <option value="all">All</option>
       </select>
     </div>
     <div id="hashrate-chart"></div>
@@ -1327,10 +1398,9 @@ tr:last-child td { border-bottom: none; }
         <option value="1h" selected>1h</option>
         <option value="6h">6h</option>
         <option value="24h">24h</option>
+        <option value="3d">3d</option>
         <option value="1w">1w</option>
         <option value="30d">30d</option>
-        <option value="180d">180d</option>
-        <option value="all">All</option>
       </select>
     </div>
     <div id="sharerate-chart"></div>
@@ -1485,7 +1555,7 @@ function cssVar(name) {
 // `window=`, but the picker is set from this value and has no option to select
 // for anything outside the list.
 const DEFAULT_WINDOW = '1h';
-const WINDOWS = ['1h', '6h', '24h', '1w', '30d', '180d', 'all'];
+const WINDOWS = ['1h', '6h', '24h', '3d', '1w', '30d'];
 function storedWindow(key) {
   try {
     const w = localStorage.getItem(key);
@@ -1531,9 +1601,11 @@ function workerLed(w, nowSec) {
 // only in the endpoint they poll, the unit their values carry, and where their
 // preferences are stored. Each owns its range picker, so one graph can sit on a
 // week while the other stays on the live hour.
-// The six decaying windows the live ranges plot, plus 'avg' — the single exact
-// series the server sends for ranges served from the share ledger, where a
-// bucket mean needs no window family.
+// Every series the server can draw: the decaying windows, plus 'avg' — the
+// ledger's exact bucket mean, which the long ranges carry beside them. No one
+// range draws all of these (a long range drops the fast windows, a short one
+// has no exact line), but a toggle stored from any of them must survive the
+// round trip.
 const LEGEND_SERIES = ['1m', '5m', '10m', '1h', '6h', '24h', 'avg'];
 
 // The server sends a default show/hide map with every poll; this is what makes a
@@ -1915,9 +1987,13 @@ async function loadChart(panel, window) {
       '1h':  light ? '#dc2626' : '#f87171',
       '6h':  light ? '#7c3aed' : '#a78bfa',
       '24h': light ? '#0e7490' : '#22d3ee',
-      // The ledger's exact series never shares a chart with the six above, so
-      // it takes the accent rather than a slot in the window ramp.
-      'avg': light ? '#b45309' : '#f59e0b'
+      // The exact series shares a chart with the windows above on the long
+      // ranges, so it takes the one hue their ramp leaves free. Not a neutral:
+      // near-white sits on top of both the legend text and the greyed-out
+      // colour a disabled entry takes, which left its pip reading the same
+      // switched on as off. Its dashed line is what sets it apart from a
+      // window, not its brightness.
+      'avg': light ? '#be185d' : '#f472b6'
     };
     const series = Array.isArray(options.series) ? options.series : [options.series].filter(Boolean);
     // ECharts assigns global colours by series order, not legend order. The
@@ -1931,7 +2007,12 @@ async function loadChart(panel, window) {
       line.itemStyle = Object.assign(line.itemStyle || {}, { color });
     });
     if (options.legend) {
-      options.legend.textStyle = { color: muted, fontSize: 11 };
+      // A drawn entry reads at full text weight and a switched-off one greys
+      // out. ECharts' default inactive colour is a fixed light grey, which on
+      // the dark theme is brighter than the text it replaces — every entry got
+      // *lighter* on being switched off.
+      options.legend.textStyle = { color: text, fontSize: 11 };
+      options.legend.inactiveColor = muted;
       // The server sends a default show/hide map on every poll. Without this
       // the chart would undo the user's legend clicks once per refresh. The
       // live chart wins where it exists; on the first load it has not been
@@ -2357,8 +2438,8 @@ setInterval(fetchBtcPrice, 60000);
 #[cfg(test)]
 mod tests {
     use super::{
-        build_decayed_chart_option, build_ledger_chart_option, canonical_scope_param, chart_window,
-        ChartKind, ChartSource, ChartWindow, DASHBOARD_HTML,
+        build_chart_option, canonical_scope_param, chart_window, plotted_series, ChartKind,
+        ChartWindow, DASHBOARD_HTML,
     };
     use crate::stats::WorkHistoryPoint;
     use std::collections::HashSet;
@@ -2395,18 +2476,18 @@ mod tests {
         assert_eq!(
             chart_window(None),
             ChartWindow {
-                duration_secs: Some(3_600),
+                duration_secs: 3_600,
                 bucket_secs: crate::stats::SNAPSHOT_INTERVAL_SECS,
-                source: ChartSource::Decayed,
             }
         );
         assert_eq!(chart_window(Some("6h")).bucket_secs, 60);
         assert_eq!(chart_window(Some("24h")).bucket_secs, 300);
+        assert_eq!(chart_window(Some("3d")).bucket_secs, 900);
         assert_eq!(chart_window(Some("30d")).bucket_secs, 7_200);
         assert_eq!(chart_window(Some("unknown")), chart_window(None));
         assert!(DASHBOARD_HTML.contains("const DEFAULT_WINDOW = '1h'"));
 
-        // "1m" and "6m" must fall through to the default, not alias 30d/180d —
+        // "1m" and "6m" must fall through to the default, not alias a month —
         // that would collide with the 1m series name.
         assert_eq!(chart_window(Some("1m")), chart_window(None));
         assert_eq!(chart_window(Some("6m")), chart_window(None));
@@ -2475,24 +2556,35 @@ mod tests {
 
     /// The legend's persistence allowlist drops keys it does not recognise, so
     /// a series the server draws but the JS list omits would toggle fine and
-    /// then forget the toggle on reload. One allowlist covers both panels and
-    /// both sources, so it has to be the union of everything the server can
-    /// draw — the decayed windows and the ledger's exact series.
+    /// then forget the toggle on reload. No single range draws everything, so
+    /// the allowlist is the union: a short range's full window family plus the
+    /// exact series only the long ones carry.
     #[test]
     fn legend_series_agree_between_js_and_server() {
-        let legend_of = |option: &serde_json::Value| -> Vec<String> {
-            option["legend"]["data"]
+        // An entry is a bare name, or an object when it overrides how its icon
+        // is drawn.
+        let legend_of = |duration: u64| -> Vec<String> {
+            build_chart_option(&[], &[], ChartKind::Hashrate, duration)["legend"]["data"]
                 .as_array()
                 .expect("legend.data")
                 .iter()
-                .map(|name| name.as_str().expect("series name").to_string())
+                .map(|entry| {
+                    entry
+                        .as_str()
+                        .or_else(|| entry["name"].as_str())
+                        .expect("series name")
+                        .to_string()
+                })
                 .collect()
         };
-        let mut served = legend_of(&build_decayed_chart_option(&[]));
-        served.extend(legend_of(&build_ledger_chart_option(
-            &[],
-            ChartKind::Hashrate,
-        )));
+
+        let mut served = legend_of(0);
+        let long = legend_of(chart_window(Some("30d")).duration_secs);
+        let fresh: Vec<String> = long
+            .into_iter()
+            .filter(|name| !served.contains(name))
+            .collect();
+        served.extend(fresh);
 
         assert_eq!(
             served,
@@ -2501,11 +2593,59 @@ mod tests {
         );
     }
 
-    /// A ledger range plots one exact line, not the six-window family: mixing
-    /// the two would put a decaying average and a true bucket mean on the same
-    /// axis under names that imply they are comparable.
+    /// The exact series joins the long ranges, where the window family has
+    /// thinned and a wide bucket's credited work is the steadier reading. On a
+    /// live range it would be a minute-grid line under averages moving faster
+    /// than it can, so those ranges do not pay for the query at all.
     #[test]
-    fn ledger_ranges_plot_one_exact_series() {
+    fn long_ranges_draw_the_exact_series_beside_the_averages() {
+        let names = |range: &str| -> Vec<String> {
+            let duration = chart_window(Some(range)).duration_secs;
+            build_chart_option(&[], &[], ChartKind::Hashrate, duration)["series"]
+                .as_array()
+                .expect("series array")
+                .iter()
+                .map(|s| s["name"].as_str().expect("series name").to_string())
+                .collect()
+        };
+
+        for range in ["1h", "6h", "24h", "3d"] {
+            assert!(
+                !names(range).contains(&"avg".to_string()),
+                "range {range} must not draw the exact series"
+            );
+        }
+        // Last, so it paints over the averages rather than under them.
+        for range in ["1w", "30d"] {
+            assert_eq!(
+                names(range).last().map(String::as_str),
+                Some("avg"),
+                "range {range} must draw the exact series on top"
+            );
+        }
+
+        // Told apart by its line, not by its colour: the six windows own a hue
+        // ramp, and a seventh hue beside them is the weakest cue on the chart.
+        let week = chart_window(Some("1w")).duration_secs;
+        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, week);
+        let series = chart["series"].as_array().expect("series array");
+        let exact = series.last().expect("exact series");
+        assert_eq!(exact["lineStyle"]["type"], "dashed");
+        let widest_window = series[..series.len() - 1]
+            .iter()
+            .filter_map(|s| s["lineStyle"]["width"].as_f64())
+            .fold(0.0, f64::max);
+        assert!(exact["lineStyle"]["width"].as_f64().unwrap() > widest_window);
+        for window in &series[..series.len() - 1] {
+            assert!(window["lineStyle"]["type"].is_null());
+        }
+    }
+
+    /// A ledger bucket converts to a rate by its own span, not the chart's
+    /// grid: buckets past the rollup horizon cover whole hours, and dividing
+    /// one of those by a half-hour grid reads twice as high.
+    #[test]
+    fn ledger_buckets_convert_by_their_own_span() {
         let points = [
             WorkHistoryPoint {
                 ts: 1_700_000_000,
@@ -2514,8 +2654,6 @@ mod tests {
                 rejected: 1,
                 span_secs: 300,
             },
-            // Past the rollup horizon: same series, hour-long span, and the
-            // divisor must follow the span rather than the chart's grid.
             WorkHistoryPoint {
                 ts: 1_700_000_300,
                 work: 14_400,
@@ -2524,15 +2662,18 @@ mod tests {
                 span_secs: 3_600,
             },
         ];
-        let chart = build_ledger_chart_option(&points, ChartKind::Hashrate);
-
-        let series = chart["series"].as_array().expect("series array");
-        assert_eq!(series.len(), 1);
-        assert_eq!(series[0]["name"], "avg");
+        let week = chart_window(Some("1w")).duration_secs;
+        let drawn = |kind: ChartKind| -> Vec<serde_json::Value> {
+            let chart = build_chart_option(&[], &points, kind, week);
+            let series = chart["series"].as_array().expect("series array").clone();
+            let exact = series.last().expect("exact series").clone();
+            assert_eq!(exact["name"], "avg");
+            exact["data"].as_array().expect("data array").clone()
+        };
 
         // work × 2³² / span_secs, exactly — this is the identity the whole
         // ledger exists to preserve, so it is asserted rather than approximated.
-        let data = series[0]["data"].as_array().expect("data array");
+        let data = drawn(ChartKind::Hashrate);
         assert_eq!(data[0][0], 1_700_000_000_000_u64);
         let expected = 600.0 * crate::mining::hashrate::NONCES / 300.0;
         assert!((data[0][1].as_f64().unwrap() - expected).abs() < 1e-6);
@@ -2540,10 +2681,7 @@ mod tests {
         assert!((data[1][1].as_f64().unwrap() - expected).abs() < 1e-6);
 
         // Shares/min reads the count instead, over each bucket's own span.
-        let shares = build_ledger_chart_option(&points, ChartKind::ShareRate);
-        let data = shares["series"][0]["data"]
-            .as_array()
-            .expect("share data array");
+        let data = drawn(ChartKind::ShareRate);
         assert!((data[0][1].as_f64().unwrap() - 4.0).abs() < 1e-9);
         assert!((data[1][1].as_f64().unwrap() - 8.0).abs() < 1e-9);
     }
@@ -2576,24 +2714,43 @@ mod tests {
         assert!(canonical_scope_param(&address, Network::Testnet).is_none());
     }
 
-    /// Ranges past the decayed tables' 48-hour retention must be served from
-    /// the ledger, or they would plot an ever-shrinking window of history.
+    /// The series a range draws and the columns the pruner keeps are one
+    /// ladder read from two ends. A range wider than a window's horizon would
+    /// draw a line that stops partway across the chart — the pruner nulled the
+    /// column — so every drawn series must be retained over the whole range.
     #[test]
-    fn long_ranges_are_served_from_the_ledger() {
-        for range in ["24h", "1w", "30d", "180d", "all"] {
-            assert_eq!(
-                chart_window(Some(range)).source,
-                ChartSource::Ledger,
-                "range {range} must come from the ledger"
-            );
+    fn ranges_only_draw_windows_the_history_still_keeps() {
+        for range in ["1h", "6h", "24h", "3d", "1w", "30d"] {
+            let duration = chart_window(Some(range)).duration_secs;
+            for series in plotted_series(duration) {
+                assert!(
+                    series.horizon_secs >= duration,
+                    "range {range} draws {} past its retention",
+                    series.name
+                );
+            }
         }
-        for range in ["1h", "6h"] {
-            assert_eq!(
-                chart_window(Some(range)).source,
-                ChartSource::Decayed,
-                "range {range} is a live view and must stay decayed"
-            );
-        }
+
+        // Each range draws every window still kept over it, so a range sitting
+        // exactly on a horizon keeps that window rather than handing it back
+        // early. Both ends of the ladder move together or the test fails.
+        let drawn = |range: &str| -> Vec<&str> {
+            plotted_series(chart_window(Some(range)).duration_secs)
+                .map(|series| series.name)
+                .collect()
+        };
+        assert_eq!(drawn("24h"), ["24h", "6h", "1h", "10m", "5m", "1m"]);
+        assert_eq!(drawn("3d"), ["24h", "6h", "1h", "10m", "5m", "1m"]);
+        assert_eq!(drawn("1w"), ["24h", "6h", "1h", "10m", "5m"]);
+        assert_eq!(drawn("30d"), ["24h", "6h", "1h", "10m"]);
+        assert_eq!(
+            (
+                crate::stats::FINE_1M_HORIZON_SECS,
+                crate::stats::FINE_5M_HORIZON_SECS,
+                crate::stats::FINE_10M_HORIZON_SECS,
+            ),
+            (3 * 86_400, 7 * 86_400, 30 * 86_400)
+        );
     }
 
     /// The legend lists the windows shortest-first while the series are drawn
@@ -2603,7 +2760,7 @@ mod tests {
     /// them into agreement.
     #[test]
     fn chart_draws_short_windows_over_long_ones() {
-        let chart = build_decayed_chart_option(&[]);
+        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, 0);
 
         let drawn: Vec<&str> = chart["series"]
             .as_array()
@@ -2653,7 +2810,7 @@ mod tests {
     /// shrinks. The two settings are only correct together.
     #[test]
     fn chart_grid_does_not_double_count_axis_label_space() {
-        let chart = build_decayed_chart_option(&[]);
+        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, 0);
         let grid = &chart["grid"];
 
         assert_eq!(
@@ -2682,7 +2839,7 @@ mod tests {
     /// `hideOverlap` as the backstop.
     #[test]
     fn chart_axis_labels_adapt_to_the_rendered_width() {
-        let chart = build_decayed_chart_option(&[]);
+        let chart = build_chart_option(&[], &[], ChartKind::Hashrate, 0);
         assert_eq!(chart["xAxis"]["axisLabel"]["hideOverlap"], true);
         assert_eq!(chart["yAxis"]["axisLabel"]["hideOverlap"], true);
 

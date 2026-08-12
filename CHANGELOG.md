@@ -10,6 +10,24 @@ everything else bumps the **patch** version.
 ## [Unreleased]
 
 ### Changed
+- **Every chart range plots the rolling averages again.** 24h, 1w and 30d had
+  converged on the ledger's single exact line; they now draw the same decaying
+  window family as the live ranges. Each range draws every window the history
+  still keeps over it, which is as far as each one resolves anything: all six
+  through 3d, then 1w drops 1m and 30d drops 5m with it.
+- **The exact line joins them on 1w and 30d** rather than replacing them: the
+  ledger's `avg` is drawn on top of the averages in a neutral colour outside
+  their hue ramp, and toggles off from the legend like any other series. Those
+  are the ranges where the family has thinned and a wide bucket's credited work
+  is the steadier reading; a live range does not run the query at all.
+- **A 3-day range**, between 24h and a week. **`180d` and `all` are gone**: the
+  decaying averages are not kept that far back, and at those widths every line
+  had flattened into the same one.
+- **The decayed-average history is kept for 31 days instead of 48 hours**, at
+  full sampling resolution for the first two days and thinned to one row a
+  minute after that — no chart range past 6h reads a finer grid. Each window's
+  column is emptied at the age above, so the table carries only what something
+  can still draw. A month of history costs single-digit MB.
 - **Each graph carries its own range picker.** The row of range buttons that
   drove both charts is now a dropdown beside each graph's Hide/Show toggle,
   sized to match it and sitting where the buttons did. The two graphs are
@@ -17,6 +35,12 @@ everything else bumps the **patch** version.
   the live hour — and each remembers its own range across reloads. A phone no
   longer has to give the ranges a row of their own to keep them from
   crumpling, so both heads read the same at every width.
+
+### Removed
+- **`hashrate_history.hashrate_hps` is no longer `NOT NULL`** — it holds the
+  10m window under the operational name, and the retention pass empties it like
+  the other fast columns. Schema v2: **existing stats databases must be deleted
+  or moved aside.**
 
 ## [0.5.0] - 2026-08-11
 
