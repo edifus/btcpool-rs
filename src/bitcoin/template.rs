@@ -508,7 +508,13 @@ fn build_coinbase(
 
     // ── Assemble transaction (non-segwit serialisation for coinbase) ──────────
     let tx = Transaction {
-        version: bitcoin::transaction::Version(1),
+        // Consensus does not constrain a coinbase's version — `CheckTransaction`
+        // ignores it, standardness never sees a transaction that is not relayed,
+        // and BIP68's relative locktimes exclude coinbases outright. This is 2
+        // because that is what Core's assembler emits, and a pool's blocks
+        // should not be distinguishable from a default node's by a field that
+        // means nothing.
+        version: bitcoin::transaction::Version(2),
         lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
         input: vec![coinbase_input],
         output: outputs,
@@ -548,9 +554,10 @@ fn build_coinbase(
     let offset = SCRIPT_SIG_OFFSET + height_script.len() + tag_bytes.len();
 
     // The coinbase has to fit in the room Core's assembler held back for it, or
-    // the block exceeds the weight limit. It is witness-free here, so weight is
-    // simply four times the size; the witness reserved value added at submit
-    // time is 32 bytes of witness data, one weight unit each.
+    // the block exceeds the weight limit. It is witness-free here, so its weight
+    // is four times the size — plus the 36 witness bytes submission adds, which
+    // weigh one unit each: the segwit marker and flag, the stack item count, the
+    // 32-byte reserved value and its length byte.
     let coinbase_weight = serialized.len() as u64 * 4 + 36;
     if coinbase_weight > COINBASE_WEIGHT_RESERVE {
         return Err(PoolError::Other(anyhow::anyhow!(
@@ -702,13 +709,8 @@ pub fn bits_to_target(bits_hex: &str) -> Result<[u8; 32], PoolError> {
 pub fn bits_to_difficulty(bits_hex: &str) -> Result<f64, PoolError> {
     let bits = u32::from_str_radix(bits_hex, 16)
         .map_err(|_| PoolError::Other(anyhow::anyhow!("Invalid bits: {bits_hex}")))?;
-    let exponent = ((bits >> 24) & 0xff) as i32;
-    let mantissa = (bits & 0x007f_ffff) as u64;
-    if mantissa == 0 {
-        return Err(PoolError::Other(anyhow::anyhow!(
-            "Invalid bits mantissa = 0"
-        )));
-    }
+    let (exponent, mantissa) = decode_compact(bits)?;
+    let (exponent, mantissa) = (exponent as i32, mantissa as u64);
 
     // difficulty = diff1_target / current_target
     // diff1_target = 0x00ffff * 2^208
@@ -785,27 +787,59 @@ pub fn hash_to_difficulty(hash_le: &[u8; 32]) -> u64 {
     }
 }
 
-fn compact_to_target(bits: u32) -> Result<[u8; 32], PoolError> {
+/// Split compact `bits` into `(exponent, mantissa)`, refusing the encodings no
+/// usable target can come from.
+///
+/// Core's `SetCompact` reports these through its `pfNegative` and `pfOverflow`
+/// out-parameters rather than failing, and `CheckProofOfWork` then rejects the
+/// block on any of them — together with a target of zero. Raising them here
+/// instead keeps both readers of `bits` refusing the same inputs: the target the
+/// pool compares every share against, and the difficulty it reports.
+///
+/// The width bound is a step tighter than Core's, which still admits an exponent
+/// of 33 or 34 when the mantissa is small enough to fit under it. No network's
+/// `powLimit` reaches even 32 — regtest's `0x207fffff` is the highest there is —
+/// so those encodings are unmineable everywhere, and refusing them keeps the
+/// byte placement below a single bounds case.
+fn decode_compact(bits: u32) -> Result<(usize, u32), PoolError> {
     let exponent = ((bits >> 24) & 0xff) as usize;
     let mantissa = bits & 0x007f_ffff;
 
     if mantissa == 0 {
-        return Ok([0u8; 32]);
+        return Err(PoolError::Other(anyhow::anyhow!(
+            "bits {bits:08x} carry a zero mantissa, which is not a target"
+        )));
     }
+    if bits & 0x0080_0000 != 0 {
+        return Err(PoolError::Other(anyhow::anyhow!(
+            "bits {bits:08x} set the sign bit; a negative target is not a target"
+        )));
+    }
+    if exponent > 32 {
+        return Err(PoolError::Other(anyhow::anyhow!(
+            "bits {bits:08x} overflow the 32-byte target width"
+        )));
+    }
+    // Below exponent 4 the mantissa is shifted *down* out of its three bytes, so
+    // a small one vanishes entirely: the remaining route to the `bnTarget == 0`
+    // that no hash can ever satisfy.
+    if exponent <= 3 && mantissa >> (8 * (3 - exponent)) == 0 {
+        return Err(PoolError::Other(anyhow::anyhow!(
+            "bits {bits:08x} shift their mantissa away to a zero target"
+        )));
+    }
+
+    Ok((exponent, mantissa))
+}
+
+fn compact_to_target(bits: u32) -> Result<[u8; 32], PoolError> {
+    let (exponent, mantissa) = decode_compact(bits)?;
 
     let mut target = [0u8; 32];
     if exponent <= 3 {
         let value = mantissa >> (8 * (3 - exponent));
-        let bytes = value.to_be_bytes();
-        target[28..32].copy_from_slice(&bytes);
+        target[28..32].copy_from_slice(&value.to_be_bytes());
         return Ok(target);
-    }
-
-    let shift = exponent - 3;
-    if shift > 29 {
-        return Err(PoolError::Other(anyhow::anyhow!(
-            "bits overflow target width: {bits:08x}"
-        )));
     }
 
     let mantissa_bytes = [
@@ -813,7 +847,8 @@ fn compact_to_target(bits: u32) -> Result<[u8; 32], PoolError> {
         ((mantissa >> 8) & 0xff) as u8,
         (mantissa & 0xff) as u8,
     ];
-    let offset = 32 - 3 - shift;
+    // exponent <= 32 above, so this is 29 at most and the slice is in bounds.
+    let offset = 32 - 3 - (exponent - 3);
     target[offset..offset + 3].copy_from_slice(&mantissa_bytes);
     Ok(target)
 }
@@ -1050,6 +1085,34 @@ mod tests {
         // Genesis bits: 0x1d00ffff
         let target = bits_to_target("1d00ffff").unwrap();
         assert_eq!(&target[..6], &[0, 0, 0, 0, 0xff, 0xff]);
+    }
+
+    /// `bits` that Core's `CheckProofOfWork` would refuse must not become a
+    /// target here either — and must be refused identically by the difficulty
+    /// reader, which reads the same field. A target accepted from an encoding a
+    /// node rejects is a target no block built against it could ever satisfy.
+    #[test]
+    fn bits_that_cannot_be_a_target_are_refused_by_both_readers() {
+        for (bits, why) in [
+            ("1d000000", "zero mantissa"),
+            ("1d80ffff", "sign bit set"),
+            ("2100ffff", "exponent past the 32-byte target width"),
+            ("01000001", "mantissa shifted away to zero"),
+        ] {
+            assert!(
+                bits_to_target(bits).is_err(),
+                "bits {bits} ({why}) must not yield a target"
+            );
+            assert!(
+                bits_to_difficulty(bits).is_err(),
+                "bits {bits} ({why}) must not yield a difficulty"
+            );
+        }
+
+        // The widest exponent any network's powLimit uses — regtest — still
+        // decodes, so the bound rejects only what is already unmineable.
+        assert!(bits_to_target("207fffff").is_ok());
+        assert!(bits_to_difficulty("207fffff").is_ok());
     }
 
     #[test]

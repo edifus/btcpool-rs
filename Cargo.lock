@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "btcpool-rs"
-version = "0.6.0-alpha3"
+version = "0.6.0-alpha4"
 dependencies = [
  "anyhow",
  "axum",

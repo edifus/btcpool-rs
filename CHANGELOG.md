@@ -35,8 +35,21 @@ everything else bumps the **patch** version.
   the live hour — and each remembers its own range across reloads. A phone no
   longer has to give the ranges a row of their own to keep them from
   crumpling, so both heads read the same at every width.
+- **The coinbase transaction declares version 2**, which is what Core's own
+  assembler emits. Consensus does not constrain the field on a coinbase, so this
+  changes nothing about validity — it stops the pool's blocks being tellable
+  from a default node's by a number that carries no meaning.
 
 ### Fixed
+- **Compact `bits` a node would refuse no longer decode to a target.** The sign
+  bit was masked away silently, a zero mantissa produced an all-zero target
+  rather than an error, and a mantissa small enough to be shifted out from under
+  a low exponent did the same — all of them the `bnTarget == 0`, negative, or
+  overflowing cases `CheckProofOfWork` rejects outright. The target the pool
+  compares shares against and the difficulty it reports now come from one
+  validated decode, so neither can accept an encoding the other refuses. The
+  values a real node sends are unaffected; this closes the gap between what the
+  pool would mine against and what the network would accept.
 - **A chart range now draws the span it advertises, however little history
   stands behind it.** The x-axis was left to scale itself around whatever rows
   came back, so a range wider than the pool's uptime described its data instead
