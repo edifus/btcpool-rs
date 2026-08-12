@@ -569,7 +569,27 @@ fn template_age_from(
 /// resubmitting the same bytes can never succeed. Everything else (transport
 /// errors, node restarting, unexpected responses) is worth retrying.
 fn is_permanent_reject(e: &PoolError) -> bool {
-    matches!(e, PoolError::SubmitBlockRejected(_))
+    match e {
+        PoolError::SubmitBlockRejected(reason) => !is_retryable_reject(reason),
+        _ => false,
+    }
+}
+
+/// The one `submitblock` rejection that the same bytes can recover from.
+///
+/// A block whose timestamp is more than two hours ahead of the validating node
+/// fails `CheckBlockHeader` before the header enters the block index, so — alone
+/// among the reject reasons — the node does not remember it as invalid, and the
+/// identical block is accepted once its clock catches up.
+///
+/// The pool can produce one: `ntime_ceiling` caps a share at two hours past
+/// whichever is earlier of the template's time and the *pool's* clock, while the
+/// node measures the same allowance against its own. Any skew that leaves the
+/// pool ahead puts a miner rolling ntime to the ceiling over the node's limit.
+/// Treating that as permanent threw the block away on the first attempt; the
+/// retry ladder outlasts any plausible skew.
+fn is_retryable_reject(reason: &str) -> bool {
+    reason == "time-too-new"
 }
 
 /// Write the block hex to `<found_block_dir>/block_<height>_<hash>.hex` so the
@@ -666,6 +686,44 @@ mod tests {
         // Boundary is exclusive: exactly at the threshold is already stale.
         assert!(!is_fresh(true, TEMPLATE_STALE_AFTER));
         assert!(!is_fresh(true, TEMPLATE_STALE_AFTER * 2));
+    }
+
+    // ── is_permanent_reject ─────────────────────────────────────────────────
+
+    /// Giving up on the first attempt is right for a block consensus will never
+    /// take, and wrong for the one rejection a clock fixes by itself. A block is
+    /// the rarest event this pool has; the cost of retrying a hopeless one is a
+    /// few RPC calls, and the cost of not retrying a recoverable one is the
+    /// block.
+    #[test]
+    fn only_a_future_timestamp_survives_a_submitblock_rejection() {
+        let rejected =
+            |reason: &str| is_permanent_reject(&PoolError::SubmitBlockRejected(reason.to_owned()));
+
+        // Consensus failures the same bytes can never clear.
+        for reason in [
+            "high-hash",
+            "bad-cb-height",
+            "bad-txnmrklroot",
+            "bad-witness-nonce-size",
+            "bad-cb-amount",
+            "duplicate-invalid",
+            "rejected",
+        ] {
+            assert!(rejected(reason), "{reason} must not be retried");
+        }
+
+        // The node's clock will catch up, and the retry ladder outlasts it.
+        assert!(
+            !rejected("time-too-new"),
+            "a future timestamp must go to the retry ladder, not be thrown away"
+        );
+
+        // Everything that is not a rejection at all — transport failures, a
+        // restarting node — was already retryable and stays that way.
+        assert!(!is_permanent_reject(&PoolError::Other(anyhow::anyhow!(
+            "connection refused"
+        ))));
     }
 
     // ── drive_refresh_loop ──────────────────────────────────────────────────

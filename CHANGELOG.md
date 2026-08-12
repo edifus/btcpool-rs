@@ -41,6 +41,18 @@ everything else bumps the **patch** version.
   from a default node's by a number that carries no meaning.
 
 ### Fixed
+- **A found block rejected as `time-too-new` is retried instead of thrown
+  away.** Every `submitblock` rejection was treated as final, which is right for
+  a block consensus will never take and wrong for the one reason a clock fixes
+  by itself: a timestamp more than two hours ahead of the validating node fails
+  before the header enters its block index, so — alone among the rejections —
+  the node does not remember the block as invalid and accepts the identical
+  bytes once its clock catches up. The pool can produce one, because it measures
+  its ntime allowance against its own clock and the node measures the same
+  allowance against its; any skew leaving the pool ahead puts a miner rolling
+  ntime to the ceiling over the node's limit. Such a block now goes to the
+  retry ladder, which outlasts any plausible skew, rather than being abandoned
+  on the first attempt.
 - **Compact `bits` a node would refuse no longer decode to a target.** The sign
   bit was masked away silently, a zero mantissa produced an all-zero target
   rather than an error, and a mantissa small enough to be shifted out from under
