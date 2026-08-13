@@ -927,7 +927,15 @@ fn chart_frame(
         },
         "yAxis": {
             "type": "value",
-            "min": 0,
+            // Fitted to what is plotted rather than floored at zero. A fleet
+            // holding ~19 TH/s against a zero baseline is a flat line in the top
+            // few percent of the grid, and the spread between the window
+            // averages — the whole point of drawing six of them — collapses into
+            // it. `scale` rather than a computed min/max because ECharts refits
+            // when a series is toggled off, which a bound sent from here could
+            // not, and because the data is blanked after this frame is built
+            // while the chart is still collecting.
+            "scale": true,
             "splitLine": { "show": true },
             "axisLabel": { "fontSize": 10, "hideOverlap": true }
         },
@@ -1742,7 +1750,11 @@ const hashratePanel = ratePanel({
 const sharePanel = ratePanel({
   canvasId: 'sharerate-chart', toggleId: 'sharerate-chart-toggle', endpoint: '/share-chart',
   windowSelectId: 'sharerate-chart-window', windowKey: 'btcpool-share-window',
-  legendKey: 'btcpool-share-legend', collapsedKey: 'shareChartCollapsed', fmt: fmtSpm
+  legendKey: 'btcpool-share-legend', collapsedKey: 'shareChartCollapsed', fmt: fmtSpm,
+  // Shares are counted whole, so an axis fitted to a quiet pool — 0.8 to 1.4 a
+  // minute, ticking in tenths — would print '1' at every gridline. This floors
+  // the tick interval, not the bound: the axis still fits its lines.
+  yMinInterval: 1
 });
 const PANELS = [hashratePanel, sharePanel];
 
@@ -1768,16 +1780,51 @@ function applyResponsiveLayout(panel, options) {
     grid.top = 44 + 22 * (legendRows - 1);
   }
 
-  // Two decimals ('25.00 T') is a lot of y-axis label on a narrow screen, and
-  // containLabel turns every pixel saved there into plot width.
   const yAxis = Array.isArray(options.yAxis) ? options.yAxis[0] : options.yAxis;
   if (yAxis) {
-    const digits = width > 0 && width < 420 ? 0 : 2;
+    // Always assigned, never conditionally dropped: a merge setOption cannot
+    // unset a key, so a value written once would stick on a panel that wants
+    // none. `undefined` is the no-op.
+    yAxis.minInterval = panel.yMinInterval;
     yAxis.axisLabel = Object.assign(yAxis.axisLabel || {}, {
-      formatter: v => panel.fmt(v, true, digits)
+      formatter: v => panel.fmt(v, true, yAxisDigits(panel, width))
     });
   }
   return options;
+}
+
+// The precision a y-axis label needs to read differently from the one above it.
+// An axis fitted to its lines can span less than the label's own rounding: 17.0
+// to 18.5 T ticks every 0.3 T, which at zero decimals prints '17, 17, 17, 18'.
+// hideOverlap is no help — the duplicates sit at different heights, so nothing
+// is overlapping.
+//
+// Read off the scale ECharts settled on rather than estimated from the data: the
+// interval is rounded to a 1/2/3/5 mantissa and lands anywhere between a third
+// and a seventh of the span, which is too loose to guess from. Deriving it here
+// rather than once per layout is also what keeps the labels right through a
+// legend toggle: the formatter is re-invoked on the refit that follows.
+//
+// The library version is pinned in the page's script tag; the fallback keeps a
+// future one labelling at the plain width precision rather than not at all.
+function yAxisDigits(panel, width) {
+  // Two decimals ('25.00 T') is a lot of y-axis label on a narrow screen, and
+  // containLabel turns every pixel saved there into plot width.
+  const base = width > 0 && width < 420 ? 0 : 2;
+  let ticks;
+  try {
+    ticks = panel.chart.getModel().getComponent('yAxis', 0).axis.scale
+      .getTicks().map(tick => tick.value);
+  } catch (_) { return base; }
+  if (!ticks || ticks.length < 2) return base;
+  const collides = d => ticks.some((v, i) =>
+    i > 0 && panel.fmt(ticks[i - 1], true, d) === panel.fmt(v, true, d));
+  for (let digits = base; digits <= 4; digits++) {
+    if (!collides(digits)) return digits;
+  }
+  // Widening never helped: fmtSpm counts whole shares whatever it is passed, and
+  // its axis is kept legible by minInterval instead. Keep the short labels.
+  return base;
 }
 
 // Re-measure both charts against their container's current size. ECharts does
@@ -1886,7 +1933,9 @@ function fmtHr(hps, short, digits) {
 // Share rate reads as a whole count: a fractional share does not exist, and the
 // decaying averages behind it carry more noise than a decimal place would
 // convey. `digits` is unused — it is part of the shared panel formatter
-// contract (see fmtHr), which the chart calls generically for both units.
+// contract (see fmtHr), which the chart calls generically for both units. What
+// keeps this honest on an axis fitted to its lines is the panel's yMinInterval:
+// no precision the caller asks for can separate two ticks a tenth apart.
 function fmtSpm(spm, short, digits) {
   if (!isFinite(spm)) return short ? '—' : '— shares/min';
   return Math.round(spm).toLocaleString() + (short ? '' : ' shares/min');
@@ -3048,16 +3097,43 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("options.title.textStyle = Object.assign("));
     }
 
-    /// The client patches the server's axis for things only it can measure. It
-    /// must not touch the bounds: re-deriving them from the rendered chart is
-    /// how the axis drifts back to fitting its data.
+    /// The client patches the axis for things only it can measure. Neither set
+    /// of bounds is its to compute: the horizontal ones are pinned by the server
+    /// to the window it queried, and the vertical ones are ECharts' fit to the
+    /// series left visible. Deriving either in the browser is how an axis drifts
+    /// away from the one thing it is supposed to describe.
     #[test]
-    fn client_leaves_the_pinned_axis_bounds_alone() {
-        for assignment in ["xAxis.min", "xAxis.max"] {
+    fn client_leaves_the_axis_bounds_alone() {
+        // `yAxis.minInterval =` is a tick floor, not a bound, and the trailing
+        // space keeps it from matching.
+        for assignment in ["xAxis.min", "xAxis.max", "yAxis.min", "yAxis.max"] {
             assert!(
                 !DASHBOARD_HTML.contains(&format!("{assignment} =")),
-                "the client must not set {assignment}; the server pins the range"
+                "the client must not set {assignment}"
             );
+        }
+    }
+
+    /// A vertical axis floored at zero draws a fleet holding a steady rate as a
+    /// flat line in the top few percent of the grid, with the spread between the
+    /// window averages — the reason six of them are plotted — squashed into it.
+    /// The axis fits its lines instead, while the range it is drawn over stays
+    /// the window that was asked for.
+    #[test]
+    fn chart_y_axis_fits_what_it_plots() {
+        for kind in [ChartKind::Hashrate, ChartKind::ShareRate] {
+            let chart = build_chart_option(&[], &[], kind, 0, 3_600);
+            assert_eq!(chart["yAxis"]["scale"], true);
+            // `scale` is inert the moment a bound is set beside it.
+            for bound in ["min", "max"] {
+                assert!(
+                    chart["yAxis"].get(bound).is_none(),
+                    "a pinned yAxis.{bound} overrides the fit"
+                );
+            }
+            // The horizontal range is still the server's to pin.
+            assert!(chart["xAxis"]["min"].is_number());
+            assert!(chart["xAxis"]["max"].is_number());
         }
     }
 
@@ -3074,6 +3150,12 @@ mod tests {
         // measured width, not baked in server-side.
         assert!(DASHBOARD_HTML.contains("xAxis.splitNumber = Math.min"));
         assert!(DASHBOARD_HTML.contains("function applyResponsiveLayout(panel, options)"));
+
+        // The y-axis labels start from that same width, then widen far enough
+        // that a fitted axis spanning less than their rounding cannot print the
+        // same figure twice. `hideOverlap` cannot catch that: duplicates sit at
+        // different heights, so they never overlap.
+        assert!(DASHBOARD_HTML.contains("function yAxisDigits(panel, width)"));
 
         // A bare `panel.chart.resize()` on the resize event would leave the label
         // density — and the viewport-relative height — stale until the next poll.
@@ -3178,7 +3260,18 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("function fmtSpm(spm, short, digits)"));
         // The axis and tooltip both go through the panel's formatter rather
         // than naming one directly.
-        assert!(DASHBOARD_HTML.contains("formatter: v => panel.fmt(v, true, digits)"));
+        assert!(DASHBOARD_HTML
+            .contains("formatter: v => panel.fmt(v, true, yAxisDigits(panel, width))"));
         assert!(DASHBOARD_HTML.contains("panel.fmt(p.value[1], false)"));
+
+        // No precision the formatter is handed can separate two ticks a tenth
+        // of a share apart, so the share axis floors the interval instead. The
+        // hashrate axis must not: it would cap a fitted axis at 1 H/s.
+        assert_eq!(
+            DASHBOARD_HTML.matches("yMinInterval: 1").count(),
+            1,
+            "only the share axis ticks in whole units"
+        );
+        assert!(DASHBOARD_HTML.contains("yAxis.minInterval = panel.yMinInterval"));
     }
 }

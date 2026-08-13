@@ -10,6 +10,15 @@ everything else bumps the **patch** version.
 ## [Unreleased]
 
 ### Changed
+- **Both graphs scale their vertical axis to the lines they draw.** It was floored
+  at zero, so a fleet holding a steady rate drew a flat line in the top few
+  percent of the grid and the spread between the window averages — the reason six
+  of them are plotted — was squashed into it with nothing to read. The axis now
+  fits the series left visible and refits when one is toggled from the legend,
+  while the horizontal range still spans the window it advertises. The labels
+  follow: the hashrate axis takes as many decimals as it needs for two gridlines
+  to read differently, and the shares/min axis will not tick finer than the whole
+  share it counts in.
 - **Every chart range plots the rolling averages again.** 24h, 1w and 30d had
   converged on the ledger's single exact line; they now draw the same decaying
   window family as the live ranges. Each range draws every window the history
