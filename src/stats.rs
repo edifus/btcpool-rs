@@ -2640,11 +2640,25 @@ impl PoolStats {
         }
     }
 
-    pub fn mark_worker_submit(&self, worker: &str) {
+    /// Record a submit for `worker`, re-latching `online`. An accepted share
+    /// only reaches accounting from an authorized live session, so a row a
+    /// lost teardown left offline is flipped back, and a row the pruner
+    /// evicted is recreated — rather than the worker sitting grey while its
+    /// shares keep counting toward the pool totals.
+    pub fn mark_worker_submit(&self, worker: &str, current_vardiff: u64) {
         let now = Self::now_secs();
         self.worker_last_submit_ts.insert(worker.to_string(), now);
         if let Some(mut state) = self.worker_states.get_mut(worker) {
             state.last_submit_ts = now;
+            if !state.online {
+                state.online = true;
+                state.active_sessions = state.active_sessions.max(1);
+            }
+        } else {
+            self.mark_worker_online(worker, current_vardiff);
+            if let Some(mut state) = self.worker_states.get_mut(worker) {
+                state.last_submit_ts = now;
+            }
         }
     }
 
@@ -4558,6 +4572,35 @@ mod tests {
         assert!(stats.worker_states.get("online").is_some());
         assert!(stats.worker_states.get("recent").is_some());
         assert!(stats.worker_states.get("idle").is_none());
+    }
+
+    /// A submit re-latches a row a teardown left offline: shares only reach
+    /// accounting from an authorized live session.
+    #[test]
+    fn a_submit_flips_an_offline_worker_back_online() {
+        let stats = PoolStats::new_with_store(None);
+        stats.mark_worker_online("w", 1_000);
+        stats.mark_worker_offline("w");
+
+        stats.mark_worker_submit("w", 1_000);
+
+        let state = stats.worker_states.get("w").unwrap();
+        assert!(state.online);
+        assert_eq!(state.active_sessions, 1);
+    }
+
+    /// A submit for a name with no row recreates it online, seeded with the
+    /// share's credit as vardiff until the next retarget.
+    #[test]
+    fn a_submit_recreates_an_evicted_worker_row() {
+        let stats = PoolStats::new_with_store(None);
+
+        stats.mark_worker_submit("w", 2_000);
+
+        let state = stats.worker_states.get("w").unwrap();
+        assert!(state.online);
+        assert_eq!(state.current_vardiff, 2_000);
+        assert!(state.last_submit_ts > 0);
     }
 
     #[test]

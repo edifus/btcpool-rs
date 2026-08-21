@@ -86,10 +86,14 @@ pub fn record_accepted(
     credit: u64,
     hash_difficulty: u64,
 ) {
+    // The submit mark runs first: it revives the worker's row when the pruner
+    // or a lost teardown removed it, and everything after — the per-worker
+    // counters and the ledger's authorized-identity guard — needs that row.
+    // `credit` seeds the recreated row's vardiff until the next retarget.
+    stats.mark_worker_submit(worker, credit);
     stats.add_share_diff(session_id, worker, credit as f64);
     stats.share_accepted(credit, hash_difficulty);
     stats.worker_share_accepted(worker, hash_difficulty);
-    stats.mark_worker_submit(worker);
     stats.ledger_share_accepted(worker, credit);
     metrics::share_accepted(credit, worker);
 }
@@ -420,6 +424,26 @@ mod tests {
         assert_eq!(worker.best_share_difficulty, 0);
 
         drop(stats);
+    }
+
+    /// The first share after a worker's row is lost (pruner eviction, lost
+    /// teardown) recreates the row and is counted on it — the revive runs
+    /// before the per-worker counters and the ledger guard.
+    #[test]
+    fn an_accepted_share_revives_and_counts_toward_a_missing_worker_row() {
+        let stats = PoolStats::new_with_store(None);
+        // No mark_worker_online: the row does not exist.
+        record_accepted(&stats, "s1", "w1", 1_000, 2_000);
+
+        let snap = stats.snapshot();
+        let w = snap
+            .worker_states
+            .iter()
+            .find(|w| w.worker == "w1")
+            .unwrap();
+        assert!(w.online);
+        assert_eq!(w.shares_accepted, 1);
+        assert_eq!(w.current_vardiff, 1_000);
     }
 
     /// A rate-limited message is not a share, so it must move its own counter
