@@ -1214,6 +1214,14 @@ tr:last-child td { border-bottom: none; }
 .led-warn { background: var(--warn); box-shadow: 0 0 5px var(--warn); }
 .led-off { background: var(--muted); opacity: 0.45; }
 .col-led { text-align: center; }
+/* Session-count badge — shown when more than one connection is mining under
+   the same worker name. Their shares merge into this one row and share its
+   vardiff, which is almost always a copied config rather than intent. */
+.sess-badge {
+  font-size: 0.58rem; font-weight: 700; letter-spacing: 0.05em;
+  color: var(--warn); border: 1px solid var(--warn); border-radius: 4px;
+  padding: 0 0.25rem; margin-left: 0.4rem; vertical-align: middle; cursor: help;
+}
 #workers .col-rate, #workers .col-count {
   padding-left: 0.35rem; padding-right: 0.35rem;
 }
@@ -2335,8 +2343,11 @@ async function refresh() {
           const uptime = w.connected_ts > 0 ? fmtUptime(nowSec - w.connected_ts) : '—';
           const mode = (w.protocol || 'sv1').toUpperCase();
           const led = workerLed(w, nowSec);
+          const sessions = w.active_sessions > 1
+            ? `<span class="sess-badge" title="${w.active_sessions} connections are mining under this worker name — their shares merge into this row">&times;${w.active_sessions}</span>`
+            : '';
           return `<tr>
-            <td>${escHtml(name)}</td>
+            <td>${escHtml(name)}${sessions}</td>
             <td class="col-led"><span class="led ${led.cls}" title="${led.title}"></span></td>
             <td>${mode}</td>
             <td class="exact-hint" title="${exactDiff(w.current_vardiff)}">${fmtDiff(w.current_vardiff)}</td>
