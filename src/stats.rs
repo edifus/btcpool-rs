@@ -2766,26 +2766,28 @@ impl PoolStats {
     pub fn prune_idle_workers(&self) {
         let cutoff = Self::now_secs().saturating_sub(IDLE_WORKER_EVICT_SECS);
 
-        let stale: Vec<String> = self
-            .worker_states
-            .iter()
-            .filter(|e| {
-                let s = e.value();
-                if s.online {
-                    return false;
-                }
-                let last_submit = self
-                    .worker_last_submit_ts
-                    .get(e.key())
-                    .map(|v| *v.value())
-                    .unwrap_or(s.last_submit_ts);
-                last_submit.max(s.connected_ts) < cutoff
-            })
-            .map(|e| e.key().clone())
-            .collect();
+        // Staleness is evaluated and the entry removed in one pass under the
+        // shard lock, so a concurrent authorize cannot slip in between: its
+        // `online = true` lands either before the check (the row is kept) or
+        // after the removal (authorize recreates the row).
+        let mut stale: Vec<String> = Vec::new();
+        self.worker_states.retain(|worker, s| {
+            if s.online {
+                return true;
+            }
+            let last_submit = self
+                .worker_last_submit_ts
+                .get(worker)
+                .map(|v| *v.value())
+                .unwrap_or(s.last_submit_ts);
+            if last_submit.max(s.connected_ts) >= cutoff {
+                return true;
+            }
+            stale.push(worker.clone());
+            false
+        });
 
         for w in &stale {
-            self.worker_states.remove(w);
             self.worker_protocol.remove(w);
             self.worker_last_submit_ts.remove(w);
         }
@@ -4572,6 +4574,29 @@ mod tests {
         assert!(stats.worker_states.get("online").is_some());
         assert!(stats.worker_states.get("recent").is_some());
         assert!(stats.worker_states.get("idle").is_none());
+    }
+
+    /// A worker authorizing while the pruner runs must survive: staleness is
+    /// re-read under the shard lock at removal time, so the `online` flip
+    /// lands either before the check (row kept) or after the removal (row
+    /// recreated by the authorize).
+    #[test]
+    fn prune_cannot_evict_a_worker_that_comes_online_mid_pass() {
+        for _ in 0..200 {
+            let stats = PoolStats::new_with_store(None);
+            stats.mark_worker_online("w", 1_000);
+            stats.mark_worker_offline("w");
+            stats.worker_states.get_mut("w").unwrap().connected_ts =
+                PoolStats::now_secs() - IDLE_WORKER_EVICT_SECS - 60;
+
+            std::thread::scope(|s| {
+                s.spawn(|| stats.prune_idle_workers());
+                s.spawn(|| stats.mark_worker_online("w", 1_000));
+            });
+
+            let state = stats.worker_states.get("w").expect("worker row survives");
+            assert!(state.online);
+        }
     }
 
     /// A submit re-latches a row a teardown left offline: shares only reach
