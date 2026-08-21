@@ -564,28 +564,9 @@ async fn handle_open_extended(
         return open_error(writer, open.request_id, "multiple-channels-unsupported").await;
     }
 
-    // Only a *new* identity counts against the cap or touches the stats maps
-    // (mirrors the SV1 authorize path). Compared canonically, so a case
-    // variant of the same address cannot burn the authorization budget.
-    let is_new_identity = session
-        .identity
-        .as_deref()
-        .map(|i| i.canonical_name.as_str())
-        != Some(identity.canonical_name.as_str());
-    if is_new_identity {
-        if !session.guard.record_new_authorization() {
-            return Flow::Disconnect("too many worker identities".into());
-        }
-        session.worker.take();
-        if let Some(prev) = session.identity.take() {
-            session.stats.mark_worker_offline(&prev.canonical_name);
-        }
-    }
-
-    // Grant the device its requested extranonce out of the coinbase's reserved
-    // total; the remaining bytes become the pool prefix. This is independent of
-    // the SV1 split, so SV1 miners (e.g. the Avalon Nano) keep their smaller
-    // extranonce2 while an SV2 device gets the larger size it needs.
+    // Reject an unsatisfiable extranonce request before touching any state:
+    // everything past this point burns authorization budget and swaps the
+    // session identity offline, and a failed open must leave both untouched.
     let requested = open.min_extranonce_size as usize;
     if requested > session.extranonce_total {
         warn!(
@@ -606,7 +587,29 @@ async fn handle_open_extended(
         return Flow::Continue;
     }
 
-    // Grant exactly what the device asked (min 1), leaving the rest as prefix.
+    // Only a *new* identity counts against the cap or touches the stats maps
+    // (mirrors the SV1 authorize path). Compared canonically, so a case
+    // variant of the same address cannot burn the authorization budget.
+    let is_new_identity = session
+        .identity
+        .as_deref()
+        .map(|i| i.canonical_name.as_str())
+        != Some(identity.canonical_name.as_str());
+    if is_new_identity {
+        if !session.guard.record_new_authorization() {
+            return Flow::Disconnect("too many worker identities".into());
+        }
+        session.worker.take();
+        if let Some(prev) = session.identity.take() {
+            session.stats.mark_worker_offline(&prev.canonical_name);
+        }
+    }
+
+    // Grant the device its requested extranonce (min 1) out of the coinbase's
+    // reserved total; the remaining bytes become the pool prefix. This is
+    // independent of the SV1 split, so SV1 miners (e.g. the Avalon Nano) keep
+    // their smaller extranonce2 while an SV2 device gets the larger size it
+    // needs.
     let granted = requested.max(1);
     let prefix_len = session.extranonce_total - granted;
     session.extranonce_size = granted;
